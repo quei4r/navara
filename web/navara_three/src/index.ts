@@ -117,7 +117,11 @@ import {
   type ResolvedGBufferOptions,
 } from "./material";
 import type { TileMesh } from "./mesh/tile";
-import { RenderPassOrchestrator } from "./orchestrators/RenderPassOrchestrator";
+import {
+  RenderPassOrchestrator,
+  type WebGpuDebugFlags,
+} from "./orchestrators/RenderPassOrchestrator";
+import { WebGPUEnvironment } from "./orchestrators/WebGPUEnvironment";
 import {
   CLICK_PIXEL_TOLERANCE,
   isClickGesture,
@@ -155,7 +159,12 @@ import {
   type SourceRef,
 } from "./type";
 import type { CommonUniforms } from "./uniforms";
-import { isWorker, convertScreenPos, type TextureSlot } from "./utils";
+import {
+  isWorker,
+  convertScreenPos,
+  loadWebGPU,
+  type TextureSlot,
+} from "./utils";
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 /** @ts-ignore ignore: https://v3.vitejs.dev/guide/features.html#import-with-query-suffixes  */
 import WorkerURL from "./worker?url&worker";
@@ -235,6 +244,7 @@ export * from "./Color";
 export { type BlendMode, blendFunction, createReplacer } from "./utils";
 export { Atmosphere, type AtmosphereOptions } from "./atmosphere";
 export type { Quality } from "./quality";
+export type { WebGpuDebugFlags } from "./orchestrators/RenderPassOrchestrator";
 export type { CustomObject3DEventMap } from "./object3DEvent";
 export type {
   FontFamily,
@@ -307,6 +317,17 @@ export type Options = {
   container?: HTMLElement;
   /** Canvas element for rendering. If not provided, a new canvas is created. */
   canvas?: HTMLCanvasElement | OffscreenCanvas;
+  /**
+   * A pre-created renderer instance. Passing a WebGPURenderer (already
+   * `init()`ed) switches the view to the experimental WebGPU forward path:
+   * no EffectComposer, no MRT G-buffer; postprocessing-library effects are
+   * replaced by a TSL PostProcessing chain (bloom/FXAA). Feature picking is
+   * fully functional (asynchronous readback). Subsystems that still degrade
+   * or no-op on that backend: tile texture compositing and draping, CSM
+   * shadows, TerrainPicker depth sampling, and the pick debug view.
+   * @experimental
+   */
+  renderer?: WebGLRenderer;
   /** Device pixel ratio override. When not specified, the device value is
    * used, capped at 2 on mobile (1 with `mobileOptimization`) — screen-sized
    * render targets grow quadratically with pixel ratio and dominate mobile
@@ -316,6 +337,13 @@ export type Options = {
   disableAutoResize?: boolean;
   /** Enables debug mode with performance stats overlay. */
   debug?: boolean;
+  /**
+   * Debug switches for the experimental WebGPU forward path (see the
+   * `renderer` option). Library code never reads URL parameters; example
+   * pages parse their own query strings into this field. All flags default
+   * to false (production behavior).
+   */
+  webgpuDebug?: WebGpuDebugFlags;
   /** Atmosphere rendering configuration options. */
   atmosphere?: AtmosphereOptions;
   /** Background color of the scene. Defaults to dark color (0x0a0a0f). */
@@ -863,6 +891,7 @@ export default class ThreeView<
   private _eventManager = new EventManager();
   private _pickHelper?: PickHelper;
   private _terrainPicker: TerrainPicker;
+  private _webgpuEnvironment?: WebGPUEnvironment;
   private _defaultTextureOptions: TextureOptions;
   private layersManager = new LayersManager();
   private shadowMapViewers: ShadowMapViewers;
@@ -933,8 +962,14 @@ export default class ThreeView<
 
     // Patches the global ShaderLib, but the injected source is
     // view-independent (defines carry the layout). Here rather than at module
-    // import so importing the library has no side effects.
-    overrideMaterialsForMRT();
+    // import so importing the library has no side effects. Meaningless (and
+    // skipped) on the WebGPU backend, which never compiles ShaderLib GLSL.
+    const isWebGPU = !!(
+      options.renderer as { isWebGPURenderer?: boolean } | undefined
+    )?.isWebGPURenderer;
+    if (!isWebGPU) {
+      overrideMaterialsForMRT();
+    }
 
     this._buffers = resolveGBufferOptions();
 
@@ -975,13 +1010,15 @@ export default class ThreeView<
       e.preventDefault();
     });
 
-    const renderer = new WebGLRenderer({
-      // If it's true, some noise will happen. So use other AA algorithm instead.
-      antialias: (options.multisampling ?? 0) > 0,
-      logarithmicDepthBuffer: options.logarithmicDepthBuffer ?? true,
-      canvas: options.canvas,
-      stencil: true,
-    });
+    const renderer =
+      options.renderer ??
+      new WebGLRenderer({
+        // If it's true, some noise will happen. So use other AA algorithm instead.
+        antialias: (options.multisampling ?? 0) > 0,
+        logarithmicDepthBuffer: options.logarithmicDepthBuffer ?? true,
+        canvas: options.canvas,
+        stencil: true,
+      });
     renderer.info.autoReset = false;
     renderer.autoClearStencil = false;
     renderer.autoClearColor = false;
@@ -1048,7 +1085,19 @@ export default class ThreeView<
     this.renderPassOrchestrator = new RenderPassOrchestrator(this._renderer, {
       halfFloat: options.halfFloat ?? true,
       multisampling: options.multisampling,
+      debugFlags: options.webgpuDebug,
     });
+
+    // The WebGPU forward path renders the view's scene containers directly;
+    // point the orchestrator at them (its own map only feeds the WebGL
+    // composer pipeline's passes, which read scenes via the ViewContext).
+    if (this.renderPassOrchestrator.backend === "webgpu") {
+      this.renderPassOrchestrator.scenes = this._scenes;
+      // Kick off the dynamic import of the node system (three/webgpu +
+      // three/tsl) now so it overlaps with the WASM fetch; init() awaits it.
+      // WebGL bundles never pay for the node system this way.
+      void loadWebGPU();
+    }
 
     this.renderPassOrchestrator.setSize(width, height);
     this.renderPassOrchestrator.onPassesChanged = () =>
@@ -1140,14 +1189,30 @@ export default class ThreeView<
     // TODO: Allow to change this value dynamically.
     const NUM_CASCADED_SHADOW_MAPS = 6;
 
+    // WebGPU duck-compat: the WebGLRenderer exposes both on `capabilities`,
+    // the WebGPURenderer exposes `getMaxAnisotropy()` directly and has no
+    // `maxTextures` — fall back to conservative values there.
+    const caps = (
+      this._renderer as {
+        capabilities?: {
+          getMaxAnisotropy?: () => number;
+          maxTextures?: number;
+        };
+        getMaxAnisotropy?: () => number;
+      }
+    ).capabilities;
     this._defaultTextureOptions = {
-      maxAnisotropy: this._renderer.capabilities.getMaxAnisotropy(),
+      maxAnisotropy:
+        caps?.getMaxAnisotropy?.() ??
+        (
+          this._renderer as { getMaxAnisotropy?: () => number }
+        ).getMaxAnisotropy?.() ??
+        1,
       magFilter: LinearFilter,
       minFilter: LinearFilter,
       useMipmaps: true,
       maxTextures:
-        Math.max(this._renderer.capabilities.maxTextures, 8) -
-        NUM_CASCADED_SHADOW_MAPS,
+        Math.max(caps?.maxTextures ?? 16, 8) - NUM_CASCADED_SHADOW_MAPS,
     };
 
     // Load shared water texture if enabled
@@ -1184,9 +1249,7 @@ export default class ThreeView<
     this._renderFlag.animation = !!options.animation;
 
     this._camera.on("frustumChanged", () => {
-      this.renderPassOrchestrator.effectComposer.setMainCamera(
-        this._camera.raw,
-      );
+      this.renderPassOrchestrator.setMainCamera(this._camera.raw);
     });
 
     this.shadowMapViewers = new ShadowMapViewers(this._scenes.light);
@@ -1438,6 +1501,13 @@ export default class ThreeView<
 
     this._initialized = true;
 
+    // WebGPU backend: the node system (three/webgpu + three/tsl) must be
+    // resolved before any tile material, pick wrapper, or post chain code
+    // touches it — all of those access it synchronously via getWebGPU().
+    if (this.renderPassOrchestrator.backend === "webgpu") {
+      await loadWebGPU();
+    }
+
     const mobileOptimized = this.isMobileOptimized();
     const concurrencyManager = createDefaultConcurrencyManager(mobileOptimized);
     if (mobileOptimized) {
@@ -1623,9 +1693,24 @@ export default class ThreeView<
       this._pickHelper.enablePick(this._options.picking ?? true);
     }
 
-    this.initializeRenderPass();
-
-    this.viewContext._setRenderPass(this.renderPass);
+    if (this.renderPassOrchestrator.backend === "webgl") {
+      this.initializeRenderPass();
+      this.viewContext._setRenderPass(this.renderPass);
+    } else {
+      // WebGPU forward path: no CustomRenderPass exists, but the orchestrator
+      // needs the camera from the first frame on.
+      this.renderPassOrchestrator.setMainCamera(this._camera.raw);
+      const noEnv = this._options.webgpuDebug?.noEnv ?? false;
+      if (!noEnv) {
+        this._webgpuEnvironment = new WebGPUEnvironment(
+          this._renderer,
+          this._atmosphere,
+          this._scenes.globe,
+          this.renderPassOrchestrator.lights,
+          this._options.webgpuDebug,
+        );
+      }
+    }
 
     // Warm up workers. Non-blocking: warms one worker, the rest follow
     // in the background off the HTTP cache; tasks dispatched to a still-cold
@@ -1911,12 +1996,19 @@ export default class ThreeView<
       this._camera.raw.far,
     ];
     this._uniforms.frustumRatio.value = [top, bottom, right, left];
-    this._uniforms.tGlobeDepth.value =
-      this.renderPass.globeDepthCopyPass.texture;
-    this._uniforms.tGlobeNormal.value =
-      this.renderPass.globeNormalCopyPass.texture;
-    this._uniforms.tSkyEnvMap.value =
-      this.skyEnvMap.ref.raw?.getEnvMapTexture() ?? null;
+    if (this.renderPassOrchestrator.backend === "webgl") {
+      this._uniforms.tGlobeDepth.value =
+        this.renderPass.globeDepthCopyPass.texture;
+      this._uniforms.tGlobeNormal.value =
+        this.renderPass.globeNormalCopyPass.texture;
+      this._uniforms.tSkyEnvMap.value =
+        this.skyEnvMap.ref.raw?.getEnvMapTexture() ?? null;
+    } else {
+      // Forward path: no G-buffer copies or sky env map exist.
+      this._uniforms.tGlobeDepth.value = null;
+      this._uniforms.tGlobeNormal.value = null;
+      this._uniforms.tSkyEnvMap.value = null;
+    }
     this._uniforms.inverseProjectionMatrix.value =
       this._camera.raw.projectionMatrixInverse;
 
@@ -1998,6 +2090,13 @@ export default class ThreeView<
     this._uniforms.time.value = updatedAt;
 
     this._atmosphere._update();
+
+    // WebGPU path: sync sky/sun/shadow frustum, then refresh the shadow
+    // map for this frame (autoUpdate is off, like the WebGL path).
+    if (this._webgpuEnvironment) {
+      this._webgpuEnvironment.update(this._camera.raw);
+      this._renderer.shadowMap.needsUpdate = true;
+    }
 
     // Screen-space label decluttering runs before the render passes so
     // placement changes land in this frame. Throttled passes and active
@@ -2337,6 +2436,10 @@ export default class ThreeView<
    * `MAX_DRAW_BUFFERS` limit.
    */
   private _assertGBufferCapacity(effectType: string): void {
+    // The WebGPU backend has no MRT G-buffer to size.
+    if (this.renderPassOrchestrator.backend === "webgpu") {
+      return;
+    }
     const required = this.registries.effect.getRequiredBuffers(effectType);
     if (required.length === 0) return;
     const prospective = unionGBufferRequirements([
@@ -3041,6 +3144,10 @@ export default class ThreeView<
    * @returns World position Vector3 in ECEF coordinates, or null if nothing is hit
    */
   pickDepthPosition(x: number, y: number): Nullable<Vector3> {
+    // The GLSL depth-sample pass is WebGL-only; on the WebGPU forward path
+    // there is no MRT depth copy to sample. Returning null lets callers
+    // (e.g. the zoom-to-cursor input handler) fall back to defaults.
+    if (this.renderPassOrchestrator.backend !== "webgl") return null;
     return this._terrainPicker.pick(
       x,
       y,

@@ -10,8 +10,10 @@ import {
   type Vector2,
   type WebGLProgramParametersWithUniforms,
 } from "three";
+import type { MeshBasicNodeMaterial } from "three/webgpu";
 
 import type { ViewContext } from "../core/ViewContext";
+import { getWebGPU } from "../utils/webgpuLoader";
 
 import { PickableMesh } from "./pickableMesh";
 
@@ -35,6 +37,87 @@ if (nvr_uPickable > 0.0) {
   gl_FragColor = vec4(nvr_batchIdToColor(nvr_uBatchId), 1.0);
 }
 `;
+
+/**
+ * TSL replication of pick.glsl's `nvr_batchIdToColor`: 24-bit id -> RGB
+ * bytes. Used by the WebGPU pick materials.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const batchIdToColorNode = (id: any) => {
+  const { vec3 } = getWebGPU().tsl;
+  return vec3(
+    id.div(65536).floor(),
+    id.div(256).mod(256).floor(),
+    id.mod(256).floor(),
+  ).div(255);
+};
+
+/**
+ * Unlit pick material encoding a fixed batchId (non-instanced meshes).
+ * Node materials have no `onBeforeCompile` to inject into, so on the WebGPU
+ * backend the pick pass swaps the mesh's material for one of these instead
+ * of flipping a uniform.
+ */
+function createUniformPickMaterial(batchId: number): MeshBasicNodeMaterial {
+  const { webgpu, tsl } = getWebGPU();
+  const m = new webgpu.MeshBasicNodeMaterial();
+  m.colorNode = tsl.vec4(batchIdToColorNode(tsl.uniform(batchId)), 1);
+  return m;
+}
+
+/** Unlit pick material encoding each instance's `batchId` attribute. */
+function createInstancedPickMaterial(): MeshBasicNodeMaterial {
+  const { webgpu, tsl } = getWebGPU();
+  const m = new webgpu.MeshBasicNodeMaterial();
+  // batchIds reach 2^24 where f32 has ulp=1, so a smoothly interpolated
+  // varying can arrive a step off at some pixels and corrupt the low byte.
+  // Flat interpolation keeps the per-instance value exact.
+  const batchIdVarying = tsl.varying(tsl.attribute("batchId"), "nvr_vBatchId");
+  tsl.nodeObject(batchIdVarying).setInterpolation("flat");
+  m.colorNode = tsl.vec4(batchIdToColorNode(batchIdVarying), 1);
+  return m;
+}
+
+/**
+ * The node material pipeline multiplies `object.instanceColor` into the
+ * diffuse term even when `colorNode` is set, which would tint the encoded
+ * batchId. During the pick pass the instanced wrappers swap in this
+ * all-white buffer (same layout, so the pipeline cache key is unchanged)
+ * and restore the real one afterwards.
+ */
+function createWhiteInstanceColor(count: number): InstancedBufferAttribute {
+  return new InstancedBufferAttribute(new Float32Array(count * 3).fill(1), 3);
+}
+
+/**
+ * Replace every descendant Mesh's material with `pickMaterial` and return
+ * the swapped pairs so {@link restoreSwappedMaterials} can undo it.
+ */
+function swapToPickMaterial(
+  root: Object3D,
+  pickMaterial: Material,
+): [Mesh, Material | Material[]][] {
+  const swapped: [Mesh, Material | Material[]][] = [];
+  root.traverse((child) => {
+    if (!(child instanceof Mesh)) return;
+    swapped.push([child, child.material]);
+    child.material = pickMaterial;
+  });
+  return swapped;
+}
+
+function restoreSwappedMaterials(
+  swapped: [Mesh, Material | Material[]][],
+): void {
+  for (const [mesh, material] of swapped) mesh.material = material;
+}
+
+/** True when the view runs on the WebGPURenderer forward path. */
+function isWebGPUContext(ctx: ViewContext): boolean {
+  const renderer = ctx.getRenderer() as
+    { isWebGPURenderer?: boolean } | undefined;
+  return renderer?.isWebGPURenderer === true;
+}
 
 /**
  * Inject picking shader support into a standard Three.js material
@@ -151,10 +234,13 @@ function injectPickingIntoShaderMaterial(
 /**
  * Turnkey {@link PickableMesh} implementation for stock Three.js materials.
  *
- * Traverses the wrapped Object3D and injects picking shader code into every
- * child `Mesh`'s material: `onBeforeCompile` for standard materials, direct
- * source mutation for `ShaderMaterial`. During the pick pass the fragment
- * shader outputs a batchId-encoded color, bypassing lighting/tonemapping.
+ * WebGL: traverses the wrapped Object3D and injects picking shader code into
+ * every child `Mesh`'s material (`onBeforeCompile` for standard materials,
+ * direct source mutation for `ShaderMaterial`). WebGPU (node materials have
+ * no injectable shader source): swaps in an unlit `MeshBasicNodeMaterial`
+ * that outputs the batchId-encoded color for the duration of the pick pass,
+ * then restores the original materials. Either way the pick pass output is
+ * the encoded batchId, bypassing lighting/tonemapping.
  *
  * Apply this explicitly, don't rely on the framework to
  * wrap your mesh for you. If you have a custom shader and don't want shader
@@ -169,6 +255,10 @@ export class PickableMeshWrapper extends Object3D implements PickableMesh {
   };
   /** Materials that already have picking shaders installed. */
   private injectedMaterials = new WeakSet<Material>();
+  /** WebGPU pick pass state: swap material + originals awaiting restore. */
+  private readonly isWebGPU: boolean;
+  private pickMaterial?: MeshBasicNodeMaterial;
+  private swappedMaterials?: [Mesh, Material | Material[]][];
 
   constructor(
     public object: Object3D,
@@ -180,6 +270,7 @@ export class PickableMeshWrapper extends Object3D implements PickableMesh {
       nvr_uPickable: { value: 0 },
       nvr_uBatchId: { value: this.batchId },
     };
+    this.isWebGPU = isWebGPUContext(ctx);
     this.setupShaders();
   }
 
@@ -193,6 +284,10 @@ export class PickableMeshWrapper extends Object3D implements PickableMesh {
   }
 
   private setupShaders(): void {
+    // WebGPU picks swap materials in onBeforePicking; there is no shader
+    // source to inject into.
+    if (this.isWebGPU) return;
+
     const refs = this.refs;
     this.object.traverse((child) => {
       if (!(child instanceof Mesh)) return;
@@ -229,10 +324,25 @@ export class PickableMeshWrapper extends Object3D implements PickableMesh {
   }
 
   onBeforePicking(_pickingCoord?: Vector2): void {
+    if (this.isWebGPU) {
+      this.pickMaterial ??= createUniformPickMaterial(this.batchId);
+      this.swappedMaterials = swapToPickMaterial(
+        this.object,
+        this.pickMaterial,
+      );
+      return;
+    }
     this.refs.nvr_uPickable.value = 1;
   }
 
   onAfterPicking(): void {
+    if (this.isWebGPU) {
+      if (this.swappedMaterials) {
+        restoreSwappedMaterials(this.swappedMaterials);
+        this.swappedMaterials = undefined;
+      }
+      return;
+    }
     this.refs.nvr_uPickable.value = 0;
   }
 
@@ -260,6 +370,32 @@ export class PickableInstancedMeshWrapper
   private batchIdAttr: InstancedBufferAttribute | null = null;
   /** Set of materials that already have picking shaders installed. */
   private injectedMaterials = new WeakSet<Material>();
+  /** WebGPU pick pass state: swap material + originals awaiting restore. */
+  private readonly isWebGPU: boolean;
+  private pickMaterial?: MeshBasicNodeMaterial;
+  private swappedMaterials?: [Mesh, Material | Material[]][];
+  /** Real `instanceColor` replaced by an all-white stand-in during picks. */
+  private savedInstanceColor: [
+    InstancedMesh,
+    InstancedMesh["instanceColor"],
+  ][] = [];
+
+  private swapOutInstanceColors(meshes: InstancedMesh[]): void {
+    this.savedInstanceColor = [];
+    for (const mesh of meshes) {
+      this.savedInstanceColor.push([mesh, mesh.instanceColor]);
+      if (mesh.instanceColor) {
+        mesh.instanceColor = createWhiteInstanceColor(mesh.count);
+      }
+    }
+  }
+
+  private restoreInstanceColors(): void {
+    for (const [mesh, saved] of this.savedInstanceColor) {
+      mesh.instanceColor = saved;
+    }
+    this.savedInstanceColor = [];
+  }
 
   constructor(
     public mesh: InstancedMesh,
@@ -272,6 +408,7 @@ export class PickableInstancedMeshWrapper
       () => ctx.genGlobalBatchId() ?? 0,
     );
     this.refs = { nvr_uPickable: { value: 0 } };
+    this.isWebGPU = isWebGPUContext(ctx);
     this.setupBatchIdAttribute();
     this.setupShader();
   }
@@ -343,6 +480,10 @@ export class PickableInstancedMeshWrapper
 
   /** Install picking shader hooks on materials that haven't been injected yet. */
   private setupShader(): void {
+    // WebGPU picks swap materials in onBeforePicking; there is no shader
+    // source to inject into.
+    if (this.isWebGPU) return;
+
     const materials = Array.isArray(this.mesh.material)
       ? this.mesh.material
       : [this.mesh.material];
@@ -371,10 +512,24 @@ export class PickableInstancedMeshWrapper
   }
 
   onBeforePicking(_pickingCoord?: Vector2): void {
+    if (this.isWebGPU) {
+      this.pickMaterial ??= createInstancedPickMaterial();
+      this.swappedMaterials = swapToPickMaterial(this.mesh, this.pickMaterial);
+      this.swapOutInstanceColors([this.mesh]);
+      return;
+    }
     this.refs.nvr_uPickable.value = 1;
   }
 
   onAfterPicking(): void {
+    if (this.isWebGPU) {
+      if (this.swappedMaterials) {
+        restoreSwappedMaterials(this.swappedMaterials);
+        this.swappedMaterials = undefined;
+      }
+      this.restoreInstanceColors();
+      return;
+    }
     this.refs.nvr_uPickable.value = 0;
   }
 
@@ -410,6 +565,32 @@ export class PickableMultiInstancedMeshWrapper
   // a stale object and picking would read outdated ids.
   private attrs = new Map<BufferGeometry, InstancedBufferAttribute>();
   private injectedMaterials = new WeakSet<Material>();
+  /** WebGPU pick pass state: swap material + originals awaiting restore. */
+  private readonly isWebGPU: boolean;
+  private pickMaterial?: MeshBasicNodeMaterial;
+  private swappedMaterials?: [Mesh, Material | Material[]][];
+  /** Real `instanceColor` replaced by an all-white stand-in during picks. */
+  private savedInstanceColor: [
+    InstancedMesh,
+    InstancedMesh["instanceColor"],
+  ][] = [];
+
+  private swapOutInstanceColors(meshes: InstancedMesh[]): void {
+    this.savedInstanceColor = [];
+    for (const mesh of meshes) {
+      this.savedInstanceColor.push([mesh, mesh.instanceColor]);
+      if (mesh.instanceColor) {
+        mesh.instanceColor = createWhiteInstanceColor(mesh.count);
+      }
+    }
+  }
+
+  private restoreInstanceColors(): void {
+    for (const [mesh, saved] of this.savedInstanceColor) {
+      mesh.instanceColor = saved;
+    }
+    this.savedInstanceColor = [];
+  }
 
   constructor(
     public root: Object3D,
@@ -423,6 +604,7 @@ export class PickableMultiInstancedMeshWrapper
       () => ctx.genGlobalBatchId() ?? 0,
     );
     this.refs = { nvr_uPickable: { value: 0 } };
+    this.isWebGPU = isWebGPUContext(ctx);
     this.setupBatchIdAttributes();
     this.setupShaders();
   }
@@ -490,6 +672,10 @@ export class PickableMultiInstancedMeshWrapper
   }
 
   private setupShaders(): void {
+    // WebGPU picks swap materials in onBeforePicking; there is no shader
+    // source to inject into.
+    if (this.isWebGPU) return;
+
     const refs = this.refs;
     for (const mesh of this.meshes) {
       const materials = Array.isArray(mesh.material)
@@ -516,10 +702,24 @@ export class PickableMultiInstancedMeshWrapper
   }
 
   onBeforePicking(_pickingCoord?: Vector2): void {
+    if (this.isWebGPU) {
+      this.pickMaterial ??= createInstancedPickMaterial();
+      this.swappedMaterials = swapToPickMaterial(this.root, this.pickMaterial);
+      this.swapOutInstanceColors(this.meshes);
+      return;
+    }
     this.refs.nvr_uPickable.value = 1;
   }
 
   onAfterPicking(): void {
+    if (this.isWebGPU) {
+      if (this.swappedMaterials) {
+        restoreSwappedMaterials(this.swappedMaterials);
+        this.swappedMaterials = undefined;
+      }
+      this.restoreInstanceColors();
+      return;
+    }
     this.refs.nvr_uPickable.value = 0;
   }
 

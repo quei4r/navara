@@ -1,12 +1,34 @@
 import { NamedIndexMap } from "@navaramap/core";
 import { EffectComposer, Pass as PostProcessingPass } from "postprocessing";
-import { HalfFloatType, Scene, WebGLRenderer, Group } from "three";
+import { HalfFloatType, Scene, Vector2, WebGLRenderer, Group } from "three";
+import type { PostProcessing, RenderTarget } from "three/webgpu";
 
 import { estimateFixedGpuBytes } from "../utils/fixedGpuFootprint";
+import { getWebGPU, isWebGPULoaded } from "../utils/webgpuLoader";
 
 export type RenderPassOrchestratorOptions = {
   halfFloat?: boolean;
   multisampling?: number;
+  /** Debug switches for the experimental WebGPU forward path. */
+  debugFlags?: WebGpuDebugFlags;
+};
+
+/**
+ * Debug switches for the experimental WebGPU forward path. All default to
+ * false (the production behavior). Exposed to applications as
+ * `Options.webgpuDebug`.
+ */
+export type WebGpuDebugFlags = {
+  /** Skip the sky/sun/shadow environment entirely. */
+  noEnv?: boolean;
+  /** Render scenes straight to the canvas, skipping the TSL post chain. */
+  noPost?: boolean;
+  /** Skip FXAA in the post chain (raw scene + bloom output). */
+  rawPost?: boolean;
+  /** Disable shadow mapping (castShadow + shadow map updates). */
+  shadowOff?: boolean;
+  /** Force tiles to the plain unlit single-texture material (A/B regression). */
+  tileBasic?: boolean;
 };
 
 export type NamedPass = {
@@ -23,6 +45,12 @@ export type NamedPass = {
 
 /**
  * Orchestrate rendering passes with ordered management and flexible insertion.
+ *
+ * The WebGPU backend (`backend: "webgpu"`) is an experimental forward path: no
+ * EffectComposer is created and `render()` draws the pipeline scenes directly
+ * to the canvas in dependency order (globe → mrt → draped → opaque →
+ * transparent). Pass registration is kept for ordering bookkeeping, but
+ * postprocessing-library passes are not executed on this backend.
  */
 export class RenderPassOrchestrator {
   lights = new Group();
@@ -34,7 +62,17 @@ export class RenderPassOrchestrator {
     transparent: new Scene(),
     skyEnvMap: new Scene(),
   };
-  effectComposer: EffectComposer;
+  effectComposer: EffectComposer | undefined;
+
+  /**
+   * The active renderer. Typed as WebGLRenderer for API compatibility; on the
+   * WebGPU backend this holds a (duck-compatible) WebGPURenderer instance.
+   */
+  renderer: WebGLRenderer;
+
+  backend: "webgl" | "webgpu";
+
+  private mainCamera?: import("three").Camera;
 
   /**
    * Invoked whenever the pass list changes (add/insert/remove/clear), so the
@@ -44,21 +82,126 @@ export class RenderPassOrchestrator {
 
   private passMap = new NamedIndexMap<NamedPass>();
 
+  /** Debug switches for the WebGPU forward path (never set in production). */
+  readonly debugFlags: WebGpuDebugFlags;
+
   constructor(renderer: WebGLRenderer, options: RenderPassOrchestratorOptions) {
-    // Setup render pass
-    this.effectComposer = new EffectComposer(renderer, {
-      stencilBuffer: true,
-      frameBufferType: (options.halfFloat ?? true) ? HalfFloatType : undefined,
-      multisampling: options.multisampling,
-    });
+    this.renderer = renderer;
+    this.debugFlags = options.debugFlags ?? {};
+    this.backend = (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer
+      ? "webgpu"
+      : "webgl";
+    if (this.backend === "webgl") {
+      // Setup render pass
+      this.effectComposer = new EffectComposer(renderer, {
+        stencilBuffer: true,
+        frameBufferType:
+          (options.halfFloat ?? true) ? HalfFloatType : undefined,
+        multisampling: options.multisampling,
+      });
+    }
+  }
+
+  setMainCamera(camera: import("three").Camera) {
+    this.mainCamera = camera;
+    this.effectComposer?.setMainCamera(camera);
   }
 
   setSize(width: number, height: number) {
-    this.effectComposer.setSize(width, height);
+    this.effectComposer?.setSize(width, height);
   }
 
   render() {
-    this.effectComposer.render();
+    if (this.backend === "webgpu") {
+      if (!this.mainCamera) {
+        return;
+      }
+      const renderer = this.renderer;
+      // Forward path with a TSL PostProcessing chain: the five scenes render
+      // into an HDR target, then bloom → FXAA run as nodes and the output
+      // transform applies the renderer's tone mapping + color space. Manual
+      // clear control (autoClear* are disabled by ThreeView); the light group
+      // attaches temporarily to whichever scene is being rendered, matching
+      // CustomRenderPass's semantics on WebGL.
+      const noPP =
+        (this.debugFlags.noPost ?? false) ||
+        // First frames can arrive before the dynamically imported node
+        // system resolves; render straight to the canvas until then.
+        !isWebGPULoaded();
+      const target = noPP ? null : (this.ensureSceneTarget() ?? null);
+      renderer.setRenderTarget(
+        target as unknown as Parameters<WebGLRenderer["setRenderTarget"]>[0],
+      );
+      renderer.clear(true, true, true);
+      const scenes = [
+        this.scenes.globe,
+        this.scenes.mrt,
+        this.scenes.draped,
+        this.scenes.opaque,
+        this.scenes.transparent,
+      ];
+      const lightsAttached = new Set<Scene>();
+      for (const scene of scenes) {
+        if (
+          this.lights.children.length > 0 &&
+          !scene.children.includes(this.lights)
+        ) {
+          scene.add(this.lights);
+          lightsAttached.add(scene);
+        }
+        renderer.render(scene, this.mainCamera);
+      }
+      for (const scene of lightsAttached) {
+        scene.remove(this.lights);
+      }
+      // Back to the canvas before the post chain — the PP quad samples the
+      // scene target, so it must not render into it.
+      renderer.setRenderTarget(null);
+      if (!noPP) {
+        this.scenePostProcessing?.render();
+      }
+      return;
+    }
+    this.effectComposer?.render();
+  }
+
+  private sceneTarget?: RenderTarget;
+  private sceneTargetSize = new Vector2();
+  private scenePostProcessing?: PostProcessing;
+
+  /**
+   * The HDR intermediate the five scenes render into, plus the bloom+FXAA
+   * PostProcessing that composites it to the canvas.
+   */
+  private ensureSceneTarget(): RenderTarget | undefined {
+    const renderer = this.renderer;
+    const size = renderer.getDrawingBufferSize(this.sceneTargetSize);
+    const width = Math.max(1, Math.floor(size.x || 1));
+    const height = Math.max(1, Math.floor(size.y || 1));
+    const current = this.sceneTarget;
+    if (current && current.width === width && current.height === height) {
+      return current;
+    }
+    current?.dispose();
+    this.scenePostProcessing?.dispose();
+
+    const { webgpu, tsl, bloom: bloomMod, fxaa: fxaaMod } = getWebGPU();
+    const target = new webgpu.RenderTarget(width, height, {
+      type: HalfFloatType,
+    });
+    this.sceneTarget = target;
+    const sceneColor = tsl.texture(target.texture);
+    const rawPP = this.debugFlags.rawPost ?? false;
+    // bloom() yields the glow contribution only — compose over the scene.
+    const bloomNode = bloomMod.bloom(sceneColor, 0.35, 0.4, 0.9);
+    const withBloom = sceneColor.add(bloomNode);
+    const output = rawPP ? sceneColor : fxaaMod.fxaa(withBloom);
+    const postProcessing = new webgpu.PostProcessing(
+      renderer as unknown as ConstructorParameters<typeof PostProcessing>[0],
+    );
+    postProcessing.outputNode = output;
+    this.scenePostProcessing = postProcessing;
+    return target;
   }
 
   /**
@@ -67,7 +210,7 @@ export class RenderPassOrchestrator {
   addPass(name: string, pass: PostProcessingPass): void {
     const namedPass: NamedPass = { name, pass };
     this.passMap.add(namedPass);
-    this.effectComposer.addPass(pass);
+    this.effectComposer?.addPass(pass);
     this.onPassesChanged?.();
   }
 
@@ -81,7 +224,7 @@ export class RenderPassOrchestrator {
   ): void {
     const namedPass: NamedPass = { name, pass };
     const targetIndex = this.passMap.insertBefore(targetName, namedPass);
-    this.effectComposer.addPass(pass, targetIndex);
+    this.effectComposer?.addPass(pass, targetIndex);
     this.onPassesChanged?.();
   }
 
@@ -95,7 +238,7 @@ export class RenderPassOrchestrator {
   ): void {
     const namedPass: NamedPass = { name, pass };
     const targetIndex = this.passMap.insertAfter(targetName, namedPass);
-    this.effectComposer.addPass(pass, targetIndex);
+    this.effectComposer?.addPass(pass, targetIndex);
     this.onPassesChanged?.();
   }
 
@@ -108,7 +251,7 @@ export class RenderPassOrchestrator {
       throw new Error(`Pass not found: ${name}`);
     }
 
-    this.effectComposer.removePass(targetPass.pass);
+    this.effectComposer?.removePass(targetPass.pass);
     this.passMap.list = this.passMap.list.filter((p) => p.name !== name);
     this.rebuildIndexMap();
     this.onPassesChanged?.();
@@ -133,7 +276,7 @@ export class RenderPassOrchestrator {
    */
   clearPasses(): void {
     for (const namedPass of this.passMap.list) {
-      this.effectComposer.removePass(namedPass.pass);
+      this.effectComposer?.removePass(namedPass.pass);
     }
     this.passMap.list = [];
     this.passMap.indexMap = {};
@@ -146,6 +289,9 @@ export class RenderPassOrchestrator {
    * reporting into the memory ledger's `fixed_gpu_bytes` term.
    */
   estimateFixedGpuBytes(): number {
+    if (!this.effectComposer) {
+      return 0;
+    }
     return estimateFixedGpuBytes(
       this.effectComposer,
       this.passMap.list.map((p) => p.pass),
@@ -157,7 +303,7 @@ export class RenderPassOrchestrator {
    */
   dispose(): void {
     this.clearPasses();
-    this.effectComposer.dispose();
+    this.effectComposer?.dispose();
   }
 
   /**

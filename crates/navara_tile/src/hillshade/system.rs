@@ -235,6 +235,10 @@ pub fn backfill_hillshade_on_loaded(
         }
 
         // Collect edge exchanges with all loaded neighbors
+        let content_size = buf
+            .get_u8(&data_req.handle)
+            .map(|b| ((b.len() / 4) as f64).sqrt() as usize)
+            .unwrap_or(0);
         let edges_to_store = collect_neighbor_edge_exchanges(
             entity,
             tile_handle,
@@ -247,6 +251,7 @@ pub fn backfill_hillshade_on_loaded(
             &data_requesters,
             &buf,
             &newly_loaded_entities,
+            content_size,
         );
 
         // Store all collected edges in BufferStore and create events
@@ -461,6 +466,7 @@ fn collect_neighbor_edge_exchanges(
     >,
     buf: &BufferStore,
     newly_loaded_entities: &std::collections::HashSet<Entity>,
+    content_size: usize,
 ) -> Vec<(Vec<u8>, u64, Entity, u8)> {
     // Define neighbor directions (coordinates will be computed with bounds checking)
     let neighbor_directions = [
@@ -473,11 +479,6 @@ fn collect_neighbor_edge_exchanges(
     let mut edges_to_store = Vec::new();
 
     for direction in neighbor_directions {
-        // Get neighbor coordinates with bounds checking and wrapping
-        let Some((nx, ny, nz)) = get_neighbor_coords(x, y, z, direction) else {
-            continue; // Skip out-of-bounds neighbors
-        };
-
         // Map direction from current tile's perspective to neighbor's perspective
         let neighbor_edge_dir = match direction {
             EdgeDirection::Left => EdgeDirection::Right, // West neighbor needs edge on their right
@@ -485,32 +486,6 @@ fn collect_neighbor_edge_exchanges(
             EdgeDirection::Top => EdgeDirection::Bottom, // North neighbor needs edge on their bottom
             EdgeDirection::Bottom => EdgeDirection::Top, // South neighbor needs edge on their top
         };
-        // Encode neighbor coordinates and check if tile exists
-        let Some(neighbor_handle) = encode_quadleaf_handle((nx, ny, nz)) else {
-            continue;
-        };
-
-        let Some(neighbor_tile) = qt.qt.get(neighbor_handle) else {
-            continue; // Neighbor tile not loaded
-        };
-
-        // Get the first hillshade entity from neighbor (only support one hillshade per tile for now)
-        let Some(neighbor_entity) = neighbor_tile
-            .hillshade_entity_ids
-            .as_ref()
-            .and_then(|ids| ids.iter().find_map(|&id| id))
-        else {
-            continue; // Neighbor doesn't have hillshade
-        };
-
-        let Ok(neighbor_dr) = data_requesters.get(neighbor_entity) else {
-            continue; // Neighbor hillshade entity not found in query
-        };
-
-        if !neighbor_dr.is_succeeded() {
-            continue; // Neighbor not successfully loaded
-        }
-
         // Opposite direction: edge direction on current tile that neighbor needs
         let opposite_dir = match neighbor_edge_dir {
             EdgeDirection::Left => EdgeDirection::Right,
@@ -519,49 +494,262 @@ fn collect_neighbor_edge_exchanges(
             EdgeDirection::Bottom => EdgeDirection::Top,
         };
 
-        // Current tile's edge -> neighbor
-        if let Some(edge_for_neighbor) =
-            get_edge_from_tile(entity, opposite_dir, extracted_edges, edges_query, buf)
+        let mut incoming_sent = false;
+        // The same-zoom neighbor exists and is still loading: its real edge
+        // will arrive when it succeeds, so wait for it instead of falling
+        // back to the lower-fidelity ancestor strip.
+        let mut neighbor_pending = false;
+
+        if let Some((nx, ny, nz)) = get_neighbor_coords(x, y, z, direction)
+            && let Some(neighbor_handle) = encode_quadleaf_handle((nx, ny, nz))
+            && let Some(neighbor_tile) = qt.qt.get(neighbor_handle)
+            && let Some(neighbor_entity) = neighbor_tile
+                .hillshade_entity_ids
+                .as_ref()
+                .and_then(|ids| ids.iter().find_map(|&id| id))
         {
-            edges_to_store.push((
-                edge_for_neighbor,
-                neighbor_handle,
-                neighbor_entity,
-                neighbor_edge_dir as u8,
-            ));
+            match data_requesters.get(neighbor_entity) {
+                Ok(neighbor_dr) if neighbor_dr.is_succeeded() => {
+                    // Current tile's edge -> neighbor
+                    if let Some(edge_for_neighbor) =
+                        get_edge_from_tile(entity, opposite_dir, extracted_edges, edges_query, buf)
+                    {
+                        edges_to_store.push((
+                            edge_for_neighbor,
+                            neighbor_handle,
+                            neighbor_entity,
+                            neighbor_edge_dir as u8,
+                        ));
+                    }
+
+                    // Neighbor's edge -> current tile
+                    if newly_loaded_entities.contains(&neighbor_entity) {
+                        // Neighbor is being processed this frame too: it sends its edge
+                        // to the current tile from its own pass, so count this direction
+                        // as covered and skip the ancestor fallback.
+                        incoming_sent = true;
+                    } else {
+                        let edge_for_current =
+                            if let Ok(neighbor_edges) = edges_query.get(neighbor_entity) {
+                                // Neighbor already has extracted edges stored, use them
+                                let edge_handle = match neighbor_edge_dir {
+                                    EdgeDirection::Left => neighbor_edges.left,
+                                    EdgeDirection::Right => neighbor_edges.right,
+                                    EdgeDirection::Top => neighbor_edges.top,
+                                    EdgeDirection::Bottom => neighbor_edges.bottom,
+                                };
+                                buf.get_u8(&edge_handle)
+                                    .map(|b| b.to_vec())
+                                    .unwrap_or_default()
+                            } else {
+                                // Neighbor loaded in the same frame: HillshadeEdges component not yet available
+                                // (inserted via commands, takes effect next frame), but original data still exists
+                                // (JS-side removeU8 is async). Extract edge from neighbor's original DEM data.
+                                buf.get_u8(&neighbor_dr.handle)
+                                    .map(|bytes| extract_single_edge(bytes, neighbor_edge_dir))
+                                    .unwrap_or_default()
+                            };
+
+                        if !edge_for_current.is_empty() {
+                            edges_to_store.push((
+                                edge_for_current,
+                                tile_handle,
+                                entity,
+                                opposite_dir as u8,
+                            ));
+                            incoming_sent = true;
+                        }
+                    }
+                }
+                Ok(neighbor_dr) => {
+                    // Neighbor request still Pending: its real edge arrives
+                    // when it succeeds. Fail falls through to the fallback.
+                    if neighbor_dr.status == navara_data_requester::DataRequesterStatus::Pending {
+                        neighbor_pending = true;
+                    }
+                }
+                // Neighbor request Failed, or entity Deleted/Ignored (rejected
+                // by the load gate): fall through to the ancestor fallback —
+                // a retry would arrive as a new entity much later, if ever.
+                Err(_) => {}
+            }
         }
 
-        // Neighbor's edge -> current tile
-        // Skip if neighbor is also being processed this frame to avoid duplicate edge updates
-        // (neighbor will send its edge to current tile when it processes)
-        if !newly_loaded_entities.contains(&neighbor_entity) {
-            let edge_for_current = if let Ok(neighbor_edges) = edges_query.get(neighbor_entity) {
-                // Neighbor already has extracted edges stored, use them
-                let edge_handle = match neighbor_edge_dir {
-                    EdgeDirection::Left => neighbor_edges.left,
-                    EdgeDirection::Right => neighbor_edges.right,
-                    EdgeDirection::Top => neighbor_edges.top,
-                    EdgeDirection::Bottom => neighbor_edges.bottom,
-                };
-                buf.get_u8(&edge_handle)
-                    .map(|b| b.to_vec())
-                    .unwrap_or_default()
-            } else {
-                // Neighbor loaded in the same frame: HillshadeEdges component not yet available
-                // (inserted via commands, takes effect next frame), but original data still exists
-                // (JS-side removeU8 is async). Extract edge from neighbor's original DEM data.
-                buf.get_u8(&neighbor_dr.handle)
-                    .map(|bytes| extract_single_edge(bytes, neighbor_edge_dir))
-                    .unwrap_or_default()
-            };
-
-            if !edge_for_current.is_empty() {
-                edges_to_store.push((edge_for_current, tile_handle, entity, opposite_dir as u8));
-            }
+        // LOD-boundary fallback: the same-zoom neighbor is not rendered
+        // (its area is covered by a coarser tile), so no edge exchange will
+        // ever happen for this direction. Reconstruct the strip from the
+        // nearest rendered ancestor's resident DEM instead. The coarse side's
+        // boundary normals are one-sided differences of this same coarse
+        // field, so aligning the fine side's padding to it hides the seam.
+        // If the same-zoom neighbor loads later, its real edge overwrites
+        // this approximation on the JS side.
+        if !incoming_sent
+            && !neighbor_pending
+            && let Some(strip) =
+                ancestor_edge_fallback(x, y, z, direction, content_size, qt, data_requesters, buf)
+        {
+            edges_to_store.push((strip, tile_handle, entity, direction as u8));
         }
     }
 
     edges_to_store
+}
+
+/// Walk up the ancestor chain to reconstruct an edge strip for a tile whose
+/// same-zoom neighbor is not rendered. Reads the ancestor's original DEM
+/// (still resident in BufferStore while the ancestor is rendered) and
+/// nearest-upsamples the relevant sub-strip to the current tile's content
+/// size. Returns None when no rendered ancestor can supply the strip
+/// (edge of the loaded region, anti-meridian wrap, or DEM evicted).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn ancestor_edge_fallback(
+    x: usize,
+    y: usize,
+    z: usize,
+    direction: EdgeDirection,
+    content_size: usize,
+    qt: &TerrainTileQuadtree,
+    data_requesters: &Query<
+        &DataRequester,
+        (
+            With<HillshadeTextureMarker>,
+            Without<Deleted>,
+            Without<Ignored>,
+        ),
+    >,
+    buf: &BufferStore,
+) -> Option<Vec<u8>> {
+    if content_size == 0 {
+        return None;
+    }
+
+    for k in 1..=z.min(8) {
+        let Some(ancestor_handle) = encode_quadleaf_handle((x >> k, y >> k, z - k)) else {
+            continue;
+        };
+        let Some(ancestor_tile) = qt.qt.get(ancestor_handle) else {
+            continue;
+        };
+        let Some(ancestor_entity) = ancestor_tile
+            .hillshade_entity_ids
+            .as_ref()
+            .and_then(|ids| ids.iter().find_map(|&id| id))
+        else {
+            continue;
+        };
+        let Ok(ancestor_dr) = data_requesters.get(ancestor_entity) else {
+            continue;
+        };
+        if !ancestor_dr.is_succeeded() {
+            continue;
+        }
+        let Some(ancestor_bytes) = buf.get_u8(&ancestor_dr.handle) else {
+            continue;
+        };
+
+        let mask = (1usize << k) - 1;
+        if let Some(strip) = extract_ancestor_edge(
+            ancestor_bytes,
+            x & mask,
+            y & mask,
+            k,
+            direction,
+            content_size,
+        ) {
+            return Some(strip);
+        }
+        // The needed texels fall outside this ancestor's own content (the
+        // tile's edge coincides with the ancestor's edge) — look deeper.
+    }
+
+    None
+}
+
+/// Extract the texel strip just beyond a tile's edge from an ancestor's DEM
+/// and nearest-upsample it to the tile's content size.
+///
+/// `rem_x`/`rem_y` are the tile's coords modulo 2^k (its position inside the
+/// ancestor), `k` the zoom gap. Returns None when the strip would come from
+/// outside the ancestor's own content (caller should try a deeper ancestor).
+fn extract_ancestor_edge(
+    ancestor: &[u8],
+    rem_x: usize,
+    rem_y: usize,
+    k: usize,
+    direction: EdgeDirection,
+    out_content_size: usize,
+) -> Option<Vec<u8>> {
+    if ancestor.len() < 16 || !ancestor.len().is_multiple_of(4) {
+        return None;
+    }
+    let pixels = ancestor.len() / 4;
+    let ancestor_size = (pixels as f64).sqrt() as usize;
+    if ancestor_size < 4 || ancestor_size * ancestor_size * 4 != ancestor.len() {
+        return None;
+    }
+    let divisor = 1usize << k;
+    if !ancestor_size.is_multiple_of(divisor) {
+        return None;
+    }
+    let block = ancestor_size / divisor;
+    let bx = rem_x * block;
+    let by = rem_y * block;
+
+    let px = |cx: usize, cy: usize| {
+        let idx = (cy * ancestor_size + cx) * 4;
+        &ancestor[idx..idx + 4]
+    };
+
+    // Raw strip in ancestor resolution: `block` samples along the edge.
+    let mut strip: Vec<&[u8]> = Vec::with_capacity(block);
+    match direction {
+        EdgeDirection::Left => {
+            if bx == 0 {
+                return None;
+            }
+            let col = bx - 1;
+            for i in 0..block {
+                strip.push(px(col, by + i));
+            }
+        }
+        EdgeDirection::Right => {
+            if bx + block >= ancestor_size {
+                return None;
+            }
+            let col = bx + block;
+            for i in 0..block {
+                strip.push(px(col, by + i));
+            }
+        }
+        EdgeDirection::Top => {
+            if by == 0 {
+                return None;
+            }
+            let row = by - 1;
+            for i in 0..block {
+                strip.push(px(bx + i, row));
+            }
+        }
+        EdgeDirection::Bottom => {
+            if by + block >= ancestor_size {
+                return None;
+            }
+            let row = by + block;
+            for i in 0..block {
+                strip.push(px(bx + i, row));
+            }
+        }
+    }
+
+    // Nearest-neighbor upsample to the current tile's content size. Nearest
+    // (not bilinear) because the DEM bytes are packed RGB elevation —
+    // interpolating the packed bytes directly would corrupt the values.
+    let mut out = Vec::with_capacity(out_content_size * 4);
+    for i in 0..out_content_size {
+        let src = ((i * block) / out_content_size).min(block - 1);
+        out.extend_from_slice(strip[src]);
+    }
+    Some(out)
 }
 
 /// Store extracted edges in BufferStore
@@ -757,6 +945,84 @@ mod tests {
         for y in 0..size {
             assert_eq!(right_edge[y * 4], 3); // x=3
             assert_eq!(right_edge[y * 4 + 1], y as u8); // y
+        }
+    }
+
+    #[test]
+    fn extract_ancestor_edge_west_half_left_is_outside() {
+        // k=1: tile in the WEST half of the ancestor — its left-edge texels
+        // are west of the ancestor itself, so extraction must refuse.
+        let texture = create_test_texture(256);
+        assert!(extract_ancestor_edge(&texture, 0, 0, 1, EdgeDirection::Left, 256).is_none());
+        assert!(extract_ancestor_edge(&texture, 0, 1, 1, EdgeDirection::Left, 256).is_none());
+    }
+
+    #[test]
+    fn extract_ancestor_edge_east_half_left_reads_midline() {
+        // k=1: tile in the EAST half (rem_x=1) — its left-edge strip is the
+        // ancestor's column 127, rows selected by rem_y, upsampled 2x.
+        let texture = create_test_texture(256);
+
+        // NE quadrant child (rem_x=1, rem_y=0): rows 0..128
+        let strip = extract_ancestor_edge(&texture, 1, 0, 1, EdgeDirection::Left, 256).unwrap();
+        assert_eq!(strip.len(), 256 * 4);
+        for i in 0..256 {
+            assert_eq!(strip[i * 4], 127, "R should be ancestor x=127 at i={i}");
+            // nearest 2x upsample: output row i comes from ancestor row i/2
+            assert_eq!(strip[i * 4 + 1], (i / 2) as u8, "G at i={i}");
+        }
+
+        // SE quadrant child (rem_x=1, rem_y=1): rows 128..256
+        let strip = extract_ancestor_edge(&texture, 1, 1, 1, EdgeDirection::Left, 256).unwrap();
+        for i in 0..256 {
+            assert_eq!(strip[i * 4], 127);
+            assert_eq!(strip[i * 4 + 1], (128 + i / 2) as u8, "G at i={i}");
+        }
+    }
+
+    #[test]
+    fn extract_ancestor_edge_right_west_half_reads_midline() {
+        // k=1: tile in the WEST half — its right-edge strip is the ancestor's
+        // column 128.
+        let texture = create_test_texture(256);
+        let strip = extract_ancestor_edge(&texture, 0, 0, 1, EdgeDirection::Right, 256).unwrap();
+        for i in 0..256 {
+            assert_eq!(strip[i * 4], 128, "R should be ancestor x=128 at i={i}");
+            assert_eq!(strip[i * 4 + 1], (i / 2) as u8);
+        }
+        // EAST half: right edge would come from east of the ancestor.
+        assert!(extract_ancestor_edge(&texture, 1, 0, 1, EdgeDirection::Right, 256).is_none());
+    }
+
+    #[test]
+    fn extract_ancestor_edge_top_bottom() {
+        let texture = create_test_texture(256);
+        // South-half child (rem_y=1), top edge = ancestor row 127.
+        let strip = extract_ancestor_edge(&texture, 0, 1, 1, EdgeDirection::Top, 256).unwrap();
+        for i in 0..256 {
+            assert_eq!(strip[i * 4], (i / 2) as u8, "R (ancestor x) at i={i}");
+            assert_eq!(strip[i * 4 + 1], 127, "G should be ancestor y=127");
+        }
+        // North-half child, bottom edge = ancestor row 128.
+        let strip = extract_ancestor_edge(&texture, 1, 0, 1, EdgeDirection::Bottom, 256).unwrap();
+        for i in 0..256 {
+            assert_eq!(strip[i * 4], (128 + i / 2) as u8);
+            assert_eq!(strip[i * 4 + 1], 128);
+        }
+        // North-half child, top edge = outside the ancestor.
+        assert!(extract_ancestor_edge(&texture, 0, 0, 1, EdgeDirection::Top, 256).is_none());
+    }
+
+    #[test]
+    fn extract_ancestor_edge_deeper_k() {
+        // k=2: tile at rem (2,1) inside the ancestor, block = 64 px.
+        // Left edge: col = 2*64 - 1 = 127, rows 64..128, 4x upsample.
+        let texture = create_test_texture(256);
+        let strip = extract_ancestor_edge(&texture, 2, 1, 2, EdgeDirection::Left, 256).unwrap();
+        assert_eq!(strip.len(), 256 * 4);
+        for i in 0..256 {
+            assert_eq!(strip[i * 4], 127);
+            assert_eq!(strip[i * 4 + 1], (64 + i / 4) as u8, "G at i={i}");
         }
     }
 

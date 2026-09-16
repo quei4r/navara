@@ -239,6 +239,11 @@ export class TileTextureCompositor {
     return out;
   }
 
+  private isWebGPUBackend(): boolean {
+    return !!(this.renderer as { isWebGPURenderer?: boolean })
+      .isWebGPURenderer;
+  }
+
   markDirty(handle: TileHandle, reason: DirtyReason): void {
     this.cache.markDirty(handle, reason);
   }
@@ -276,6 +281,9 @@ export class TileTextureCompositor {
     }[],
     renderTargets: WebGLRenderTarget[],
   ): void {
+    // Vector draping is a GLSL bake pass — skipped on the WebGPU backend
+    // (its ShaderMaterial pipelines cannot compile there).
+    if (this.isWebGPUBackend()) return;
     this.bakeSlotTargets(slots, renderTargets, (slot) => {
       for (const source of slot.sources) {
         const scene = this.texturizedScenes.findSceneByLayerId(
@@ -493,6 +501,13 @@ export class TileTextureCompositor {
     features: CompositeFeatures,
   ): boolean {
     if (!this.cache.isDirty(handle)) return false;
+    // The composite pass is a GLSL ShaderMaterial bake — it cannot compile
+    // on the WebGPU backend. Consume the dirty state so the scheduler stops
+    // retrying; tiles sample raster textures directly there instead.
+    if (this.isWebGPUBackend()) {
+      this.cache.consumeDirty(handle);
+      return false;
+    }
     const entry = this.cache.getEntry(handle);
     if (!entry) return false;
 

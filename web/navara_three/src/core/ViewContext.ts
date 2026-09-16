@@ -8,7 +8,10 @@ import invariant from "tiny-invariant";
 import type { LayersManager } from "../layersManager";
 import { type ResolvedGBufferOptions } from "../material/gbufferLayout";
 import type { PickableMesh } from "../mesh/pickableMesh";
-import type { RenderPassOrchestrator } from "../orchestrators";
+import type {
+  RenderPassOrchestrator,
+  WebGpuDebugFlags,
+} from "../orchestrators";
 import type { CustomRenderPass } from "../passes";
 import type { Scenes } from "../scene";
 import type { MeshCache } from "../type";
@@ -138,11 +141,20 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
 
   /** Get the underlying WebGLRenderer instance. */
   getRenderer(): WebGLRenderer {
-    return this.renderPassOrchestrator.effectComposer.getRenderer();
+    return this.renderPassOrchestrator.renderer;
+  }
+
+  /** Debug switches for the experimental WebGPU forward path. */
+  get webgpuDebugFlags(): WebGpuDebugFlags {
+    return this.renderPassOrchestrator.debugFlags;
   }
 
   /** Get the input buffer from the effect composer. */
   getInputBuffer() {
+    invariant(
+      this.renderPassOrchestrator.effectComposer,
+      "Not available on the WebGPU backend.",
+    );
     return this.renderPassOrchestrator.effectComposer.inputBuffer;
   }
 

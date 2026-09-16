@@ -6,7 +6,6 @@ import {
   NearestFilter,
   NoColorSpace,
   RGBAFormat,
-  RGBFormat,
   UnsignedByteType,
   WebGLRenderTarget,
 } from "three";
@@ -134,7 +133,9 @@ export class HillshadeContext {
 
     if (!rt) {
       rt = new WebGLRenderTarget(width, height, {
-        format: RGBFormat,
+        // RGBAFormat: WebGPU has no 3-channel 8-bit renderable format (RGBFormat
+        // triggers "Unsupported texture type" under WebGPURenderer)
+        format: RGBAFormat,
         type: UnsignedByteType,
         minFilter: LinearFilter,
         magFilter: LinearFilter,
@@ -142,6 +143,9 @@ export class HillshadeContext {
         wrapT: ClampToEdgeWrapping,
         colorSpace: NoColorSpace,
         generateMipmaps: false,
+        // Normal-map generation is a fullscreen-quad pass; no depth needed
+        // (also avoids depth-stencil validation errors under WebGPU)
+        depthBuffer: false,
       });
       this.renderTargets.set(entityId, rt);
     }

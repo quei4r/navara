@@ -19,6 +19,22 @@ export type PickHelperOptions = {
 };
 
 /**
+ * Structural view of the WebGPURenderer API used here. Kept local so this
+ * module doesn't import `three/webgpu` (the WebGL bundle shouldn't pay for
+ * the node system just for picking).
+ */
+type WebGPURendererLike = {
+  isWebGPURenderer?: boolean;
+  readRenderTargetPixelsAsync(
+    renderTarget: WebGLRenderTarget,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ): Promise<Uint8Array>;
+};
+
+/**
  * Travel tolerance in CSS pixels between pointerdown and pointerup to count as a click.
  * Follows Cesium's `_clickPixelTolerance` (MapLibre uses 3px).
  * ref: https://github.com/CesiumGS/cesium/blob/9fda7ab97a762e40c74b1d0e1814c98a2de43337/packages/engine/Source/Core/ScreenSpaceEventHandler.js#L1012
@@ -82,6 +98,19 @@ export class PickHelper {
   private _camera: PerspectiveCamera;
   private _meshes: MeshCache;
   private onPickCallback: (pickArr: number[]) => void;
+  private onHoverCallback: (pickArr: number[]) => void;
+
+  /** True when the view runs on the WebGPURenderer forward path. */
+  private readonly isWebGPU: boolean;
+  /** A GPU pick is awaiting its async readback. */
+  private gpuPickRunning = false;
+  /** Latest queued GPU pick request; newer requests replace older ones. */
+  private gpuPickPending?: {
+    x: number;
+    y: number;
+    radius: number;
+    callback: (pickArr: number[]) => void;
+  };
 
   /** Dedicated scene used only during the pick render. */
   private readonly pickScene = new Scene();
@@ -91,7 +120,6 @@ export class PickHelper {
   /** Full-size render target used for click picking with scissor restriction. */
   private pickRenderTarget: WebGLRenderTarget;
 
-  private onHoverCallback: (pickArr: number[]) => void;
   /** Click picks run only while this returns true (e.g. featureClick listeners exist). */
   private shouldClickPick: () => boolean;
   /** Hover picks run only while this returns true (e.g. hover listeners exist). */
@@ -136,8 +164,25 @@ export class PickHelper {
       this.onHoverPointerMove(event);
     this.hoverLeaveHandler = () => this.onHoverPointerLeave();
 
-    const width = this._renderer.getContext().drawingBufferWidth;
-    const height = this._renderer.getContext().drawingBufferHeight;
+    this.isWebGPU = !!(
+      this._renderer as unknown as WebGPURendererLike
+    ).isWebGPURenderer;
+
+    let width: number;
+    let height: number;
+    if (this.isWebGPU) {
+      // The WebGPU renderer has no GL context; ask for the drawing buffer.
+      const size = (
+        this._renderer as unknown as {
+          getDrawingBufferSize: (target: Vector2) => Vector2;
+        }
+      ).getDrawingBufferSize(new Vector2());
+      width = size.x;
+      height = size.y;
+    } else {
+      width = this._renderer.getContext().drawingBufferWidth;
+      height = this._renderer.getContext().drawingBufferHeight;
+    }
 
     this.pickRenderTarget = new WebGLRenderTarget(width, height, {
       format: RGBAFormat,
@@ -240,6 +285,15 @@ export class PickHelper {
       // scheduled this frame and now. Re-check so no orphan pick runs.
       if (!this.shouldHoverPick()) return;
 
+      if (this.isWebGPU) {
+        this.requestWebGPUPick(
+          position.x,
+          position.y,
+          PICK_RADIUS,
+          this.onHoverCallback,
+        );
+        return;
+      }
       const batchId = this.pickBatchIdAt(position.x, position.y);
       this.onHoverCallback(batchId > 0 ? [batchId] : []);
     });
@@ -349,6 +403,8 @@ export class PickHelper {
 
   public renderDebugCanvas() {
     if (!this.debugBufferView || !this.debugRenderTarget) return;
+    // The debug view reads pixels back synchronously — WebGL only.
+    if (this.isWebGPU) return;
 
     // Full-screen debug view: no view-offset so we can see everything.
     this.processRender(this.debugRenderTarget);
@@ -358,9 +414,122 @@ export class PickHelper {
   private onClickPick(event: PointerEvent) {
     const radius =
       event.pointerType === "touch" ? TOUCH_PICK_RADIUS : PICK_RADIUS;
+    if (this.isWebGPU) {
+      this.requestWebGPUPick(
+        event.clientX,
+        event.clientY,
+        radius,
+        this.onPickCallback,
+      );
+      return;
+    }
     const batchId = this.pickBatchIdAt(event.clientX, event.clientY, radius);
     const pickArr = batchId > 0 ? [batchId] : [];
     this.onPickCallback(pickArr);
+  }
+
+  /**
+   * Queues a WebGPU pick. Readbacks are async, so picks run one at a time;
+   * while one is in flight only the newest request is kept (hover streams
+   * would otherwise pile up stale frames, and a click that lands during a
+   * hover pick still gets serviced right after it).
+   */
+  private requestWebGPUPick(
+    x: number,
+    y: number,
+    radius: number,
+    callback: (pickArr: number[]) => void,
+  ) {
+    this.gpuPickPending = { x, y, radius, callback };
+    if (this.gpuPickRunning) return;
+    this.gpuPickRunning = true;
+    void (async () => {
+      try {
+        while (this.gpuPickPending) {
+          const pending = this.gpuPickPending;
+          this.gpuPickPending = undefined;
+          try {
+            const batchId = await this.pickBatchIdAtWebGPU(
+              pending.x,
+              pending.y,
+              pending.radius,
+            );
+            pending.callback(batchId > 0 ? [batchId] : []);
+          } catch (e) {
+            console.error("[navara] WebGPU pick failed:", e);
+          }
+        }
+      } finally {
+        this.gpuPickRunning = false;
+      }
+    })();
+  }
+
+  /**
+   * Texture-space Y orientation of the pick render target. GL framebuffers
+   * (both the legacy WebGLRenderer and the WebGPURenderer's WebGL backend)
+   * are bottom-up; only the native WebGPU backend is top-down.
+   */
+  private isBottomUpTextureSpace(): boolean {
+    if (!this.isWebGPU) return true;
+    const backend = (
+      this._renderer as unknown as {
+        backend?: { isWebGPUBackend?: boolean };
+      }
+    ).backend;
+    return backend?.isWebGPUBackend !== true;
+  }
+
+  /**
+   * Computes the pick search window (in device pixels, clamped to the
+   * viewport) around a client-space pointer position. `minY`/`pickingCoord`
+   * are in texture space (see {@link isBottomUpTextureSpace}).
+   */
+  private computePickWindow(clientX: number, clientY: number, radiusCss: number) {
+    const rect = this.element.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+
+    const pixelRatio = this._renderer.getPixelRatio();
+    let fullWidth: number;
+    let fullHeight: number;
+    if (this.isWebGPU) {
+      const size = (
+        this._renderer as unknown as {
+          getDrawingBufferSize: (target: Vector2) => Vector2;
+        }
+      ).getDrawingBufferSize(new Vector2());
+      fullWidth = size.x;
+      fullHeight = size.y;
+    } else {
+      fullWidth = this._renderer.getContext().drawingBufferWidth;
+      fullHeight = this._renderer.getContext().drawingBufferHeight;
+    }
+
+    // gl_FragCoord-style pixel-space coords (centers at 0.5, 1.5, ...).
+    // Clamp to valid viewport bounds.
+    const pixelX = Math.max(
+      0,
+      Math.min(Math.floor(x * pixelRatio), fullWidth - 1),
+    );
+    const pixelY = Math.max(
+      0,
+      Math.min(Math.floor(y * pixelRatio), fullHeight - 1),
+    );
+    const bottomUp = this.isBottomUpTextureSpace();
+    const texY = bottomUp ? fullHeight - 1 - pixelY : pixelY;
+    const pickingCoord = new Vector2(pixelX + 0.5, texY + 0.5);
+
+    // The search window in device pixels, clamped to the viewport.
+    const radius = Math.max(0, Math.round(radiusCss * pixelRatio));
+    const minX = Math.max(0, pixelX - radius);
+    const maxX = Math.min(fullWidth - 1, pixelX + radius);
+    const minY = Math.max(0, texY - radius);
+    const maxY = Math.min(fullHeight - 1, texY + radius);
+    const width = maxX - minX + 1;
+    const height = maxY - minY + 1;
+
+    return { pixelX, texY, pickingCoord, minX, minY, width, height };
   }
 
   /**
@@ -373,74 +542,89 @@ export class PickHelper {
     clientY: number,
     radiusCss: number = PICK_RADIUS,
   ): number {
-    const rect = this.element.getBoundingClientRect();
-    const x = clientX - rect.left;
-    const y = clientY - rect.top;
-
-    const pixelRatio = this._renderer.getPixelRatio();
-    const fullWidth = this._renderer.getContext().drawingBufferWidth;
-    const fullHeight = this._renderer.getContext().drawingBufferHeight;
-
-    // gl_FragCoord-style pixel-space coords (centers at 0.5, 1.5, ...).
-    // Clamp to valid viewport bounds.
-    const pixelX = Math.max(
-      0,
-      Math.min(Math.floor(x * pixelRatio), fullWidth - 1),
-    );
-    const pixelY = Math.max(
-      0,
-      Math.min(Math.floor(y * pixelRatio), fullHeight - 1),
-    );
-    const pickingCoord = new Vector2(
-      pixelX + 0.5,
-      fullHeight - pixelY - 0.5, // flip Y for WebGL
-    );
-    const readY = fullHeight - 1 - pixelY;
-
-    // The search window in device pixels, clamped to the viewport.
-    const radius = Math.max(0, Math.round(radiusCss * pixelRatio));
-    const minX = Math.max(0, pixelX - radius);
-    const maxX = Math.min(fullWidth - 1, pixelX + radius);
-    const minY = Math.max(0, readY - radius);
-    const maxY = Math.min(fullHeight - 1, readY + radius);
-    const width = maxX - minX + 1;
-    const height = maxY - minY + 1;
+    const w = this.computePickWindow(clientX, clientY, radiusCss);
 
     // Keep the camera projection unchanged for wide lines / screen-space
     // expanded shaders, and limit fragment work to the window via scissor.
-    this._renderer.setScissor(minX, minY, width, height);
+    this._renderer.setScissor(w.minX, w.minY, w.width, w.height);
     this._renderer.setScissorTest(true);
 
-    this.processRender(this.pickRenderTarget, pickingCoord);
+    this.processRender(this.pickRenderTarget, w.pickingCoord);
 
-    if (this.pixelBuffer.length < width * height * 4) {
-      this.pixelBuffer = new Uint8Array(width * height * 4);
+    if (this.pixelBuffer.length < w.width * w.height * 4) {
+      this.pixelBuffer = new Uint8Array(w.width * w.height * 4);
     }
     this._renderer.readRenderTargetPixels(
       this.pickRenderTarget,
-      minX,
-      minY,
-      width,
-      height,
+      w.minX,
+      w.minY,
+      w.width,
+      w.height,
       this.pixelBuffer,
     );
 
     this._renderer.setScissorTest(false);
 
-    // The non-zero batch id nearest to the pointer wins, so a small feature
-    // beside a large one is still pickable by aiming at it.
+    return this.scanPickBuffer(this.pixelBuffer, w, w.width * 4);
+  }
+
+  /**
+   * WebGPU variant of {@link pickBatchIdAt}: the render is identical, but
+   * pixels come back through `readRenderTargetPixelsAsync`. The resolved
+   * buffer keeps the 256-byte row alignment of the underlying GPU copy, so
+   * the row stride is derived from the returned length instead of assuming
+   * tight packing.
+   */
+  private async pickBatchIdAtWebGPU(
+    clientX: number,
+    clientY: number,
+    radiusCss: number = PICK_RADIUS,
+  ): Promise<number> {
+    const w = this.computePickWindow(clientX, clientY, radiusCss);
+
+    this._renderer.setScissor(w.minX, w.minY, w.width, w.height);
+    this._renderer.setScissorTest(true);
+
+    this.processRender(this.pickRenderTarget, w.pickingCoord);
+
+    const renderer = this._renderer as unknown as WebGPURendererLike;
+    const data = await renderer.readRenderTargetPixelsAsync(
+      this.pickRenderTarget,
+      w.minX,
+      w.minY,
+      w.width,
+      w.height,
+    );
+
+    this._renderer.setScissorTest(false);
+
+    // Layout is (height - 1) padded rows + one final tight row.
+    const rowStride =
+      w.height > 1
+        ? (data.byteLength - w.width * 4) / (w.height - 1)
+        : w.width * 4;
+    return this.scanPickBuffer(data, w, rowStride);
+  }
+
+  /**
+   * The non-zero batch id nearest to the pointer wins, so a small feature
+   * beside a large one is still pickable by aiming at it. `rowStride` is the
+   * byte distance between rows (tight for WebGL, 256-aligned for WebGPU).
+   */
+  private scanPickBuffer(
+    data: Uint8Array,
+    w: { pixelX: number; texY: number; minX: number; minY: number; width: number; height: number },
+    rowStride: number,
+  ): number {
     let bestId = 0;
     let bestDistSq = Infinity;
-    for (let row = 0; row < height; row++) {
-      for (let col = 0; col < width; col++) {
-        const i = (row * width + col) * 4;
-        const id =
-          (this.pixelBuffer[i] << 16) +
-          (this.pixelBuffer[i + 1] << 8) +
-          this.pixelBuffer[i + 2];
+    for (let row = 0; row < w.height; row++) {
+      for (let col = 0; col < w.width; col++) {
+        const i = row * rowStride + col * 4;
+        const id = (data[i] << 16) + (data[i + 1] << 8) + data[i + 2];
         if (id === 0) continue;
-        const dx = minX + col - pixelX;
-        const dy = minY + row - readY;
+        const dx = w.minX + col - w.pixelX;
+        const dy = w.minY + row - w.texY;
         const distSq = dx * dx + dy * dy;
         if (distSq < bestDistSq) {
           bestDistSq = distSq;
