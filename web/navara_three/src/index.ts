@@ -3167,21 +3167,32 @@ export default class ThreeView<
       // sample and schedules a fresh capture at (x, y) for the next render.
       // Until the first readback lands the caller falls back to defaults.
       const depth = this.renderPassOrchestrator.requestDepthSample(x, y);
+      // The analytic ray/ellipsoid hit is always current (synchronous).
+      // GPU depth readbacks lag a frame or more, so on heavy pages a stale
+      // sample reconstructed with the moved camera can overshoot the zoom
+      // anchor far past the ground. Clamp to the closer of the two: the
+      // anchor may then only ever undershoot (zoom slows), never cross.
+      const rayHit = intersectRayEllipsoid(x, y, this._renderer, this._camera.raw);
       if (depth !== null && depth <= 0.99) {
-        return reconstructWebgpuWorldPosition(
+        const pos = reconstructWebgpuWorldPosition(
           x,
           y,
           depth,
           this._renderer,
           this._camera.raw,
         );
+        if (rayHit == null) return pos;
+        const camPos = this._camera.raw.position;
+        return camPos.distanceTo(pos) <= camPos.distanceTo(rayHit)
+          ? pos
+          : rayHit;
       }
       // The scene depth only contains depth-writing objects (terrain tiles
       // don't write depth), so over bare ground the GPU sample misses.
       // Fall back to the analytic ray/ellipsoid intersection so the
       // zoom-to-cursor handler still gets a ground distance — without it
       // the zoom overshoots below the ellipsoid.
-      return intersectRayEllipsoid(x, y, this._renderer, this._camera.raw);
+      return rayHit;
     }
     return this._terrainPicker.pick(
       x,
