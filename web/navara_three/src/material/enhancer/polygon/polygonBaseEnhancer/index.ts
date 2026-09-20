@@ -71,7 +71,7 @@ export function createPolygonBaseEnhancer(
       if (props.batchDataTexture) {
         mutates.setBatchDataTexture(props.batchDataTexture);
       }
-      updateMaterialProps(material, mergedProps);
+      updateMaterialProps(material, mergedProps, state.isTexturized);
     },
 
     update: (props: PolygonBaseProps): void => {
@@ -82,7 +82,7 @@ export function createPolygonBaseEnhancer(
       if (props.batchDataTexture) {
         mutates.setBatchDataTexture(props.batchDataTexture);
       }
-      updateMaterialProps(material, props);
+      updateMaterialProps(material, props, state.isTexturized);
     },
 
     states: (): PolygonBaseState => {
@@ -97,12 +97,8 @@ export function createPolygonBaseEnhancer(
 
     programCacheKey: (): string => {
       invariant(state, "mount() must be called before programCacheKey");
-      // Return cache key based on state that affects shader defines
+      // Return cache key based on state that affects shader defines.
       return JSON.stringify({
-        useBatchTexture: state.useBatchTexture,
-        useBatchColorShow: state.useBatchColorShow,
-        useBatchHeight: state.useBatchHeight,
-        useBatchExtrudedHeight: state.useBatchExtrudedHeight,
         isTexturized: state.isTexturized,
         clampToGround: state.clampToGround,
         useRTE: state.useRTE,

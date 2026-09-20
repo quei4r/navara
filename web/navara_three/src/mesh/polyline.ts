@@ -15,7 +15,14 @@ import {
   Vector4,
 } from "three";
 import type { DataTexture } from "three";
+import invariant from "tiny-invariant";
 
+import {
+  registerBatchedMaterial,
+  POLYLINE_BATCH_SUPPORT,
+  type BatchedAttributeName,
+  type BatchTextureSupport,
+} from "../batchTexture";
 import type { EventContext } from "../event/context";
 import { applyLitOption } from "../material";
 import { createPolylineMaterialEnhancer } from "../material/enhancer";
@@ -23,15 +30,8 @@ import { getWebGPU } from "../utils";
 
 import {
   BatchedFeatureMesh,
-  POLYLINE_BATCH_TEXTURE_ROWS,
   type BatchedFeatureAttributes,
 } from "./batchedFeature";
-import type {
-  BatchedAttributeName,
-  BatchTextureConfig,
-  BatchTextureRowKey,
-  DefaultBatchAttributeValues,
-} from "./batchTexture";
 import { GEOMETRY_TYPES } from "./constants";
 import { releaseGeometryArraysAfterUpload } from "./releaseGeometryArrays";
 import { setupRTECallback } from "./rtcRteHelper";
@@ -431,6 +431,7 @@ export class PolylineMesh extends BatchedFeatureMesh<
         width: meshMaterial.width,
         maxWidth: meshMaterial.maxWidth,
         isTexturized,
+        drapeRtSize: this.ctx.tileTextureCompositor.size,
         pickable: false,
         useRTE,
         transparent: meshMaterial.transparent,
@@ -966,63 +967,41 @@ export class PolylineMesh extends BatchedFeatureMesh<
     );
   }
 
-  _getBatchTextureRows(): BatchTextureRowKey[] {
-    // No EXTRUDED_HEIGHT: the polyline shaders declare no receiver for it,
-    // so accepting the attribute would break shader compilation.
-    return POLYLINE_BATCH_TEXTURE_ROWS;
+  _getBatchTextureSupport(): BatchTextureSupport {
+    return POLYLINE_BATCH_SUPPORT;
   }
 
   _initBatchDataTexture(): void {
-    // Call parent to create the texture
-    super._initBatchDataTexture();
-
-    // Update the enhancer with the new batchDataTexture
-    const texture = this._getBatchDataTexture();
-    if (texture) {
-      this.getEnhancer().update({
-        base: { useBatchTexture: true, batchDataTexture: { value: texture } },
-      });
-    }
+    invariant(this.batchLength != null);
+    // Register batchLength; the texture itself is created lazily on the
+    // first attribute write.
+    const uniform = registerBatchedMaterial(
+      this.material,
+      { ...this._getBatchTextureSupport(), batchLength: this.batchLength },
+      this.ctx.viewContext.getRenderer(),
+    );
+    this.getEnhancer().update({ base: { batchDataTexture: uniform } });
   }
 
-  /**
-   * Keep enhancer state in sync with batch-attribute usage so that
-   * customProgramCacheKey reflects the correct shader configuration.
-   *
-   * This mirrors PolygonMesh._updateBatchAttribute: when batch color
-   * is first enabled, also enable batchColorEnabled and set color to white.
-   */
   _updateBatchAttribute(
     batchId: number,
     attribute: BatchedAttributeName,
     value: number | number[] | boolean,
-  ): void {
-    switch (attribute) {
-      case "color": {
-        // When batch color is first used, enable batchColorEnabled and set material.color to white
-        if (!this.getEnhancer().states().batchColorEnabled) {
-          // Set material.color to white (multiplier identity) and enable batch color mode
-          this.getEnhancer().update({
-            base: { batchColorEnabled: true, color: 0xffffff },
-          });
-        }
-        this.getEnhancer().update({ base: { useBatchColorShow: true } });
-        break;
-      }
-      case "show": {
-        this.getEnhancer().update({ base: { useBatchColorShow: true } });
-        break;
-      }
-      case "height":
-        this.getEnhancer().update({ base: { useBatchHeight: true } });
-        break;
-      case "lineWidth":
-        this.getEnhancer().update({ base: { useBatchLineWidth: true } });
-        break;
-    }
+  ): boolean {
+    // Write the texture first: a rejected write must not stamp any define —
+    // the shaders have no safety net for an unwritten receiver.
+    if (!super._updateBatchAttribute(batchId, attribute, value)) return false;
 
-    // Call parent to update the batch texture
-    super._updateBatchAttribute(batchId, attribute, value);
+    if (attribute === "color") {
+      // When batch color is first used, set material.color to white
+      // (multiplier identity: white * batch color = batch color).
+      if (!this.getEnhancer().states().batchColorEnabled) {
+        this.getEnhancer().update({
+          base: { batchColorEnabled: true, color: 0xffffff },
+        });
+      }
+    }
+    return true;
   }
 
   _update(material: PolylineMaterial, active: boolean) {
@@ -1056,7 +1035,7 @@ export class PolylineMesh extends BatchedFeatureMesh<
     enhancer.update({
       base: {
         // `material.color` is used only when `batchColorEnabled` is `false`.
-        // Otherwise the color is updated via `_setFeatureColor` or the batch data texture.
+        // Otherwise the color comes from the batch data texture.
         color: base.batchColorEnabled ? undefined : material.color,
         minMaxHeight:
           minMaxHeights !== undefined
@@ -1152,24 +1131,6 @@ export class PolylineMesh extends BatchedFeatureMesh<
     }
     this.needsUpdate();
     enhancer.mutates().setPickingCoord(PICKING_COORD_SENTINEL);
-  }
-
-  _getDefaultBatchAttributeValues(): DefaultBatchAttributeValues {
-    return {
-      color: this.color,
-    };
-  }
-
-  _setFeatureColor(color: Color): void {
-    // Called by evaluator to override feature color
-    // Set batchColorEnabled=true to prevent _update() from overwriting with material.color
-    this.getEnhancer().update({
-      base: { batchColorEnabled: true, color: color.getHex() },
-    });
-  }
-
-  _setFeatureShow(visible: boolean): void {
-    this.visible = visible;
   }
 
   clone() {

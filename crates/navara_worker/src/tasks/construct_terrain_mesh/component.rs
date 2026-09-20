@@ -17,6 +17,7 @@ pub struct ConstructTerrainMeshParameters {
     pub tile_handle: TileHandle,
     /// Whether to render skirts along tile boundaries.
     pub skirt: bool,
+    pub pole_sides: (bool, bool),
     /// Multiplier for the automatically calculated skirt height.
     pub skirt_exaggeration: f32,
     pub is_quantized_mesh: bool,
@@ -44,13 +45,12 @@ pub struct ConstructTerrainMeshResult {
 }
 
 impl FreeResultBuffers for ConstructTerrainMeshResult {
-    fn remove_from_buf(&self, buf: &mut BufferStore) -> Vec<u32> {
+    fn remove_from_buf(&self, buf: &mut BufferStore) {
         self.geometry.remove_from_buf(buf);
         buf.remove(&self.heights);
         if let Some(watermask) = &self.watermask {
             buf.remove(watermask);
         }
-        Vec::new()
     }
 }
 

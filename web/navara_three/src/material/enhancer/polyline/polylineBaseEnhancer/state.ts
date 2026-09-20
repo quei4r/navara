@@ -18,22 +18,20 @@ export const DEFAULT_BASE_PROPS: Required<
   width: 1,
   maxWidth: 1000,
   isTexturized: false,
+  drapeRtSize: 512,
   pickable: false,
   effectIdsMask: 0,
   emissiveColor: 0,
   emissiveIntensity: 0,
   useRTE: false,
   batchColorEnabled: false,
-  useBatchTexture: false,
-  useBatchColorShow: false,
-  useBatchHeight: false,
-  useBatchLineWidth: false,
 };
 
 /** Default state derived from DEFAULT_BASE_PROPS */
 export const DEFAULT_BASE_STATE: PolylineBaseState = {
   useRTE: DEFAULT_BASE_PROPS.useRTE,
   isTexturized: DEFAULT_BASE_PROPS.isTexturized,
+  drapeRtSize: DEFAULT_BASE_PROPS.drapeRtSize,
   pickable: DEFAULT_BASE_PROPS.pickable,
   effectIdsMask: DEFAULT_BASE_PROPS.effectIdsMask,
   emissiveColor: DEFAULT_BASE_PROPS.emissiveColor,
@@ -44,10 +42,6 @@ export const DEFAULT_BASE_STATE: PolylineBaseState = {
   maxWidth: DEFAULT_BASE_PROPS.maxWidth,
   color: DEFAULT_BASE_PROPS.color,
   batchColorEnabled: DEFAULT_BASE_PROPS.batchColorEnabled,
-  useBatchTexture: DEFAULT_BASE_PROPS.useBatchTexture,
-  useBatchColorShow: DEFAULT_BASE_PROPS.useBatchColorShow,
-  useBatchHeight: DEFAULT_BASE_PROPS.useBatchHeight,
-  useBatchLineWidth: DEFAULT_BASE_PROPS.useBatchLineWidth,
 };
 
 /**
@@ -68,6 +62,7 @@ export const updateState = (
     // RTE cannot change after mount - always preserve current value
     useRTE: currentState.useRTE,
     isTexturized,
+    drapeRtSize: props.drapeRtSize ?? currentState.drapeRtSize,
     pickable: props.pickable ?? currentState.pickable,
     effectIdsMask: props.effectIdsMask ?? currentState.effectIdsMask,
     emissiveColor: props.emissiveColor ?? currentState.emissiveColor,
@@ -78,14 +73,8 @@ export const updateState = (
     width: props.width ?? currentState.width,
     maxWidth: props.maxWidth ?? currentState.maxWidth,
     color: props.color ?? currentState.color,
-    // Batch flags can only transition from false to true, never back
+    // batchColorEnabled can only transition from false to true, never back
     batchColorEnabled:
       currentState.batchColorEnabled || !!props.batchColorEnabled,
-    useBatchTexture: currentState.useBatchTexture || !!props.useBatchTexture,
-    useBatchColorShow:
-      currentState.useBatchColorShow || !!props.useBatchColorShow,
-    useBatchHeight: currentState.useBatchHeight || !!props.useBatchHeight,
-    useBatchLineWidth:
-      currentState.useBatchLineWidth || !!props.useBatchLineWidth,
   };
 };

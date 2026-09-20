@@ -47,6 +47,7 @@ import {
 import invariant from "tiny-invariant";
 
 import { Atmosphere, type AtmosphereOptions } from "./atmosphere";
+import { flushBatchTextureUpdates } from "./batchTexture";
 import { ThreeViewCamera } from "./camera";
 import { Color } from "./Color";
 import { createDefaultConcurrencyManager } from "./concurrency";
@@ -220,6 +221,7 @@ export type {
 } from "./terrain/sampleTerrainMostDetailed";
 export * from "./constants";
 export * from "./light";
+export * from "./batchTexture";
 export * from "./mesh";
 export * from "./layer";
 export * from "./source";
@@ -1952,7 +1954,9 @@ export default class ThreeView<
    */
   private _reportFixedGpuBytes(): void {
     if (this._disposed || !this._core) return;
-    const bytes = this.renderPassOrchestrator.estimateFixedGpuBytes();
+    const bytes =
+      this.renderPassOrchestrator.estimateFixedGpuBytes() +
+      (this._tileTextureCompositor?.fixedGpuBytes() ?? 0);
     this.framesSinceFixedGpuBytesReport = 0;
     if (bytes === this.lastReportedFixedGpuBytes) return;
     this.lastReportedFixedGpuBytes = bytes;
@@ -2967,6 +2971,9 @@ export default class ThreeView<
       this._forceFeatureUpdates(time);
 
       const updated = this._update(time);
+      // Batch texture writes accumulated during event processing above are
+      // turned into partial GPU uploads here, before the render consumes them.
+      flushBatchTextureUpdates(this._renderer);
       if (updated || this._renderFlag.forceUpdate || this._renderFlag.animation)
         this._render(time);
       this._renderFlag.forceUpdate = false;
