@@ -82,8 +82,102 @@ class DepthPickPass {
   }
 }
 
-export class TerrainPicker {
-  private depthPickPass: DepthPickPass;
+/**
+ * Reconstructs the world-space position for a WebGPU depth sample.
+ * `depth` is the NDC depth read from the scene target's depth texture
+ * ([0, 1], row 0 = screen top); `x`/`y` are CSS pixels. Mirrors
+ * `TerrainPicker._reconstructWorldPosition` but with the WebGPU conventions:
+ * clip z = depth directly (no ×2−1) and the logarithmic depth formula is
+ * Ulrich's variant used by TSL (`log2(-viewZ/near)/log2(far/near)`).
+ */
+export function reconstructWebgpuWorldPosition(
+  x: number,
+  y: number,
+  depth: number,
+  renderer: WebGLRenderer,
+  camera: PerspectiveCamera,
+): Vector3 {
+  const size = renderer.getDrawingBufferSize(new Vector2());
+  const pixelRatio = renderer.getPixelRatio();
+  const texelCenter = (cssCoord: number, sizePx: number) =>
+    Math.max(0, Math.min(sizePx - 1, Math.floor(cssCoord * pixelRatio))) + 0.5;
+  const ndcX = (texelCenter(x, size.x) / size.x) * 2 - 1;
+  const ndcY = -((texelCenter(y, size.y) / size.y) * 2 - 1);
+
+  const near = camera.near;
+  const far = camera.far;
+  const logarithmic = !!(
+    renderer as { logarithmicDepthBuffer?: boolean }
+  ).logarithmicDepthBuffer;
+  // Inverse of TSL's viewZToLogarithmicDepth / perspectiveDepthToViewZ.
+  const viewZ = logarithmic
+    ? -near * Math.pow(far / near, depth)
+    : (near * far) / ((far - near) * depth - far);
+
+  // Any clip z lands on the same view-space ray; scale it to the known
+  // viewZ (same trick as the WebGL picker).
+  const eye = new Vector4(ndcX, ndcY, depth, 1).applyMatrix4(
+    camera.projectionMatrixInverse,
+  );
+  if (eye.w !== 0) eye.divideScalar(eye.w);
+  const scale = viewZ / eye.z;
+  return new Vector3(eye.x * scale, eye.y * scale, viewZ).applyMatrix4(
+    camera.matrixWorld,
+  );
+}
+
+/**
+ * Analytic ray/WGS84-ellipsoid intersection, used as the WebGPU
+ * pickDepthPosition fallback: the scene depth texture only contains
+ * depth-writing objects (terrain tiles don't write depth), so over bare
+ * ground the GPU sample misses — but the zoom-to-cursor handler still
+ * needs a ground distance there or the zoom overshoots below the
+ * ellipsoid. `x`/`y` are CSS pixels; returns the ECEF hit point or null
+ * when the ray misses the ellipsoid (e.g. pointing at the sky).
+ */
+export function intersectRayEllipsoid(
+  x: number,
+  y: number,
+  renderer: WebGLRenderer,
+  camera: PerspectiveCamera,
+): Nullable<Vector3> {
+  const size = renderer.getDrawingBufferSize(new Vector2());
+  const pixelRatio = renderer.getPixelRatio();
+  const rect = (
+    renderer as { domElement?: HTMLCanvasElement }
+  ).domElement?.getBoundingClientRect();
+  const cssW = rect?.width || size.x / pixelRatio;
+  const cssH = rect?.height || size.y / pixelRatio;
+  const relX = x - (rect?.left ?? 0);
+  const relY = y - (rect?.top ?? 0);
+  const ndcX = (relX / cssW) * 2 - 1;
+  const ndcY = -((relY / cssH) * 2 - 1);
+
+  const v = new Vector4(ndcX, ndcY, 1, 1).applyMatrix4(
+    camera.projectionMatrixInverse,
+  );
+  if (v.w !== 0) v.divideScalar(v.w);
+  const dir = new Vector3(v.x, v.y, v.z).transformDirection(camera.matrixWorld);
+  const o = camera.position; // ECEF world space
+
+  // WGS84: x²/a² + y²/a² + z²/b² = 1
+  const a = 6378137.0;
+  const b = 6356752.314245;
+  const aa = a * a;
+  const bb = b * b;
+  const A = (dir.x * dir.x + dir.y * dir.y) / aa + (dir.z * dir.z) / bb;
+  const B = 2 * ((o.x * dir.x + o.y * dir.y) / aa + (o.z * dir.z) / bb);
+  const C = (o.x * o.x + o.y * o.y) / aa + (o.z * o.z) / bb - 1;
+  const disc = B * B - 4 * A * C;
+  if (disc < 0) return null;
+  const sqrt = Math.sqrt(disc);
+  let t = (-B - sqrt) / (2 * A);
+  if (t < 0) t = (-B + sqrt) / (2 * A);
+  if (t < 0) return null;
+  return new Vector3(o.x + dir.x * t, o.y + dir.y * t, o.z + dir.z * t);
+}
+
+export class TerrainPicker {  private depthPickPass: DepthPickPass;
 
   constructor() {
     this.depthPickPass = new DepthPickPass();

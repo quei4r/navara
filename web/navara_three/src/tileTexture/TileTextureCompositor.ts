@@ -33,6 +33,7 @@ import {
   type CoreUniformMutates,
 } from "../material/enhancer/tileComposite";
 import { type TexturizedSceneByTileCoordinates } from "../scene";
+import { getWebGPU } from "../utils";
 
 import type { SlotPlan } from "./SlotPlanner";
 import { TileTextureCache } from "./TileTextureCache";
@@ -220,6 +221,17 @@ export class TileTextureCompositor {
     depthWrite: false,
     blending: NoBlending,
   });
+  // WebGPU equivalent of `msaaResolveMaterial`: GLSL ShaderMaterial cannot
+  // compile on the node pipeline, so the resolve copy runs as a
+  // MeshBasicNodeMaterial with the same unpremultiply. The WebGPU
+  // render-target layout is V-flipped relative to WebGL (row 0 = NDC y=+1),
+  // so the copy samples v' = 1 - v to land the same orientation the direct
+  // (non-MSAA) bake produces. Lazily created: getWebGPU() throws until
+  // ThreeView.init() resolves the dynamic node-system import.
+  private msaaResolveNode: {
+    material: unknown;
+    setMap: (texture: Texture) => void;
+  } | null = null;
 
   // 1×1 no-data underlay for baked heatmap targets, drawn through the same
   // value-preserving bake pipeline as the sources — a texture upload is
@@ -510,9 +522,48 @@ export class TileTextureCompositor {
   /** Copy a resolved MSAA image into the current render target, dividing
    * coverage back out (see `msaaResolveMaterial`). */
   private drawMsaaResolveQuad(texture: Texture): void {
+    if (this.isWebGPUBackend()) {
+      const node = (this.msaaResolveNode ??= this.createMsaaResolveNode());
+      node.setMap(texture);
+      this.quadMesh.material = node.material as typeof this.quadMesh.material;
+      this.renderer.render(this.quadScene, this.quadCamera);
+      return;
+    }
     this.msaaResolveMaterial.uniforms.map.value = texture;
     this.quadMesh.material = this.msaaResolveMaterial;
     this.renderer.render(this.quadScene, this.quadCamera);
+  }
+
+  private createMsaaResolveNode(): {
+    material: unknown;
+    setMap: (texture: Texture) => void;
+  } {
+    const { webgpu, tsl } = getWebGPU();
+    const placeholder = new DataTexture(new Uint8Array(4), 1, 1);
+    placeholder.needsUpdate = true;
+    // Sample with v flipped: WebGPU render-target row 0 is NDC y=+1, so an
+    // unflipped copy would invert the bake relative to the direct path.
+    const mapNode = tsl.texture(
+      placeholder,
+      tsl.vec2(tsl.uv().x, tsl.uv().y.oneMinus()),
+    );
+    const t = mapNode.toVar();
+    const material = new webgpu.MeshBasicNodeMaterial({
+      depthTest: false,
+      depthWrite: false,
+      blending: NoBlending,
+      toneMapped: false,
+    });
+    material.colorNode = tsl.vec4(
+      tsl.select(t.a.greaterThan(0), t.rgb.div(t.a), tsl.vec3(0)),
+      t.a,
+    );
+    return {
+      material,
+      setMap: (texture) => {
+        mapNode.value = texture;
+      },
+    };
   }
 
   /**
@@ -780,6 +831,8 @@ export class TileTextureCompositor {
     this.quadMesh.geometry.dispose();
     this.rasterBakeMaterial.dispose();
     this.msaaResolveMaterial.dispose();
+    (this.msaaResolveNode?.material as { dispose(): void } | undefined)?.dispose();
+    this.msaaResolveNode = null;
     this.msaaBakeTarget?.dispose();
     this.msaaBakeTarget = null;
     this.demNoDataTexture?.dispose();

@@ -3,8 +3,12 @@ import { EffectComposer, Pass as PostProcessingPass } from "postprocessing";
 import {
   AmbientLight,
   DirectionalLight,
+  FloatType,
   HalfFloatType,
   HemisphereLight,
+  Mesh,
+  OrthographicCamera,
+  PlaneGeometry,
   PointLight,
   Scene,
   SpotLight,
@@ -12,7 +16,7 @@ import {
   WebGLRenderer,
   Group,
 } from "three";
-import type { Object3D, Vector3 } from "three";
+import type { Object3D, Texture, Vector3 } from "three";
 import type { PostProcessing, RenderTarget } from "three/webgpu";
 
 import { estimateFixedGpuBytes } from "../utils/fixedGpuFootprint";
@@ -224,6 +228,112 @@ export class RenderPassOrchestrator {
   /** Debug switches for the WebGPU forward path (never set in production). */
   readonly debugFlags: WebGpuDebugFlags;
 
+  // --- WebGPU scene-depth sampling (zoom-to-cursor support) ---------------
+  // TerrainPicker's GLSL depth-sample pass is WebGL-only; on the WebGPU
+  // forward path the depth lives in the scene target's depth texture. GPU
+  // readbacks are async, so the synchronous pick API (pickDepthPosition,
+  // called per wheel event) consumes the most recent completed sample and
+  // each request schedules a fresh capture on the next render.
+  private depthSampleRequest: [number, number] | null = null; // CSS px
+  private depthSampleValue: number | null = null;
+  private depthSampleReadInFlight = false;
+  private depthSample?: {
+    target: RenderTarget;
+    scene: Scene;
+    camera: OrthographicCamera;
+    uv: { value: Vector2 };
+    texNode: { value: Texture };
+  };
+
+  /**
+   * WebGPU only: returns the latest asynchronously-read scene depth (NDC
+   * [0, 1]) at the most recently requested screen point, or null until the
+   * first readback lands (and on the noPost debug path, where no scene
+   * target exists). Schedules a fresh capture at (`x`, `y`) — CSS pixels —
+   * for the next render.
+   */
+  requestDepthSample(x: number, y: number): number | null {
+    this.depthSampleRequest = [x, y];
+    return this.depthSampleValue;
+  }
+
+  private captureDepthSample(target: RenderTarget): void {
+    const { webgpu, tsl } = getWebGPU();
+    if (!this.depthSample) {
+      const rt = new webgpu.RenderTarget(1, 1, {
+        type: FloatType,
+        depthBuffer: false,
+        stencilBuffer: false,
+      });
+      const uv = tsl.uniform(new Vector2(0.5, 0.5));
+      const depthNode = tsl.texture(new webgpu.DepthTexture(1, 1));
+      const material = new webgpu.MeshBasicNodeMaterial({
+        depthTest: false,
+        depthWrite: false,
+        toneMapped: false,
+      });
+      material.colorNode = tsl.vec4(depthNode.sample(uv).x, 0, 0, 1);
+      const scene = new Scene();
+      scene.add(new Mesh(new PlaneGeometry(2, 2), material));
+      this.depthSample = {
+        target: rt,
+        scene,
+        camera: new OrthographicCamera(-1, 1, 1, -1, 0, 1),
+        uv: uv as unknown as { value: Vector2 },
+        texNode: depthNode as unknown as { value: Texture },
+      };
+    }
+    const request = this.depthSampleRequest;
+    this.depthSampleRequest = null;
+    const depthTexture = target.depthTexture;
+    const sample = this.depthSample;
+    if (!request || !depthTexture || !sample) return;
+
+    // The depth texture node must follow target recreation (resize).
+    sample.texNode.value = depthTexture;
+    // Sample the exact texel center: WebGPU depth texture row 0 is NDC
+    // y=+1 (screen top), so v = cy / height — no flip.
+    const renderer = this.renderer;
+    const size = renderer.getDrawingBufferSize(new Vector2());
+    const pixelRatio = renderer.getPixelRatio();
+    const cx =
+      Math.max(0, Math.min(size.x - 1, Math.floor(request[0] * pixelRatio))) +
+      0.5;
+    const cy =
+      Math.max(0, Math.min(size.y - 1, Math.floor(request[1] * pixelRatio))) +
+      0.5;
+    sample.uv.value.set(cx / size.x, cy / size.y);
+
+    const prevTarget = renderer.getRenderTarget();
+    renderer.setRenderTarget(
+      sample.target as unknown as Parameters<WebGLRenderer["setRenderTarget"]>[0],
+    );
+    renderer.render(sample.scene, sample.camera);
+    renderer.setRenderTarget(prevTarget);
+
+    if (this.depthSampleReadInFlight) return;
+    this.depthSampleReadInFlight = true;
+    (
+      renderer as unknown as {
+        readRenderTargetPixelsAsync: (
+          t: RenderTarget,
+          x: number,
+          y: number,
+          w: number,
+          h: number,
+        ) => Promise<ArrayBufferView>;
+      }
+    )
+      .readRenderTargetPixelsAsync(sample.target, 0, 0, 1, 1)
+      .then((pixels) => {
+        this.depthSampleValue = (pixels as Float32Array)[0];
+        this.depthSampleReadInFlight = false;
+      })
+      .catch(() => {
+        this.depthSampleReadInFlight = false;
+      });
+  }
+
   constructor(renderer: WebGLRenderer, options: RenderPassOrchestratorOptions) {
     this.renderer = renderer;
     this.debugFlags = options.debugFlags ?? {};
@@ -340,6 +450,9 @@ export class RenderPassOrchestrator {
       }
       // Back to the canvas before the post chain — the PP quad samples the
       // scene target, so it must not render into it.
+      if (this.depthSampleRequest && target?.depthTexture) {
+        this.captureDepthSample(target);
+      }
       renderer.setRenderTarget(null);
       if (!noPP) {
         this.scenePostProcessing?.render();
@@ -373,6 +486,11 @@ export class RenderPassOrchestrator {
     const target = new webgpu.RenderTarget(width, height, {
       type: HalfFloatType,
     });
+    // Attach a sampleable depth texture: pickDepthPosition's WebGPU path
+    // reads it back (async, 1 texel) to anchor zoom-to-cursor.
+    const depthTexture = new webgpu.DepthTexture(width, height);
+    depthTexture.isRenderTargetTexture = true;
+    target.depthTexture = depthTexture;
     this.sceneTarget = target;
     const sceneColor = tsl.texture(target.texture);
     const rawPP = this.debugFlags.rawPost ?? false;

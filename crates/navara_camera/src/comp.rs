@@ -237,6 +237,11 @@ pub struct CameraInertia {
     pub translate_time: f32,
     pub zoom: FloatType,
     pub zoom_time: f32,
+    /// Remaining zoom distance as of the previous frame, so `apply_zoom`
+    /// can move by the per-frame eased delta instead of re-applying the
+    /// remaining distance every frame (which compounded into a
+    /// frame-rate-dependent overshoot).
+    pub zoom_prev_remaining: FloatType,
     pub pan: Vec3,
 }
 
@@ -249,6 +254,7 @@ impl Default for CameraInertia {
             translate_time: 500.,
             zoom: 0.,
             zoom_time: 100.,
+            zoom_prev_remaining: 0.,
             pan: Vec3::ZERO,
         }
     }
@@ -265,6 +271,7 @@ impl CameraInertia {
     pub fn zoom(&mut self, v: f64) {
         self.zoom = v;
         self.zoom_time = 0.;
+        self.zoom_prev_remaining = v;
         self.spin = Vec3::ZERO;
         self.translate = Vec3::ZERO;
     }

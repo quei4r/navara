@@ -129,7 +129,11 @@ import {
   PickHelper,
   TAP_PIXEL_TOLERANCE,
 } from "./pick/pickHelper";
-import { TerrainPicker } from "./pick/pickTerrain";
+import {
+  intersectRayEllipsoid,
+  reconstructWebgpuWorldPosition,
+  TerrainPicker,
+} from "./pick/pickTerrain";
 import { AttributionPlugin, type AttributionPluginOptions } from "./plugins";
 import { TexturizedSceneByTileCoordinates, type Scenes } from "./scene";
 import { ShadowMapViewers } from "./ShadowMapViewers";
@@ -3157,10 +3161,28 @@ export default class ThreeView<
    * @returns World position Vector3 in ECEF coordinates, or null if nothing is hit
    */
   pickDepthPosition(x: number, y: number): Nullable<Vector3> {
-    // The GLSL depth-sample pass is WebGL-only; on the WebGPU forward path
-    // there is no MRT depth copy to sample. Returning null lets callers
-    // (e.g. the zoom-to-cursor input handler) fall back to defaults.
-    if (this.renderPassOrchestrator.backend !== "webgl") return null;
+    if (this.renderPassOrchestrator.backend !== "webgl") {
+      // WebGPU forward path: depth is read back asynchronously from the
+      // scene target's depth texture, so this consumes the latest completed
+      // sample and schedules a fresh capture at (x, y) for the next render.
+      // Until the first readback lands the caller falls back to defaults.
+      const depth = this.renderPassOrchestrator.requestDepthSample(x, y);
+      if (depth !== null && depth <= 0.99) {
+        return reconstructWebgpuWorldPosition(
+          x,
+          y,
+          depth,
+          this._renderer,
+          this._camera.raw,
+        );
+      }
+      // The scene depth only contains depth-writing objects (terrain tiles
+      // don't write depth), so over bare ground the GPU sample misses.
+      // Fall back to the analytic ray/ellipsoid intersection so the
+      // zoom-to-cursor handler still gets a ground distance — without it
+      // the zoom overshoots below the ellipsoid.
+      return intersectRayEllipsoid(x, y, this._renderer, this._camera.raw);
+    }
     return this._terrainPicker.pick(
       x,
       y,

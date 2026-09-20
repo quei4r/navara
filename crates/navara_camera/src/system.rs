@@ -912,7 +912,14 @@ fn apply_zoom(orbit: &mut Orbit, inertia: &mut CameraInertia, controller: &Camer
     if t > 1. {
         return;
     }
-    let next_zoom = inertia.zoom * (1. - ease_out_circ(t) as f64);
+    // `zoom * (1 - ease(t))` is the REMAINING distance at time t. Applying
+    // it directly every frame compounds into a frame-rate-dependent
+    // overshoot that can drive the camera below the terrain; move only by
+    // this frame's decrease of the remainder so the total travel over the
+    // animation is exactly `zoom`.
+    let remaining = inertia.zoom * (1. - ease_out_circ(t) as f64);
+    let next_zoom = inertia.zoom_prev_remaining - remaining;
+    inertia.zoom_prev_remaining = remaining;
     let next = orbit.local_position - orbit.local_forward * next_zoom;
     let length = next.length();
     if length >= controller.maximum_zoom_distance && next_zoom > 0. {
