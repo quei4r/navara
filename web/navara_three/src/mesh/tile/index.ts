@@ -1694,7 +1694,7 @@ ${generateTileCommonInjection(maxTextures)}
       // shared empty texture and forces a re-bake + re-bind on the next
       // frame's resolver update() (bindSlots then re-syncs the node slots).
       this.rasterDrape.syncMaterialSlots(textureFragments);
-      this.vectorDrape.syncMaterialSlots(textureFragments);
+      this.vectorDrape.syncMaterialSlots();
       this._syncWebgpuSlotNodes();
       return;
     }

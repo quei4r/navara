@@ -7,6 +7,14 @@
 
 # Navara
 
+> **This is a personal fork** ([quei4r/navara](https://github.com/quei4r/navara)) of [reearth/navara](https://github.com/reearth/navara): **a personal, self-use experimental WebGPU port** — the renderer is being migrated from WebGL2 to three.js `WebGPURenderer` (TSL node materials) on the `webgpu-renderer-port` branch.
+>
+> - 个人自用 WebGPU 实验版，不向上游提交 PR。
+> - 尽量保持与上游 reearth/navara 的同步更新（merge 上游变更进本 fork）。
+> - 欢迎提 PR 和 issue（包括与上游同步相关的改进）。
+>
+> For the upstream README, read on below.
+
 Web map engines have long forced a choice: engines with polished declarative APIs are easy to adopt but hard to extend beyond their built-in features, while engines that expose deep low-level control are powerful but demand steep expertise. Fully 3D globe applications usually leave no option but the latter. Navara is a highly extensible 3D map engine built to remove that trade-off. It streams real-world GIS data, from satellite imagery and terrain to 3D city models and vector data, onto an interactive globe, and lets you present it the way your application needs: as a clean basemap for data visualization, styled per feature by attributes, or as a photorealistic scene with atmosphere, sunlight, and shadows.
 
 Navara's answer to the trade-off is a tiered API. Capabilities are organized into four tiers, so you start with the simplicity of a declarative engine and drop down, as far as the render pipeline itself, only when you need more control:

@@ -21,6 +21,7 @@ import {
 import invariant from "tiny-invariant";
 
 import {
+  attachBatchedMaterial,
   readBatchScalar,
   readBatchShowOpacity,
   registerBatchedMaterial,
@@ -41,6 +42,11 @@ import { getWebGPU } from "../../utils";
 import { buildBatchIndexMap } from "../batchIndexMap";
 import { GEOMETRY_TYPES, type GeometryType } from "../constants";
 import { PickableMesh } from "../pickableMesh";
+import {
+  createWebgpuBatchSampler,
+  eagerAllocateBatchTexture,
+  syncWebgpuBatchTexture,
+} from "../webgpuBatchTexture";
 
 import { BillboardAtlas, type AtlasRect } from "./billboardAtlas";
 import { loadAtlasImageFromUrl } from "./billboardAtlasImageLoader";
@@ -94,6 +100,16 @@ type InstancedSpriteWebgpuHandles = {
   uFovRad: { value: number };
   uScreenHeightPx: { value: number };
   uPickable: { value: number };
+  /** Mesh-level style defaults (batch texture values replace them once
+   *  written — the gates mirror the classic write-time USE_BATCH_* defines). */
+  uAddHeight: { value: number };
+  uColor: { value: Color };
+  uOpacity: { value: number };
+  gateColor: { value: number };
+  gateHeight: { value: number };
+  gateShowOpacity: { value: number };
+  /** Batch texture node; re-pointed if the shared uniform swaps textures. */
+  batchTex?: { value: unknown };
   /** Texture node whose `.value` is swapped as the billboard atlas grows. */
   spriteTex?: { value: unknown };
   src: ShaderMaterial;
@@ -627,8 +643,22 @@ export class InstancedSpriteMesh
     const mutates = enhancer.mutates();
     mutates.updateUniforms(material.uniforms, enhancer.states());
 
+    // Register for per-feature styling before either material path: the WebGPU
+    // node graph bakes the batch texture's layout rows in as constants, so the
+    // texture must exist (eager identity allocation) before it is built; the
+    // classic path allocates lazily on the first attribute write.
+    const batchUniform = registerBatchedMaterial(
+      material,
+      { ...this._getBatchTextureSupport(), batchLength: this._batchLength },
+      this.ctx.viewContext.getRenderer(),
+    );
+    enhancer.update({ base: { batchDataTexture: batchUniform } });
+
     let nodeMaterial: Material | null = null;
     if (this._isWebGPUBackend()) {
+      eagerAllocateBatchTexture(material, SPRITE_BATCH_SUPPORT, {
+        showOpacity: true,
+      });
       // The GLSL enhancer pipeline (onBeforeCompile) never runs on the WebGPU
       // backend, and the shared Renderer only invokes object.onBeforeRender —
       // not material.onBeforeRender — so the per-frame uniform hook moves to
@@ -697,15 +727,6 @@ export class InstancedSpriteMesh
       material.onBeforeCompile = enhancer.transformShader;
     }
 
-    // Register for per-feature styling. Slots and the texture itself are
-    // allocated lazily on the first attribute write.
-    const batchUniform = registerBatchedMaterial(
-      material,
-      { ...this._getBatchTextureSupport(), batchLength: this._batchLength },
-      this.ctx.viewContext.getRenderer(),
-    );
-    enhancer.update({ base: { batchDataTexture: batchUniform } });
-
     // Handle billboard texture
     if (isBillboard && m.material.url) {
       await this._setDefaultImage(m.material.url);
@@ -726,7 +747,8 @@ export class InstancedSpriteMesh
    * WebGPU instancedSprite material: a TSL node material reproducing the
    * classic GLSL enhancer pipeline (instancedSprite.vert/frag.glsl), which
    * never runs on this backend:
-   *  - vertex: per-instance params/color/batchId/declutter attributes, RTE
+   *  - vertex: per-instance batchId/declutter attributes + per-feature style
+   *    from the shared batch data texture (keyed by `_batchid`), RTE
    *    high/low or RTC view-space anchor resolve, ellipsoidal horizon culling
    *    + hidden/decluttered/empty-rect culling (clip position collapsed to
    *    vec4(0)), view-space billboard expansion with pxToWorld scaling when
@@ -767,6 +789,12 @@ export class InstancedSpriteMesh
       uFovRad: T.uniform(1) as unknown as { value: number },
       uScreenHeightPx: T.uniform(1080) as unknown as { value: number },
       uPickable: T.uniform(0) as unknown as { value: number },
+      uAddHeight: T.uniform(0) as unknown as { value: number },
+      uColor: T.uniform(new Color(1, 1, 1)) as unknown as { value: Color },
+      uOpacity: T.uniform(1) as unknown as { value: number },
+      gateColor: T.uniform(0) as unknown as { value: number },
+      gateHeight: T.uniform(0) as unknown as { value: number },
+      gateShowOpacity: T.uniform(0) as unknown as { value: number },
       src,
     };
     if (billboard) {
@@ -790,6 +818,12 @@ export class InstancedSpriteMesh
       uFovRad,
       uScreenHeightPx,
       uPickable,
+      uAddHeight,
+      uColor,
+      uOpacity,
+      gateColor,
+      gateHeight,
+      gateShowOpacity,
       spriteTex,
     } = handles as unknown as Record<string, any>;
 
@@ -798,20 +832,37 @@ export class InstancedSpriteMesh
     // Per-instance attributes (instancedSprite.vert.glsl). The quad uv is
     // exactly position.xy + 0.5; deriving it keeps the `uv` attribute out of
     // the node graph (WebGPU caps vertex buffers at 8, and the RTE billboard
-    // path needs every remaining slot).
-    const params: any = T.attribute("instanceParams");
-    const instanceColor: any = T.attribute("instanceColor");
+    // path needs every remaining slot). Per-feature style comes from the
+    // shared batch data texture keyed by the `_batchid` instance attribute.
     const instanceBatchID: any = T.attribute("instanceBatchID");
     const declutterHide: any = T.attribute("instanceDeclutterHide");
     const uvRect: any = billboard ? T.attribute("instanceUvRect") : null;
     const quad: any = T.positionGeometry;
     const uvQuad = quad.xy.add(0.5);
 
-    const instanceHeight = params.x;
-    const instanceSize = params.y;
-    const instanceShow = params.z;
+    // Batch-texture style (instancedSprite.vert.glsl + batch_texture_vertex):
+    // mesh-level defaults (uAddHeight/uScale/uOpacity/uColor) hold until a
+    // per-feature write lands; the gates mirror the classic write-time
+    // USE_BATCH_* defines, and `size` carries a -1 fallback sentinel.
+    const batch =
+      this._batchLength > 0
+        ? createWebgpuBatchSampler(T, src, this._batchLength)
+        : null;
+    if (batch) handles.batchTex = batch.texNode;
+    const batchShowOpacity = batch?.showOpacity() ?? null;
+    const instanceShow = batchShowOpacity?.show ?? T.float(1);
+    const batchHeight = batch?.scalar("height");
+    const instanceHeight = batchHeight
+      ? T.mix(uAddHeight, batchHeight, gateHeight)
+      : uAddHeight;
+    const batchSize = batch?.scalar("size");
+    const instanceSize = batchSize ?? T.float(-1);
+    const batchColor = batch?.vec3("color");
     const vOpacity = T.varying(
-      params.w.mul(declutterHide.oneMinus()),
+      (batchShowOpacity
+        ? T.mix(uOpacity, batchShowOpacity.opacity, gateShowOpacity)
+        : uOpacity
+      ).mul(declutterHide.oneMinus()),
       "nvr_opacity",
     );
 
@@ -872,7 +923,10 @@ export class InstancedSpriteMesh
     const vBatchIDNode = T.varying(instanceBatchID, "nvr_batchId");
     T.nodeObject(vBatchIDNode).setInterpolation("flat");
     const vBatchID = vBatchIDNode;
-    const vColor = T.varying(instanceColor, "nvr_instanceColor");
+    const vColor = T.varying(
+      batchColor ? T.mix(uColor, batchColor, gateColor) : uColor,
+      "nvr_instanceColor",
+    );
 
     // mvr_getMvHeightOffset: height along the ellipsoid normal, rotated into
     // view space (a w=0 transform, so the translation column never contributes).
@@ -968,6 +1022,10 @@ export class InstancedSpriteMesh
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
     m.userData.nvrWebgpu = handles;
+    // Batch writes address this.material, which becomes this node material
+    // (_initMaterial's return value); attach it to the classic material's
+    // batch texture state so updateBatchAttribute keeps landing.
+    attachBatchedMaterial(src, m);
     this._syncWebgpuHandles(handles);
     return m as Material;
   }
@@ -1024,6 +1082,17 @@ export class InstancedSpriteMesh
     setN(w.uFovRad, u.uFovRad as { value: number } | undefined);
     setN(w.uScreenHeightPx, u.uScreenHeightPx as { value: number } | undefined);
     setN(w.uPickable, u.nvr_uPickable as { value: number } | undefined);
+    setN(w.uAddHeight, u.uAddHeight as { value: number } | undefined);
+    setN(w.uOpacity, u.uOpacity as { value: number } | undefined);
+    const uColor = u.uColor as { value: Color } | undefined;
+    if (uColor) w.uColor.value.copy(uColor.value);
+    // Batch gates mirror the classic write-time USE_BATCH_* defines, stamped
+    // on every attached material by the batch texture module.
+    const defines = (w.src.userData.defines ?? {}) as Record<string, unknown>;
+    w.gateColor.value = defines.USE_BATCH_COLOR ? 1 : 0;
+    w.gateHeight.value = defines.USE_BATCH_HEIGHT ? 1 : 0;
+    w.gateShowOpacity.value = defines.USE_BATCH_SHOW_OPACITY ? 1 : 0;
+    if (w.batchTex) syncWebgpuBatchTexture({ texNode: w.batchTex }, w.src);
 
     // The atlas texture object is replaced whenever the atlas grows;
     // re-point the TSL texture node (NodeSampledTexture rebinds on change).

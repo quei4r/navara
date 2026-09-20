@@ -6,7 +6,6 @@ import {
 import {
   BufferAttribute,
   BufferGeometry,
-  Color,
   Matrix4,
   MeshBasicMaterial,
   MeshLambertMaterial,
@@ -17,7 +16,6 @@ import {
   Vector2,
   Vector3,
 } from "three";
-import type { DataTexture } from "three";
 import invariant from "tiny-invariant";
 
 import { PolygonOutlineMesh } from "..";
@@ -41,6 +39,11 @@ import {
 import { GEOMETRY_TYPES } from "./constants";
 import { releaseGeometryArraysAfterUpload } from "./releaseGeometryArrays";
 import { setupRTECallback } from "./rtcRteHelper";
+import {
+  createWebgpuBatchSampler,
+  eagerAllocateBatchTexture,
+  syncWebgpuBatchTexture,
+} from "./webgpuBatchTexture";
 
 /** Set to true to render bounding spheres as wireframe spheres for debugging. */
 const DEBUG_BOUNDING_SPHERE = false;
@@ -55,10 +58,13 @@ type PolygonWebgpuHandles = {
   uMinMaxHeight: { value: Vector2 };
   uAddHeight: { value: number };
   uAddExtrudedHeight: { value: number };
-  gateColorShow: { value: number };
+  gateColor: { value: number };
   gateHeight: { value: number };
   gateExtrudedHeight: { value: number };
+  gateEmissive: { value: number };
   uPickable: { value: number };
+  /** Batch texture node; re-pointed if the shared uniform swaps textures. */
+  batchTex?: { value: unknown };
   /** Enhancer-mounted classic material; per-frame prop source. */
   src: MeshLambertMaterial;
   rte?: {
@@ -96,6 +102,11 @@ export class PolygonMesh extends BatchedFeatureMesh<
   private _maxBatchHeight = 0;
   /** Running max of per-feature batch extruded height values */
   private _maxBatchExtrudedHeight = 0;
+  /** First-write flags gating the replacing batch attributes in the WebGPU
+   *  node graph (the classic path uses write-time USE_BATCH_* defines). */
+  private _batchHeightUsed = false;
+  private _batchExtrudedHeightUsed = false;
+  private _batchEmissiveUsed = false;
 
   readonly ctx: EventContext;
   /** Layer ID for SelectiveEffect handling */
@@ -466,18 +477,23 @@ export class PolygonMesh extends BatchedFeatureMesh<
     const { webgpu, tsl: T } = getWebGPU();
     const src = this.material;
 
-    // The node graph fetches the batch texture in the vertex stage, so it
-    // must exist before the material is built (created lazily on the classic
-    // path).
+    // The node graph fetches the batch texture in the vertex stage with
+    // layout rows baked in as constants, so every supported row/slot must be
+    // allocated before the material is built (the classic path allocates
+    // lazily on first write). Eager identity writes also whiten src.color
+    // (batch-color multiplier convention) — restore it; a real color write
+    // re-whitens through the enhancer's batchColorEnabled path.
     this._initBatchDataTexture();
-    const batchTex = src.userData.batchDataTexture?.value as
-      DataTexture | null | undefined;
-    const batchCfg = src.userData.batchTextureConfig as
-      BatchTextureConfig | undefined;
-    const hasBatch =
-      batchTex != null &&
-      batchCfg != null &&
-      this.geometry.getAttribute("_batchid") != null;
+    const keepColor = src.color.clone();
+    eagerAllocateBatchTexture(src, POLYGON_BATCH_SUPPORT, {
+      showOpacity: true,
+    });
+    src.color.copy(keepColor);
+    const batch =
+      this.batchLength != null &&
+      this.geometry.getAttribute("_batchid") != null
+        ? createWebgpuBatchSampler(T, src, this.batchLength)
+        : null;
 
     const handles: PolygonWebgpuHandles = {
       uMinMaxHeight: T.uniform(new Vector2(0, 0)) as unknown as {
@@ -485,9 +501,10 @@ export class PolygonMesh extends BatchedFeatureMesh<
       },
       uAddHeight: T.uniform(0) as unknown as { value: number },
       uAddExtrudedHeight: T.uniform(0) as unknown as { value: number },
-      gateColorShow: T.uniform(0) as unknown as { value: number },
+      gateColor: T.uniform(0) as unknown as { value: number },
       gateHeight: T.uniform(0) as unknown as { value: number },
       gateExtrudedHeight: T.uniform(0) as unknown as { value: number },
+      gateEmissive: T.uniform(0) as unknown as { value: number },
       uPickable: T.uniform(0) as unknown as { value: number },
       src,
     };
@@ -495,9 +512,10 @@ export class PolygonMesh extends BatchedFeatureMesh<
       uMinMaxHeight,
       uAddHeight,
       uAddExtrudedHeight,
-      gateColorShow,
+      gateColor,
       gateHeight,
       gateExtrudedHeight,
+      gateEmissive,
       uPickable,
       // TSL's chained node methods don't survive the library's generic
       // typings; the graph is runtime-checked by the node builder instead
@@ -508,49 +526,42 @@ export class PolygonMesh extends BatchedFeatureMesh<
     // Vertex: batch-texture lookups (per-feature color/show/opacity/heights).
     // texture().load() (texel fetch) works in the vertex stage and needs no
     // sampler — float32 linear filtering is an optional WebGPU feature.
+    // color/show/opacity sample identity defaults (white / visible / 1) until
+    // written, so only the replacing attributes (heights, emissive) and the
+    // vertex-color-replacing batch color need gates.
     let addHeight: any = uAddHeight;
     let addExtrudedHeight: any = uAddExtrudedHeight;
     let vBatchColor: any = T.varying(T.vec3(1, 1, 1), "nvr_batchColor");
     let vShow: any = T.varying(T.float(1), "nvr_show");
     let vOpacity: any = T.varying(T.float(1), "nvr_opacity");
-    if (hasBatch && batchTex && batchCfg) {
-      const rows = batchCfg.rows;
-      const rowCount = rows.length;
-      const texW = batchTex.image.width;
-      const texNode = T.texture(batchTex);
-      const bid: any = T.attribute("_batchid");
-      const col = bid.mod(texW).toUint();
-      const rowBase = bid.div(texW).floor().mul(rowCount).toUint();
-      const fetchRow = (rowKey: BatchTextureRowKey): any =>
-        texNode.load(T.uvec2(col, rowBase.add(rows.indexOf(rowKey))));
-      // decodeRGBAToFloat: 4 bytes little-endian reinterpreted as f32.
-      // NOTE: each component is converted individually — a vec4-wide
-      // `.toUint()` collapses to a scalar and every swizzle then reads the
-      // same (x) lane (observed in the generated WGSL).
-      const decode = (texel: any): any => {
-        const b = texel.mul(255);
-        const bx = b.x.toUint();
-        const by = b.y.toUint();
-        const bz = b.z.toUint();
-        const bw = b.w.toUint();
-        return T.uintBitsToFloat(
-          bx
-            .bitOr(by.shiftLeft(T.uint(8)))
-            .bitOr(bz.shiftLeft(T.uint(16)))
-            .bitOr(bw.shiftLeft(T.uint(24))),
+    let vBatchEmissive: any = T.varying(T.vec3(0, 0, 0), "nvr_batchEmissive");
+    if (batch) {
+      handles.batchTex = batch.texNode;
+      const colorNode = batch.vec3("color");
+      if (colorNode) vBatchColor = T.varying(colorNode, "nvr_batchColor");
+      const showOpacity = batch.showOpacity();
+      if (showOpacity) {
+        vShow = T.varying(showOpacity.show, "nvr_show");
+        vOpacity = T.varying(showOpacity.opacity, "nvr_opacity");
+      }
+      const emissiveNode = batch.vec3("emissive");
+      const emissiveIntensity = batch.scalar("emissiveIntensity");
+      if (emissiveNode && emissiveIntensity) {
+        vBatchEmissive = T.varying(
+          emissiveNode.mul(emissiveIntensity),
+          "nvr_batchEmissive",
         );
-      };
-      const colorShow = fetchRow("COLOR_SHOW");
-      const packedByte = colorShow.a.mul(255).add(0.5).floor().clamp(0, 255);
-      vBatchColor = T.varying(colorShow.rgb, "nvr_batchColor");
-      vShow = T.varying(T.step(128, packedByte), "nvr_show");
-      vOpacity = T.varying(packedByte.mod(128).div(127), "nvr_opacity");
-      addHeight = T.mix(uAddHeight, decode(fetchRow("HEIGHT")), gateHeight);
-      addExtrudedHeight = T.mix(
-        uAddExtrudedHeight,
-        decode(fetchRow("EXTRUDED_HEIGHT")),
-        gateExtrudedHeight,
-      );
+      }
+      const batchHeight = batch.scalar("height");
+      if (batchHeight) addHeight = T.mix(uAddHeight, batchHeight, gateHeight);
+      const batchExtrudedHeight = batch.scalar("extrudedHeight");
+      if (batchExtrudedHeight) {
+        addExtrudedHeight = T.mix(
+          uAddExtrudedHeight,
+          batchExtrudedHeight,
+          gateExtrudedHeight,
+        );
+      }
     }
 
     // Vertex: base position + extrusion (transformed += scaleNormalAndCap.xyz
@@ -616,11 +627,11 @@ export class PolygonMesh extends BatchedFeatureMesh<
     );
     m.colorNode = T.Fn(() => {
       // show_fragment.glsl: discard hidden / fully transparent features.
-      T.mix(T.float(1), vShow, gateColorShow).lessThan(0.5).discard();
-      T.mix(T.float(1), vOpacity, gateColorShow).lessThanEqual(0).discard();
+      vShow.lessThan(0.5).discard();
+      vOpacity.lessThanEqual(0).discard();
       return T.vec4(
         T.materialColor.rgb
-          .mul(T.mix(T.vec3(1, 1, 1), vBatchColor, gateColorShow))
+          .mul(T.mix(T.vec3(1, 1, 1), vBatchColor, gateColor))
           .mul(uPickable.oneMinus()),
         1,
       );
@@ -630,20 +641,30 @@ export class PolygonMesh extends BatchedFeatureMesh<
       // property — materialEmissive would build a color uniform with an
       // undefined value and crash the WebGPU uniform update. Basic: pick
       // color only, gated by uPickable (colorNode zeroes diffuse when picking).
+      // batch_emissive_fragment.glsl: a written batch emissive REPLACES the
+      // material's emissive term.
       "emissive" in m
-        ? T.mix(T.materialEmissive, pickColor, uPickable)
+        ? T.mix(
+            T.mix(T.materialEmissive, vBatchEmissive, gateEmissive),
+            pickColor,
+            uPickable,
+          )
         : pickColor.mul(uPickable);
     m.opacityNode = T.mix(
-      T.materialOpacity.mul(T.mix(T.float(1), vOpacity, gateColorShow)),
+      T.materialOpacity.mul(vOpacity),
       T.float(1),
       uPickable,
     );
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
-    // Point the batch plumbing (userData.defines / batchDataTexture /
-    // batchTextureConfig, written later by updateBatchAttribute) at the same
-    // objects the classic material used.
+    // Share the classic material's userData (uPickable etc.) with the node
+    // material; batch writes keep landing via attachBatchedMaterial below.
     Object.assign(m.userData, src.userData);
+    // Batch writes address this.material, which is about to become the node
+    // material; attach it to the classic material's batch texture state so
+    // updateBatchAttribute keeps landing (the state lives in a module-private
+    // WeakMap keyed by material, not in userData).
+    attachBatchedMaterial(src, m);
     m.userData.nvrWebgpu = handles;
     this.material = m as MeshLambertMaterial;
   }
@@ -664,10 +685,12 @@ export class PolygonMesh extends BatchedFeatureMesh<
     );
     w.uAddHeight.value = b.addHeight;
     w.uAddExtrudedHeight.value = b.addExtrudedHeight;
-    w.gateColorShow.value = b.useBatchColorShow ? 1 : 0;
-    w.gateHeight.value = b.useBatchHeight ? 1 : 0;
-    w.gateExtrudedHeight.value = b.useBatchExtrudedHeight ? 1 : 0;
+    w.gateColor.value = b.batchColorEnabled ? 1 : 0;
+    w.gateHeight.value = this._batchHeightUsed ? 1 : 0;
+    w.gateExtrudedHeight.value = this._batchExtrudedHeightUsed ? 1 : 0;
+    w.gateEmissive.value = this._batchEmissiveUsed ? 1 : 0;
     w.uPickable.value = b.pickable ? 1 : 0;
+    if (w.batchTex) syncWebgpuBatchTexture({ texNode: w.batchTex }, w.src);
     // Props the enhancer writes on its own (classic) material.
     const m = this.material;
     m.color.copy(w.src.color);
@@ -893,7 +916,13 @@ export class PolygonMesh extends BatchedFeatureMesh<
         this.outline?.enableBatchShowOpacity();
         break;
       }
+      case "emissive":
+      case "emissiveIntensity": {
+        this._batchEmissiveUsed = true;
+        break;
+      }
       case "height": {
+        this._batchHeightUsed = true;
         this.outline?.enableBatchHeight();
         const h = value as number;
         if (h > this._maxBatchHeight) this._maxBatchHeight = h;
@@ -902,6 +931,7 @@ export class PolygonMesh extends BatchedFeatureMesh<
         break;
       }
       case "extrudedHeight": {
+        this._batchExtrudedHeightUsed = true;
         this.outline?.enableBatchExtrudedHeight();
         const eh = value as number;
         if (eh > this._maxBatchExtrudedHeight)

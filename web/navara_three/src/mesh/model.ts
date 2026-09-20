@@ -51,6 +51,11 @@ import { GEOMETRY_TYPES } from "./constants";
 import type { FeatureMesh } from "./featureMesh";
 import type { PickableMesh } from "./pickableMesh";
 import { releaseGeometryArraysAfterUpload } from "./releaseGeometryArrays";
+import {
+  createWebgpuBatchSampler,
+  eagerAllocateBatchTexture,
+  syncWebgpuBatchTexture,
+} from "./webgpuBatchTexture";
 
 export type ModelMaterial = MeshStandardMaterial | MeshPhysicalMaterial;
 
@@ -76,8 +81,11 @@ type PntsMaterialEnhancer = ReturnType<typeof createPntsEnhancer>;
  * through the enhancer-mounted node material on their own.
  */
 type ModelWebgpuHandles = {
-  gateColorShow: { value: number };
+  gateColor: { value: number };
+  gateEmissive: { value: number };
   uPickable: { value: number };
+  /** Batch texture node; re-pointed if the shared uniform swaps textures. */
+  batchTex?: { value: unknown };
   /** Selective effect: 1 when effectIdsMask > 0 (see effectIdsMask). */
   uEffectGate: { value: number };
   uEmissiveIntensity: { value: number };
@@ -137,6 +145,14 @@ export class ModelMesh
   private _pntsEnhancers = new Map<
     Points<BufferGeometry<NormalBufferAttributes>, PointsMaterial>,
     PntsMaterialEnhancer
+  >();
+
+  /** First-write flags gating the replacing batch emissive in the WebGPU node
+   *  graph, per child mesh (the classic path uses a write-time
+   *  USE_BATCH_EMISSIVE define). */
+  private _batchEmissiveUsed = new WeakMap<
+    Mesh<BufferGeometry<NormalBufferAttributes>, ModelMaterial>,
+    boolean
   >();
 
   // model credit for attribution
@@ -309,6 +325,12 @@ export class ModelMesh
         });
       }
     }
+    if (attribute === "emissive" || attribute === "emissiveIntensity") {
+      // First-write flag gating the replacing batch emissive in the WebGPU
+      // node graph (the classic path uses a write-time USE_BATCH_EMISSIVE
+      // define).
+      this._batchEmissiveUsed.set(mesh, true);
+    }
   }
 
   private _setupMeshNode(
@@ -480,16 +502,23 @@ export class ModelMesh
     }
     Object.assign(m.userData, src.userData);
 
-    // The batch texture is created lazily on the classic path; the node graph
-    // fetches it in the vertex stage, so it must exist before first render.
+    // The batch texture's layout rows are baked into the node graph as
+    // constants, so every supported row/slot must be allocated before the
+    // graph is built (the classic path allocates lazily on first write).
+    // Eager identity writes whiten src.color (batch-color multiplier
+    // convention), but m.color was already copied above and the enhancer
+    // re-whitens through batchColorEnabled on a real color write.
     this._initBatchDataTexture(mesh);
-    const batchTex = m.userData.batchDataTexture?.value as
-      DataTexture | undefined;
-    const hasBatch =
-      batchTex != null && mesh.geometry.getAttribute("_batchid") != null;
+    eagerAllocateBatchTexture(src, MODEL_BATCH_SUPPORT, { showOpacity: true });
+    const batch =
+      this.batchLength != null &&
+      mesh.geometry.getAttribute("_batchid") != null
+        ? createWebgpuBatchSampler(T, src, this.batchLength)
+        : null;
 
     const handles: ModelWebgpuHandles = {
-      gateColorShow: T.uniform(0),
+      gateColor: T.uniform(0),
+      gateEmissive: T.uniform(0),
       uPickable: T.uniform(0),
       uEffectGate: T.uniform(0),
       uEmissiveIntensity: T.uniform(0),
@@ -507,7 +536,8 @@ export class ModelMesh
       waterNormalNode: null,
     };
     const {
-      gateColorShow,
+      gateColor,
+      gateEmissive,
       uPickable,
       uEffectGate,
       uEmissiveIntensity,
@@ -525,18 +555,24 @@ export class ModelMesh
     let vBatchColor: any = T.varying(T.vec3(1, 1, 1), "nvr_mBatchColor");
     let vShow: any = T.varying(T.float(1), "nvr_mShow");
     let vOpacity: any = T.varying(T.float(1), "nvr_mOpacity");
-    if (hasBatch && batchTex) {
-      const texW = batchTex.image.width;
-      const texNode = T.texture(batchTex);
-      const bid: any = T.attribute("_batchid");
-      // COLOR_SHOW is the only row: physical row == floor(batchId / texW).
-      const col = bid.mod(texW).toUint();
-      const row = bid.div(texW).floor().toUint();
-      const colorShow = texNode.load(T.uvec2(col, row));
-      const packedByte = colorShow.a.mul(255).add(0.5).floor().clamp(0, 255);
-      vBatchColor = T.varying(colorShow.rgb, "nvr_mBatchColor");
-      vShow = T.varying(T.step(128, packedByte), "nvr_mShow");
-      vOpacity = T.varying(packedByte.mod(128).div(127), "nvr_mOpacity");
+    let vBatchEmissive: any = T.varying(T.vec3(0, 0, 0), "nvr_mBatchEmissive");
+    if (batch) {
+      handles.batchTex = batch.texNode;
+      const colorNode = batch.vec3("color");
+      if (colorNode) vBatchColor = T.varying(colorNode, "nvr_mBatchColor");
+      const showOpacity = batch.showOpacity();
+      if (showOpacity) {
+        vShow = T.varying(showOpacity.show, "nvr_mShow");
+        vOpacity = T.varying(showOpacity.opacity, "nvr_mOpacity");
+      }
+      const emissiveNode = batch.vec3("emissive");
+      const emissiveIntensity = batch.scalar("emissiveIntensity");
+      if (emissiveNode && emissiveIntensity) {
+        vBatchEmissive = T.varying(
+          emissiveNode.mul(emissiveIntensity),
+          "nvr_mBatchEmissive",
+        );
+      }
     }
 
     // Pick color from the GLOBAL batch id (matches pick.glsl). The id
@@ -567,12 +603,12 @@ export class ModelMesh
     m.vertexColors = false;
     m.colorNode = T.Fn(() => {
       // show_fragment.glsl: discard hidden / fully transparent features.
-      T.mix(T.float(1), vShow, gateColorShow).lessThan(0.5).discard();
-      T.mix(T.float(1), vOpacity, gateColorShow).lessThanEqual(0).discard();
+      vShow.lessThan(0.5).discard();
+      vOpacity.lessThanEqual(0).discard();
       const featureColor = T.mix(
         vColor ?? T.vec3(1, 1, 1),
         vBatchColor,
-        gateColorShow,
+        gateColor,
       );
       return T.vec4(
         T.materialColor.rgb.mul(featureColor).mul(uPickable.oneMinus()),
@@ -660,13 +696,25 @@ export class ModelMesh
       // normal-map path alive when water is off.
       m.normalNode = T.mix(T.materialNormal, waterNormal, uWater);
     }
-    m.emissiveNode = T.mix(fxEmissive, pickColor, uPickable);
+    m.emissiveNode = T.mix(
+      // batch_emissive_fragment.glsl: a written batch emissive REPLACES the
+      // material's emissive term (folded rgb × intensity in the vertex stage).
+      T.mix(fxEmissive, vBatchEmissive, gateEmissive),
+      pickColor,
+      uPickable,
+    );
     m.opacityNode = T.mix(
-      T.materialOpacity.mul(T.mix(T.float(1), vOpacity, gateColorShow)),
+      T.materialOpacity.mul(vOpacity),
       T.float(1),
       uPickable,
     );
     /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    // Batch writes address mesh.material, which is about to become the node
+    // material; attach it to the classic material's batch texture state so
+    // updateBatchAttribute keeps landing (the state lives in a module-private
+    // WeakMap keyed by material, not in userData).
+    attachBatchedMaterial(src, m);
 
     m.userData.nvrWebgpu = handles;
     mesh.material = m as ModelMaterial;
@@ -678,8 +726,12 @@ export class ModelMesh
       const enhancer = this._enhancers.get(mesh);
       if (!enhancer) return;
       const { base: b, water: w } = enhancer.states();
-      handles.gateColorShow.value = b.useBatchColorShow ? 1 : 0;
+      handles.gateColor.value = b.batchColorEnabled ? 1 : 0;
+      handles.gateEmissive.value = this._batchEmissiveUsed.get(mesh) ? 1 : 0;
       handles.uPickable.value = b.pickable ? 1 : 0;
+      if (handles.batchTex) {
+        syncWebgpuBatchTexture({ texNode: handles.batchTex }, mesh.material);
+      }
       handles.uEffectGate.value = b.effectIdsMask > 0 ? 1 : 0;
       handles.uEmissiveIntensity.value = b.emissiveIntensity;
       handles.uWater.value = w.useWater ? 1 : 0;

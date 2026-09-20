@@ -14,10 +14,10 @@ import {
   Vector3,
   Vector4,
 } from "three";
-import type { DataTexture } from "three";
 import invariant from "tiny-invariant";
 
 import {
+  attachBatchedMaterial,
   registerBatchedMaterial,
   POLYLINE_BATCH_SUPPORT,
   type BatchedAttributeName,
@@ -35,6 +35,11 @@ import {
 import { GEOMETRY_TYPES } from "./constants";
 import { releaseGeometryArraysAfterUpload } from "./releaseGeometryArrays";
 import { setupRTECallback } from "./rtcRteHelper";
+import {
+  createWebgpuBatchSampler,
+  eagerAllocateBatchTexture,
+  syncWebgpuBatchTexture,
+} from "./webgpuBatchTexture";
 
 // Sentinel value for picking coordinate when not picking (reused to avoid allocations)
 const PICKING_COORD_SENTINEL = new Vector2(-1, -1);
@@ -71,10 +76,11 @@ type PolylineWebgpuHandles = {
   uViewportAndPixelRatio: { value: Vector3 };
   uFrustumNearFar: { value: Vector2 };
   uFrustumRatio: { value: Vector4 };
-  gateColorShow: { value: number };
+  gateColor: { value: number };
   gateHeight: { value: number };
-  gateLineWidth: { value: number };
   uPickable: { value: number };
+  /** Batch texture node; re-pointed if the shared uniform swaps textures. */
+  batchTex?: { value: unknown };
   /** Enhancer-mounted classic material; per-frame prop/uniform source. */
   src: ShaderMaterial;
   rte?: {
@@ -113,6 +119,9 @@ export class PolylineMesh extends BatchedFeatureMesh<
   private _enhancedMaterial?: ReturnType<typeof createPolylineMaterialEnhancer>;
   /** Flag indicating geometry initialization failed - mesh should never be visible */
   private _geometryInitFailed = false;
+  /** First-write flag gating the replacing batch height in the WebGPU node
+   *  graph (the classic path uses a write-time USE_BATCH_HEIGHT define). */
+  private _batchHeightUsed = false;
 
   constructor(ctx: EventContext) {
     super(new BufferGeometry<Attributes>(), new ShaderMaterial());
@@ -548,18 +557,24 @@ export class PolylineMesh extends BatchedFeatureMesh<
     const { webgpu, tsl: T } = getWebGPU();
     const src = this.material;
 
-    // The node graph fetches the batch texture in the vertex stage, so it
-    // must exist before the material is built (created lazily on the classic
-    // path).
+    // The node graph fetches the batch texture in the vertex stage with
+    // layout rows baked in as constants, so every supported row/slot must be
+    // allocated before the material is built (the classic path allocates
+    // lazily on first write). Eager identity writes also whiten the enhancer's
+    // color uniform (batch-color multiplier convention) — restore it; a real
+    // color write re-whitens through the enhancer's batchColorEnabled path.
     this._initBatchDataTexture();
-    const batchTex = src.userData.batchDataTexture?.value as
-      DataTexture | null | undefined;
-    const batchCfg = src.userData.batchTextureConfig as
-      BatchTextureConfig | undefined;
-    const hasBatch =
-      batchTex != null &&
-      batchCfg != null &&
-      this.geometry.getAttribute("_batchid") != null;
+    const colorUniform = src.uniforms.color?.value as Color | undefined;
+    const keepColor = colorUniform?.clone();
+    eagerAllocateBatchTexture(src, POLYLINE_BATCH_SUPPORT, {
+      showOpacity: true,
+    });
+    if (colorUniform && keepColor) colorUniform.copy(keepColor);
+    const batch =
+      this.batchLength != null &&
+      this.geometry.getAttribute("_batchid") != null
+        ? createWebgpuBatchSampler(T, src, this.batchLength)
+        : null;
 
     const handles: PolylineWebgpuHandles = {
       uMinMaxHeightAndWidth: T.uniform(new Vector3(0, 0, 1)) as unknown as {
@@ -576,9 +591,8 @@ export class PolylineMesh extends BatchedFeatureMesh<
       uFrustumRatio: T.uniform(new Vector4(1, 1, 1, 1)) as unknown as {
         value: Vector4;
       },
-      gateColorShow: T.uniform(0) as unknown as { value: number },
+      gateColor: T.uniform(0) as unknown as { value: number },
       gateHeight: T.uniform(0) as unknown as { value: number },
-      gateLineWidth: T.uniform(0) as unknown as { value: number },
       uPickable: T.uniform(0) as unknown as { value: number },
       src,
     };
@@ -589,9 +603,8 @@ export class PolylineMesh extends BatchedFeatureMesh<
       uViewportAndPixelRatio,
       uFrustumNearFar,
       uFrustumRatio,
-      gateColorShow,
+      gateColor,
       gateHeight,
-      gateLineWidth,
       uPickable,
       // TSL's chained node methods don't survive the library's generic
       // typings; the graph is runtime-checked by the node builder instead
@@ -602,7 +615,9 @@ export class PolylineMesh extends BatchedFeatureMesh<
     // Vertex: batch-texture lookups (per-feature color/show/opacity, height,
     // line width). texture().load() (texel fetch) works in the vertex stage
     // and needs no sampler — float32 linear filtering is an optional WebGPU
-    // feature.
+    // feature. color/show/opacity sample identity defaults (white / visible /
+    // 1) until written, so only the replacing attributes (height) and the
+    // material-color-replacing batch color need gates.
     let addHeight: any = uAddHeight;
     // Negative batchLineWidth means "use the default width" (see
     // line_width_vertex.glsl + polyline.vert.glsl).
@@ -610,58 +625,39 @@ export class PolylineMesh extends BatchedFeatureMesh<
     let vBatchColor: any = T.varying(T.vec3(1, 1, 1), "nvr_batchColor");
     let vShow: any = T.varying(T.float(1), "nvr_show");
     let vOpacity: any = T.varying(T.float(1), "nvr_opacity");
-    if (hasBatch && batchTex && batchCfg) {
-      const rows = batchCfg.rows;
-      const rowCount = rows.length;
-      const texW = batchTex.image.width;
-      const texNode = T.texture(batchTex);
-      const bid: any = T.attribute("_batchid");
-      const col = bid.mod(texW).toUint();
-      const rowBase = bid.div(texW).floor().mul(rowCount).toUint();
-      const fetchRow = (rowKey: BatchTextureRowKey): any =>
-        texNode.load(T.uvec2(col, rowBase.add(rows.indexOf(rowKey))));
-      // decodeRGBAToFloat: 4 bytes little-endian reinterpreted as f32.
-      // NOTE: each component is converted individually — a vec4-wide
-      // `.toUint()` collapses to a scalar and every swizzle then reads the
-      // same (x) lane (observed in the generated WGSL).
-      const decode = (texel: any): any => {
-        const b = texel.mul(255);
-        const bx = b.x.toUint();
-        const by = b.y.toUint();
-        const bz = b.z.toUint();
-        const bw = b.w.toUint();
-        return T.uintBitsToFloat(
-          bx
-            .bitOr(by.shiftLeft(T.uint(8)))
-            .bitOr(bz.shiftLeft(T.uint(16)))
-            .bitOr(bw.shiftLeft(T.uint(24))),
-        );
-      };
-      const colorShow = fetchRow("COLOR_SHOW");
-      const packedByte = colorShow.a.mul(255).add(0.5).floor().clamp(0, 255);
-      vBatchColor = T.varying(colorShow.rgb, "nvr_batchColor");
-      vShow = T.varying(T.step(128, packedByte), "nvr_show");
-      vOpacity = T.varying(packedByte.mod(128).div(127), "nvr_opacity");
-      addHeight = T.mix(uAddHeight, decode(fetchRow("HEIGHT")), gateHeight);
-      batchLineWidth = decode(fetchRow("LINE_WIDTH"));
+    if (batch) {
+      handles.batchTex = batch.texNode;
+      const colorNode = batch.vec3("color");
+      if (colorNode) vBatchColor = T.varying(colorNode, "nvr_batchColor");
+      const showOpacity = batch.showOpacity();
+      if (showOpacity) {
+        vShow = T.varying(showOpacity.show, "nvr_show");
+        vOpacity = T.varying(showOpacity.opacity, "nvr_opacity");
+      }
+      const batchHeight = batch.scalar("height");
+      if (batchHeight) addHeight = T.mix(uAddHeight, batchHeight, gateHeight);
+      batchLineWidth = batch.scalar("lineWidth") ?? batchLineWidth;
     }
 
-    // line_width_vertex.glsl + polyline.vert.glsl: batch line width wins when
-    // the gate is on and the decoded value is non-negative.
-    const baseLineWidth = T.mix(
+    // line_width_vertex.glsl + polyline.vert.glsl: a non-negative batch line
+    // width wins over the material default (negative = sentinel).
+    const baseLineWidth = T.select(
+      batchLineWidth.greaterThanEqual(0),
+      batchLineWidth,
       uMinMaxHeightAndWidth.z,
-      T.select(
-        batchLineWidth.greaterThanEqual(0),
-        batchLineWidth,
-        uMinMaxHeightAndWidth.z,
-      ),
-      gateLineWidth,
     );
 
     const Base = (lit === false || isTexturized
       ? webgpu.MeshBasicNodeMaterial
       : webgpu.MeshLambertNodeMaterial) as unknown as new () => ShaderMaterial;
     let m: any;
+    // Seam-clip planes for the fragment stage (non-texturized path only).
+    let seamPlanes: {
+      startN: unknown;
+      startW: unknown;
+      endN: unknown;
+      endW: unknown;
+    } | null = null;
 
     if (isTexturized) {
       // flatPolyline.vert.glsl: positions in normalized [-1, 1] tile
@@ -781,6 +777,21 @@ export class PolylineMesh extends BatchedFeatureMesh<
       // Start/end/right planes (Hessian form) in eye coordinates.
       const startPlaneW = startPlaneN.dot(ecStart).negate();
       const endPlaneW = endPlaneN.dot(ecEnd).negate();
+      // Seam clipping (polyline.frag.glsl, #829): the segment is pushed past
+      // both ends below to cover joint gaps; flat varyings let the fragment
+      // clip it back to the start/end planes so adjacent segments meet on
+      // their shared miter plane.
+      const flatVarying = (node: any, name: string): any => {
+        const v = T.varying(node, name);
+        T.nodeObject(v).setInterpolation("flat");
+        return v;
+      };
+      seamPlanes = {
+        startN: flatVarying(startPlaneN, "nvr_startPlaneN"),
+        startW: flatVarying(startPlaneW, "nvr_startPlaneW"),
+        endN: flatVarying(endPlaneN, "nvr_endPlaneN"),
+        endW: flatVarying(endPlaneW, "nvr_endPlaneW"),
+      };
       const absStartPlaneDistance = startPlaneN
         .dot(positionEC)
         .add(startPlaneW)
@@ -889,12 +900,29 @@ export class PolylineMesh extends BatchedFeatureMesh<
       pickId.mod(256).floor().div(255),
     );
     m.colorNode = T.Fn(() => {
+      // Seam clipping (polyline.frag.glsl, #829): discard past the start/end
+      // planes so pushed-out joint covers meet on the shared miter plane.
+      // positionView is the eye-space position (== -vViewPosition).
+      if (seamPlanes) {
+        const posEc: any = T.positionView;
+        const sp = seamPlanes as Record<string, any>;
+        sp.startN
+          .dot(posEc)
+          .add(sp.startW)
+          .lessThan(0)
+          .discard();
+        sp.endN
+          .dot(posEc)
+          .add(sp.endW)
+          .lessThan(0)
+          .discard();
+      }
       // show_fragment.glsl: discard hidden / fully transparent features.
-      T.mix(T.float(1), vShow, gateColorShow).lessThan(0.5).discard();
-      T.mix(T.float(1), vOpacity, gateColorShow).lessThanEqual(0).discard();
+      vShow.lessThan(0.5).discard();
+      vOpacity.lessThanEqual(0).discard();
       return T.vec4(
         T.materialColor.rgb
-          .mul(T.mix(T.vec3(1, 1, 1), vBatchColor, gateColorShow))
+          .mul(T.mix(T.vec3(1, 1, 1), vBatchColor, gateColor))
           .mul(uPickable.oneMinus()),
         1,
       );
@@ -908,7 +936,7 @@ export class PolylineMesh extends BatchedFeatureMesh<
         ? T.mix(T.materialEmissive, pickColor, uPickable)
         : pickColor.mul(uPickable);
     m.opacityNode = T.mix(
-      T.materialOpacity.mul(T.mix(T.float(1), vOpacity, gateColorShow)),
+      T.materialOpacity.mul(vOpacity),
       T.float(1),
       uPickable,
     );
@@ -917,10 +945,12 @@ export class PolylineMesh extends BatchedFeatureMesh<
     // Polyline always renders without depth testing (see initMaterial).
     m.depthTest = false;
 
-    // Point the batch plumbing (userData.defines / batchDataTexture /
-    // batchTextureConfig, written later by updateBatchAttribute) at the same
-    // objects the classic material used.
+    // Share the classic material's userData (uPickable etc.) with the node
+    // material; batch writes address this.material, so attach it to the
+    // classic material's batch texture state (a module-private WeakMap keyed
+    // by material, not userData) for updateBatchAttribute to keep landing.
     Object.assign(m.userData, src.userData);
+    attachBatchedMaterial(src, m);
     m.userData.nvrWebgpu = handles;
     this.material = m as ShaderMaterial;
   }
@@ -942,10 +972,10 @@ export class PolylineMesh extends BatchedFeatureMesh<
     );
     w.uMaxWidth.value = s.maxWidth;
     w.uAddHeight.value = s.addHeight;
-    w.gateColorShow.value = s.useBatchColorShow ? 1 : 0;
-    w.gateHeight.value = s.useBatchHeight ? 1 : 0;
-    w.gateLineWidth.value = s.useBatchLineWidth ? 1 : 0;
+    w.gateColor.value = s.batchColorEnabled ? 1 : 0;
+    w.gateHeight.value = this._batchHeightUsed ? 1 : 0;
     w.uPickable.value = s.pickable ? 1 : 0;
+    if (w.batchTex) syncWebgpuBatchTexture({ texNode: w.batchTex }, w.src);
 
     // External shared uniforms (CommonUniforms): the classic material's
     // uniform entries hold live tuple references updated externally per frame.
@@ -1000,6 +1030,11 @@ export class PolylineMesh extends BatchedFeatureMesh<
           base: { batchColorEnabled: true, color: 0xffffff },
         });
       }
+    }
+    if (attribute === "height") {
+      // First-write flag gating the replacing batch height in the WebGPU node
+      // graph (the classic path uses a write-time USE_BATCH_HEIGHT define).
+      this._batchHeightUsed = true;
     }
     return true;
   }

@@ -18,6 +18,7 @@ import {
 import invariant from "tiny-invariant";
 
 import {
+  attachBatchedMaterial,
   registerBatchedMaterial,
   TEXT_BATCH_SUPPORT,
   updateBatchAttribute,
@@ -52,6 +53,11 @@ import { buildBatchIndexMap } from "../batchIndexMap";
 import { GEOMETRY_TYPES } from "../constants";
 import { InstancedMesh, type InstancedMeshOptions } from "../instanced";
 import type { PickableMesh } from "../pickableMesh";
+import {
+  createWebgpuBatchSampler,
+  eagerAllocateBatchTexture,
+  syncWebgpuBatchTexture,
+} from "../webgpuBatchTexture";
 
 import { GlyphBuffers } from "./glyphBuffers";
 import { GlyphSlotAllocator, type GlyphRun } from "./glyphSlots";
@@ -103,6 +109,8 @@ type SdfTextWebgpuHandles = {
   labelDataTex: { value: DataTexture };
   atlasTex: { value: DataTexture };
   colorAtlasTex: { value: DataTexture };
+  /** Batch texture node; re-pointed if the shared uniform swaps textures. */
+  batchTex?: { value: unknown };
   src: ShaderMaterial;
 };
 
@@ -440,6 +448,19 @@ export class BatchedSdfTextMesh
         mutates.updateAtlasSizes();
         this._syncWebgpuHandles();
       };
+      // Register for per-feature styling BEFORE the node graph is built: the
+      // graph bakes the batch texture's layout rows in as constants, so every
+      // supported slot must already exist (the classic path below registers
+      // lazily and lets write-time defines grow the texture).
+      const webgpuBatchUniform = registerBatchedMaterial(
+        mat,
+        { ...this._getBatchTextureSupport(), batchLength: this._batchLength },
+        this.ctx.viewContext.getRenderer(),
+      );
+      this._enhancer.mutates().setBatchDataTexture(webgpuBatchUniform);
+      eagerAllocateBatchTexture(mat, TEXT_BATCH_SUPPORT, {
+        showOpacity: true,
+      });
       this._webgpuMaterial = this._initWebGPUMaterial(mat);
       return;
     }
@@ -629,13 +650,27 @@ export class BatchedSdfTextMesh
     const labelState = readLabel(LabelRow.STATE);
     const declutterHide = labelState.x;
     const showState = labelState.z;
-    const posSize = readLabel(LabelRow.POSITION_HIGH_SIZE);
-    const posHeight = readLabel(LabelRow.POSITION_LOW_HEIGHT);
-    const colorOpacity = readLabel(LabelRow.COLOR_OPACITY);
+    const posHigh = readLabel(LabelRow.POSITION_HIGH);
+    const posLow = readLabel(LabelRow.POSITION_LOW);
     const box = readLabel(LabelRow.BOX);
 
-    const fontSize = posSize.w;
-    const addHeight = posHeight.w;
+    // Per-feature style from the shared batch data texture, keyed by the
+    // feature index in STATE.w (the NVR_BATCH_ID_EXPR override idiom in
+    // sdfText.vert.glsl). Defaults cover only the pre-first-write program:
+    // every label's style is written through on creation.
+    const batch =
+      this._batchLength > 0
+        ? createWebgpuBatchSampler(T, src, this._batchLength, {
+            bid: labelState.w,
+          })
+        : null;
+    if (batch) handles.batchTex = batch.texNode;
+    const batchColor = batch?.vec3("color") ?? T.vec3(1, 1, 1);
+    const batchOpacity = batch?.showOpacity()?.opacity ?? T.float(1);
+    const addHeight = batch?.scalar("height") ?? T.float(0);
+    const batchSize = batch?.scalar("size") ?? T.float(-1);
+
+    const fontSize = T.max(batchSize, 0.0);
     const textWidth = box.x;
     const textHeight = box.y;
     const bgMinY = box.z;
@@ -653,8 +688,8 @@ export class BatchedSdfTextMesh
       // u_rteOne (== 1.0) blocks fast-math reassociation of the high/low
       // recombination — see chunks/rte_pars_vertex.glsl.
       const uRteOne = T.uniform(1.0);
-      const high = posSize.xyz;
-      const low = posHeight.xyz;
+      const high = posHigh.xyz;
+      const low = posLow.xyz;
       absTransformed = high.add(low);
       const resolved = high
         .sub(uEyeRTEHigh)
@@ -664,7 +699,7 @@ export class BatchedSdfTextMesh
       // to a w=0 vector.
       baseMv = T.cameraViewMatrix.mul(T.vec4(resolved, 0)).xyz;
     } else {
-      const rtcPos = posSize.xyz;
+      const rtcPos = posHigh.xyz;
       absTransformed = rtcPos.add(uRTCCenter);
       baseMv = T.cameraViewMatrix
         .mul(T.vec4(rtcPos, 0))
@@ -735,9 +770,9 @@ export class BatchedSdfTextMesh
       T.select(isBackground, uvQuad, T.mix(vAtlasUvMin, vAtlasUvMax, uvQuad)),
       "nvr_atlasUv",
     );
-    const vColor = flatVarying(colorOpacity.rgb, "nvr_labelColor");
+    const vColor = flatVarying(batchColor, "nvr_labelColor");
     const vOpacity = flatVarying(
-      colorOpacity.a.mul(declutterHide.oneMinus()),
+      batchOpacity.mul(declutterHide.oneMinus()),
       "nvr_labelOpacity",
     );
     const vBatchID = flatVarying(labelState.y, "nvr_batchId");
@@ -962,6 +997,11 @@ export class BatchedSdfTextMesh
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
     m.userData.nvrWebgpu = handles;
+    // Batch writes address this.material, which becomes this node material
+    // (constructor: this.material = this._webgpuMaterial ?? mat); attach it to
+    // the classic material's batch texture state so updateBatchAttribute keeps
+    // landing (the state lives in a module-private WeakMap keyed by material).
+    attachBatchedMaterial(src, m);
     this._syncWebgpuHandles(handles);
     return m as Material;
   }
@@ -1057,6 +1097,7 @@ export class BatchedSdfTextMesh
       (u.uAtlas?.value as DataTexture | null) ?? getPlaceholderTexture();
     w.colorAtlasTex.value =
       (u.uColorAtlas?.value as DataTexture | null) ?? getPlaceholderTexture();
+    if (w.batchTex) syncWebgpuBatchTexture({ texNode: w.batchTex }, w.src);
 
     // Props the enhancer writes on its own (classic) material.
     const m = this.material as Material | undefined;
