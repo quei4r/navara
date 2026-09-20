@@ -1,4 +1,10 @@
-import { Loader, Texture } from "three";
+import {
+  Loader,
+  Texture,
+  type Material,
+  type Mesh,
+  type Object3D,
+} from "three";
 
 import { AbortableImageLoader } from "./AbortableImageLoader";
 
@@ -15,6 +21,103 @@ export function disposeTexture(texture: Texture): void {
   texture.dispose();
   if (typeof ImageBitmap !== "undefined" && image instanceof ImageBitmap) {
     image.close();
+  }
+}
+
+/**
+ * Deferred texture retirement for tile textures torn down by Rust removal
+ * events. A removal can race tiles that still bind the texture (LOD churn:
+ * ancestor-fallback slots, tile updates still in flight). Destroying the GPU
+ * texture then is fatal on the WebGPU backend — direct texture bindings sample
+ * the recreated empty texture (white tiles) — while WebGL masks it by keeping
+ * the previously uploaded texels.
+ *
+ * Retirement closes the ImageBitmap immediately (its decoded pixels are the
+ * bulk of the memory, and the already-uploaded GPU texture keeps sampling
+ * without it), but defers `texture.dispose()` until a sweep finds the texture
+ * bound nowhere. A texture that stays bound (a stale tile binding) is kept —
+ * disposing it would reintroduce the white-tile regression.
+ */
+const RETIRE_SWEEP_MS = 5_000;
+const RETIRE_GRACE_MS = 10_000;
+
+type TraversableScenes = Record<
+  string,
+  { traverse: (cb: (object: Object3D) => void) => void } | undefined
+>;
+
+const retired: { texture: Texture; at: number }[] = [];
+let sweepTimer: ReturnType<typeof setInterval> | undefined;
+let retiredScenes: (() => TraversableScenes) | undefined;
+
+export function retireTexture(
+  texture: Texture,
+  scenes: () => TraversableScenes,
+): void {
+  const image = texture.image as unknown;
+  if (
+    typeof ImageBitmap !== "undefined" &&
+    image instanceof ImageBitmap &&
+    image.width > 0
+  ) {
+    image.close();
+  }
+  retired.push({ texture, at: Date.now() });
+  retiredScenes = scenes;
+  sweepTimer ??= setInterval(sweepRetiredTextures, RETIRE_SWEEP_MS);
+}
+
+function collectBoundTextures(scenes: TraversableScenes): Set<Texture> {
+  const bound = new Set<Texture>();
+  const addMaterial = (material: Material | Material[] | undefined) => {
+    if (!material || Array.isArray(material)) return;
+    const m = material as Material & { map?: Texture | null };
+    if (m.map) bound.add(m.map);
+    const ud = m.userData as {
+      textures?: { value?: (Texture | null)[] };
+      webgpuSlots?: { node?: { value?: Texture } }[];
+      webgpuHillshade?: { node?: { value?: Texture } };
+    };
+    for (const t of ud.textures?.value ?? []) {
+      if (t) bound.add(t);
+    }
+    for (const slot of ud.webgpuSlots ?? []) {
+      const v = slot?.node?.value;
+      if (v) bound.add(v);
+    }
+    const hs = ud.webgpuHillshade?.node?.value;
+    if (hs) bound.add(hs);
+  };
+  for (const scene of Object.values(scenes)) {
+    scene?.traverse((o) => addMaterial((o as Mesh).material));
+  }
+  return bound;
+}
+
+function sweepRetiredTextures(): void {
+  if (!retired.length) {
+    clearInterval(sweepTimer);
+    sweepTimer = undefined;
+    return;
+  }
+  const now = Date.now();
+  if (!retired.some((e) => now - e.at >= RETIRE_GRACE_MS)) return;
+  const bound = collectBoundTextures(retiredScenes?.() ?? {});
+  for (let i = retired.length - 1; i >= 0; i--) {
+    const entry = retired[i];
+    if (now - entry.at < RETIRE_GRACE_MS) continue;
+    if (bound.has(entry.texture)) continue;
+    entry.texture.dispose();
+    retired.splice(i, 1);
+  }
+}
+
+/** Force-dispose every retired texture (view teardown). */
+export function flushRetiredTextures(): void {
+  clearInterval(sweepTimer);
+  sweepTimer = undefined;
+  for (const entry of retired.splice(0)) {
+    entry.texture.dispose();
   }
 }
 

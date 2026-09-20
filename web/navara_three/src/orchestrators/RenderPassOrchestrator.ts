@@ -1,6 +1,18 @@
 import { NamedIndexMap } from "@navaramap/core";
 import { EffectComposer, Pass as PostProcessingPass } from "postprocessing";
-import { HalfFloatType, Scene, Vector2, WebGLRenderer, Group } from "three";
+import {
+  AmbientLight,
+  DirectionalLight,
+  HalfFloatType,
+  HemisphereLight,
+  PointLight,
+  Scene,
+  SpotLight,
+  Vector2,
+  WebGLRenderer,
+  Group,
+} from "three";
+import type { Object3D, Vector3 } from "three";
 import type { PostProcessing, RenderTarget } from "three/webgpu";
 
 import { estimateFixedGpuBytes } from "../utils/fixedGpuFootprint";
@@ -36,6 +48,123 @@ export type NamedPass = {
   pass: PostProcessingPass;
 };
 
+type LightProxy = { proxy: Object3D; sync: () => void };
+
+/**
+ * Build a per-frame-synced stand-in for an app light from `scenes.light`.
+ *
+ * The WebGL path nests the whole light scene into each rendered scene
+ * (CustomRenderPass._renderWithLight). On WebGPU that works for plain lights
+ * but not for CascadedDirectionalLights: its per-cascade clones rely on the
+ * GLSL chunk swap to keep only the main cascade's contribution, which TSL
+ * materials never run — nesting the group would stack the extra white
+ * clones. So a CSM group collapses to a single directional proxy driven by
+ * mainLight + direction, exactly what the classic injected shader resolves
+ * to. Proxies never cast shadows: the WebGPUEnvironment's native sun owns
+ * shadow mapping on this path. Only top-level lights are mirrored.
+ */
+function makeLightProxy(source: Object3D): LightProxy | null {
+  const csm = source as {
+    mainLight?: DirectionalLight;
+    direction?: Vector3;
+    cascadedLights?: DirectionalLight[];
+  };
+  if (
+    csm.mainLight?.isDirectionalLight &&
+    csm.direction &&
+    Array.isArray(csm.cascadedLights)
+  ) {
+    const main = csm.mainLight;
+    const direction = csm.direction;
+    const proxy = new DirectionalLight();
+    proxy.castShadow = false;
+    const sync = () => {
+      proxy.color.copy(main.color);
+      proxy.intensity = main.intensity;
+      proxy.visible = source.visible && main.visible;
+      // Parallel light: only the position→target vector matters.
+      proxy.position.copy(direction).multiplyScalar(-1e7);
+      proxy.target.position.set(0, 0, 0);
+    };
+    sync();
+    return { proxy, sync };
+  }
+  const src = source as Partial<
+    AmbientLight & DirectionalLight & HemisphereLight & PointLight & SpotLight
+  >;
+  if (src.isAmbientLight) {
+    const s = source as AmbientLight;
+    const proxy = new AmbientLight();
+    const sync = () => {
+      proxy.color.copy(s.color);
+      proxy.intensity = s.intensity;
+      proxy.visible = s.visible;
+    };
+    sync();
+    return { proxy, sync };
+  }
+  if (src.isHemisphereLight) {
+    const s = source as HemisphereLight;
+    const proxy = new HemisphereLight();
+    const sync = () => {
+      proxy.color.copy(s.color);
+      proxy.groundColor.copy(s.groundColor);
+      proxy.intensity = s.intensity;
+      proxy.visible = s.visible;
+    };
+    sync();
+    return { proxy, sync };
+  }
+  if (src.isSpotLight) {
+    const s = source as SpotLight;
+    const proxy = new SpotLight();
+    proxy.castShadow = false;
+    const sync = () => {
+      proxy.color.copy(s.color);
+      proxy.intensity = s.intensity;
+      proxy.distance = s.distance;
+      proxy.decay = s.decay;
+      proxy.angle = s.angle;
+      proxy.penumbra = s.penumbra;
+      proxy.visible = s.visible;
+      proxy.position.copy(s.position);
+      proxy.target.position.copy(s.target.position);
+    };
+    sync();
+    return { proxy, sync };
+  }
+  if (src.isPointLight) {
+    const s = source as PointLight;
+    const proxy = new PointLight();
+    proxy.castShadow = false;
+    const sync = () => {
+      proxy.color.copy(s.color);
+      proxy.intensity = s.intensity;
+      proxy.distance = s.distance;
+      proxy.decay = s.decay;
+      proxy.visible = s.visible;
+      proxy.position.copy(s.position);
+    };
+    sync();
+    return { proxy, sync };
+  }
+  if (src.isDirectionalLight) {
+    const s = source as DirectionalLight;
+    const proxy = new DirectionalLight();
+    proxy.castShadow = false;
+    const sync = () => {
+      proxy.color.copy(s.color);
+      proxy.intensity = s.intensity;
+      proxy.visible = s.visible;
+      proxy.position.copy(s.position);
+      proxy.target.position.copy(s.target.position);
+    };
+    sync();
+    return { proxy, sync };
+  }
+  return null;
+}
+
 // Implementation policy:
 // - Here we only manage Pass with an ordered Map mechanism.
 // - When a Layer inserts with insertBefore/After, it inserts in the appropriate place.
@@ -63,6 +192,16 @@ export class RenderPassOrchestrator {
     skyEnvMap: new Scene(),
   };
   effectComposer: EffectComposer | undefined;
+
+  /**
+   * Mirrors of the app-configured lights in `scenes.light`, attached to each
+   * rendered scene on the WebGPU path (see makeLightProxy). Rebuilt when the
+   * light scene's children change; synced every frame.
+   */
+  private readonly lightMirror = new Group();
+  private lightProxies: LightProxy[] = [];
+  private lightMirrorDirty = true;
+  private lightSceneListened?: Scene;
 
   /**
    * The active renderer. Typed as WebGLRenderer for API compatibility; on the
@@ -107,6 +246,42 @@ export class RenderPassOrchestrator {
     this.effectComposer?.setMainCamera(camera);
   }
 
+  /**
+   * True when the app has configured lights of its own in `scenes.light`
+   * (LightDesc adds them there). Drives WebGPUEnvironment's fallback rig.
+   */
+  get hasAppLights(): boolean {
+    return ((this.scenes as { light?: Scene }).light?.children.length ?? 0) > 0;
+  }
+
+  /** Rebuild (on light-scene changes) and per-frame sync the light mirror. */
+  private syncLightMirror(): void {
+    const lightScene = (this.scenes as { light?: Scene }).light;
+    if (lightScene && this.lightSceneListened !== lightScene) {
+      this.lightSceneListened = lightScene;
+      const dirty = () => {
+        this.lightMirrorDirty = true;
+      };
+      lightScene.addEventListener("childadded", dirty);
+      lightScene.addEventListener("childremoved", dirty);
+      this.lightMirrorDirty = true;
+    }
+    if (this.lightMirrorDirty) {
+      this.lightMirrorDirty = false;
+      this.lightProxies = [];
+      this.lightMirror.clear();
+      for (const child of lightScene?.children ?? []) {
+        const entry = makeLightProxy(child);
+        if (!entry) continue;
+        this.lightProxies.push(entry);
+        this.lightMirror.add(entry.proxy);
+        const target = (entry.proxy as DirectionalLight | SpotLight).target;
+        if (target) this.lightMirror.add(target);
+      }
+    }
+    for (const p of this.lightProxies) p.sync();
+  }
+
   setSize(width: number, height: number) {
     this.effectComposer?.setSize(width, height);
   }
@@ -140,6 +315,7 @@ export class RenderPassOrchestrator {
         this.scenes.opaque,
         this.scenes.transparent,
       ];
+      this.syncLightMirror();
       const lightsAttached = new Set<Scene>();
       for (const scene of scenes) {
         if (
@@ -149,10 +325,18 @@ export class RenderPassOrchestrator {
           scene.add(this.lights);
           lightsAttached.add(scene);
         }
+        if (
+          this.lightMirror.children.length > 0 &&
+          !scene.children.includes(this.lightMirror)
+        ) {
+          scene.add(this.lightMirror);
+          lightsAttached.add(scene);
+        }
         renderer.render(scene, this.mainCamera);
       }
       for (const scene of lightsAttached) {
         scene.remove(this.lights);
+        scene.remove(this.lightMirror);
       }
       // Back to the canvas before the post chain — the PP quad samples the
       // scene target, so it must not render into it.

@@ -25,5 +25,5 @@ export const updateState = (
 ): PntsState => ({
   height: props.height ?? currentState.height,
   geodeticNormal: props.geodeticNormal ?? currentState.geodeticNormal,
-  divideColor: !!props.divideColor,
+  divideColor: props.divideColor ?? currentState.divideColor,
 });

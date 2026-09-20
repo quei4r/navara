@@ -240,8 +240,7 @@ export class TileTextureCompositor {
   }
 
   private isWebGPUBackend(): boolean {
-    return !!(this.renderer as { isWebGPURenderer?: boolean })
-      .isWebGPURenderer;
+    return !!(this.renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer;
   }
 
   markDirty(handle: TileHandle, reason: DirtyReason): void {
@@ -281,9 +280,6 @@ export class TileTextureCompositor {
     }[],
     renderTargets: WebGLRenderTarget[],
   ): void {
-    // Vector draping is a GLSL bake pass — skipped on the WebGPU backend
-    // (its ShaderMaterial pipelines cannot compile there).
-    if (this.isWebGPUBackend()) return;
     this.bakeSlotTargets(slots, renderTargets, (slot) => {
       for (const source of slot.sources) {
         const scene = this.texturizedScenes.findSceneByLayerId(
@@ -390,7 +386,12 @@ export class TileTextureCompositor {
 
       if (slot) drawSlot(slot);
 
-      renderTarget.texture.needsUpdate = true;
+      // WebGL: bump the texture version so the sampler re-reads the freshly
+      // baked texels. WebGPU: MUST NOT bump — a version change on a render
+      // target texture makes the backend destroy and recreate the GPUTexture
+      // (Textures.updateTexture), wiping the bake it was meant to publish.
+      // Render-to-texture writes are visible to subsequent samplers without it.
+      if (!this.isWebGPUBackend()) renderTarget.texture.needsUpdate = true;
     }
 
     this.renderer.autoClear = prevAutoClear;
@@ -404,6 +405,13 @@ export class TileTextureCompositor {
    * meshUv·uvScale, source NDC = 2·sourceUv − 1. A source finer than the
    * terrain tile yields a camera wider than [-1, 1], so it draws into only
    * its sub-rect and leaves the rest of the render target transparent.
+   *
+   * Note the baked render target's texel layout is backend-dependent:
+   * WebGL row 0 holds NDC y=−1 (the south edge of this window) while WebGPU
+   * row 0 holds NDC y=+1 (north). The WebGPU tile material compensates at
+   * sampling time (per-slot V flip, see `WebgpuSlotNodes.flipV`) — flipping
+   * this camera instead would invert triangle winding and cull the
+   * FrontSide bake materials.
    */
   private frameBakeCamera(
     uvOffset: [number, number],
@@ -462,6 +470,15 @@ export class TileTextureCompositor {
   /** Value-preserving sampler settings for a bake source texture (see
    * {@link renderRasterTiles}); idempotent so re-bakes don't re-upload. */
   private configureRasterBakeSource(tex: Texture, isElevationHeatmap: boolean) {
+    // A texture whose ImageBitmap was closed after upload (tile cache eviction
+    // racing a still-bound slot) reports 0x0. On the WebGPU backend, mutating
+    // colorSpace/filters with needsUpdate would destroy the live GPU texture
+    // and recreate it from the dead bitmap — skip all mutation so the
+    // previously uploaded content keeps sampling (same guard as
+    // TileMesh.setupTextures).
+    const texImage = tex.image as
+      { width?: number; height?: number } | undefined;
+    if (texImage && (texImage.width === 0 || texImage.height === 0)) return;
     const colorSpace = isElevationHeatmap ? NoColorSpace : SRGBColorSpace;
     const filter = isElevationHeatmap ? NearestFilter : LinearFilter;
     if (

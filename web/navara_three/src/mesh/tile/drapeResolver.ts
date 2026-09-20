@@ -71,6 +71,11 @@ export function configureTexturizedTexture(
   tex.magFilter = textureOptions.magFilter as MagnificationTextureFilter;
   tex.anisotropy = textureOptions.maxAnisotropy;
   tex.generateMipmaps = textureOptions.useMipmaps;
-  tex.needsUpdate = true;
+  // Only the first configuration bumps the version. On the WebGPU backend a
+  // version bump on an already-initialized render target texture destroys and
+  // recreates its GPUTexture, wiping the baked content — and reconfigurations
+  // are idempotent anyway, so the bump is only needed to get a fresh texture
+  // allocated with these sampler settings.
+  if (tex.version === 0) tex.needsUpdate = true;
   return tex;
 }

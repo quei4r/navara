@@ -32,6 +32,7 @@ import {
 } from "three";
 import { MeshBasicNodeMaterial, WebGPURenderer } from "three/webgpu";
 
+import { TILE_DATASETS } from "../../helpers/constants";
 import { atZoneTime } from "../../helpers/control";
 
 // ============================================================================
@@ -220,6 +221,18 @@ const bootstrap = async () => {
 
   // Daylight so the unlit test colors read clearly against the lit globe.
   view.atmosphere.date = atZoneTime(view.atmosphere.date, 10);
+
+  // Base imagery layer — same as the WebGL debug/mesh-picking page, so the
+  // test meshes sit on the rendered globe instead of bare sky.
+  const osmSource = view.addSource({
+    type: "raster-tile",
+    url: TILE_DATASETS.openstreetmap.url,
+    maxZoom: 18,
+  });
+  view.addLayer({
+    type: "raster",
+    source: osmSource,
+  });
 
   view.registerMesh("gpuBox", GpuBoxMeshDesc);
   view.registerMesh("gpuSpheres", GpuInstancedSpheresMeshDesc);

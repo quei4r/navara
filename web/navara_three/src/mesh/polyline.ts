@@ -6,14 +6,20 @@ import {
   BufferAttribute,
   BufferGeometry,
   Color,
+  InterleavedBuffer,
+  InterleavedBufferAttribute,
   Matrix4,
   ShaderMaterial,
   Vector2,
+  Vector3,
+  Vector4,
 } from "three";
+import type { DataTexture } from "three";
 
 import type { EventContext } from "../event/context";
 import { applyLitOption } from "../material";
 import { createPolylineMaterialEnhancer } from "../material/enhancer";
+import { getWebGPU } from "../utils";
 
 import {
   BatchedFeatureMesh,
@@ -22,6 +28,7 @@ import {
 } from "./batchedFeature";
 import type {
   BatchedAttributeName,
+  BatchTextureConfig,
   BatchTextureRowKey,
   DefaultBatchAttributeValues,
 } from "./batchTexture";
@@ -33,6 +40,15 @@ import { setupRTECallback } from "./rtcRteHelper";
 const PICKING_COORD_SENTINEL = new Vector2(-1, -1);
 
 /**
+ * Post-upload CPU-array release for InterleavedBuffers, mirroring the
+ * BufferAttribute `disposeArray` idiom in releaseGeometryArrays.ts (which
+ * skips interleaved attributes).
+ */
+function disposeInterleavedArray(this: InterleavedBuffer) {
+  (this as unknown as { array: unknown }).array = null;
+}
+
+/**
  * Minimum stroke width used while rendering the pick pass. A hairline stroke
  * covers too few pick-buffer texels to click reliably — on the draped path the
  * 512px tile atlas resolves a thin line to scattered partial texels, so the
@@ -41,6 +57,32 @@ const PICKING_COORD_SENTINEL = new Vector2(-1, -1);
  * tolerance" pointing devices get elsewhere; the visible width is untouched.
  */
 const MIN_PICK_WIDTH = 10;
+
+/**
+ * TSL uniform handles + prop source for the WebGPU node material built by
+ * initWebGPUMaterial. Values are synced from the enhancer state once per
+ * render (see syncWebgpuHandles) because the enhancer remains mounted on the
+ * classic material it was created with.
+ */
+type PolylineWebgpuHandles = {
+  uMinMaxHeightAndWidth: { value: Vector3 };
+  uMaxWidth: { value: number };
+  uAddHeight: { value: number };
+  uViewportAndPixelRatio: { value: Vector3 };
+  uFrustumNearFar: { value: Vector2 };
+  uFrustumRatio: { value: Vector4 };
+  gateColorShow: { value: number };
+  gateHeight: { value: number };
+  gateLineWidth: { value: number };
+  uPickable: { value: number };
+  /** Enhancer-mounted classic material; per-frame prop/uniform source. */
+  src: ShaderMaterial;
+  rte?: {
+    matrix: { value: Matrix4 };
+    camHigh: { value: Vector3 };
+    camLow: { value: Vector3 };
+  };
+};
 
 type Attributes = BatchedFeatureAttributes<{
   position: BufferAttribute;
@@ -255,6 +297,14 @@ export class PolylineMesh extends BatchedFeatureMesh<
     // world-space coordinates, so the resulting sphere is valid.
     geometry.computeBoundingSphere();
 
+    // WebGPU guarantees only 8 vertex buffers per pipeline; the polyline
+    // attribute set (11-12 separate buffers) exceeds that. Repack into a few
+    // InterleavedBuffers (one vertex-buffer slot each) on that backend only —
+    // the classic WebGL path keeps the original layout untouched.
+    if (this.isWebGPUBackend()) {
+      this._interleaveAttributesForWebGPU(useRTE);
+    }
+
     // With the bounding sphere resolved and batch-id data consumed on the GPU,
     // no CPU read survives the first upload. Drop the JS-heap copies to keep a
     // single resident (GPU) copy — see releaseGeometryArraysAfterUpload for the
@@ -262,6 +312,86 @@ export class PolylineMesh extends BatchedFeatureMesh<
     releaseGeometryArraysAfterUpload(geometry);
 
     return { success: true, useRTE };
+  }
+
+  /**
+   * Repack the polyline attributes into InterleavedBuffers so the WebGPU
+   * pipeline stays within the 8 vertex-buffer limit. RTE additionally drops
+   * the `position` attribute: the shader never reads it (RTE decodes
+   * position_3d_high/low instead) and the bounding sphere is already
+   * computed. Interleaved attributes are skipped by
+   * releaseGeometryArraysAfterUpload, so the underlying InterleavedBuffers
+   * get the same post-upload array release attached here.
+   */
+  private _interleaveAttributesForWebGPU(useRTE: boolean): void {
+    const geometry = this.geometry;
+    const groups: string[][] = useRTE
+      ? [
+          ["position_3d_high", "position_3d_low"],
+          ["start_3d_high", "start_3d_low", "end_3d_high", "end_3d_low"],
+          [
+            "start_normal",
+            "end_normal_and_texture_coordinate_normalization_x",
+            "right_normal_and_texture_coordinate_normalization_y",
+          ],
+          ["attrBatchId", "_batchid"],
+        ]
+      : [
+          ["start", "forward_offset"],
+          [
+            "start_normal",
+            "end_normal_and_texture_coordinate_normalization_x",
+            "right_normal_and_texture_coordinate_normalization_y",
+          ],
+          ["attrBatchId", "_batchid"],
+        ];
+
+    for (const names of groups) {
+      const present = names
+        .map((name) => ({
+          name: name as keyof Attributes,
+          attr: geometry.getAttribute(name as keyof Attributes),
+        }))
+        .filter(
+          (e): e is { name: keyof Attributes; attr: BufferAttribute } =>
+            e.attr != null,
+        );
+      if (present.length < 2) continue;
+
+      const count = present[0].attr.count;
+      const stride = present.reduce((s, e) => s + e.attr.itemSize, 0);
+      const data = new Float32Array(count * stride);
+      let offset = 0;
+      for (const { attr } of present) {
+        const src = attr.array as Float32Array;
+        const size = attr.itemSize;
+        for (let i = 0; i < count; i++) {
+          for (let c = 0; c < size; c++) {
+            data[i * stride + offset + c] = src[i * size + c];
+          }
+        }
+        offset += size;
+      }
+
+      const interleaved = new InterleavedBuffer(data, stride);
+      interleaved.onUpload(disposeInterleavedArray);
+      offset = 0;
+      for (const { name, attr } of present) {
+        geometry.setAttribute(
+          name,
+          new InterleavedBufferAttribute(
+            interleaved,
+            attr.itemSize,
+            offset,
+          ) as unknown as BufferAttribute,
+        );
+        offset += attr.itemSize;
+      }
+    }
+
+    if (useRTE) {
+      geometry.deleteAttribute("position");
+    }
   }
 
   private initMaterial(mesh: NavaraPolylineMesh, useRTE: boolean) {
@@ -319,25 +449,57 @@ export class PolylineMesh extends BatchedFeatureMesh<
 
     // Set up RTE callback if needed
     const state = enhancer.states();
+    let rteCallback: ReturnType<typeof setupRTECallback> | undefined;
     if (state.useRTE) {
-      const mutates = enhancer.mutates();
-      const callback = setupRTECallback(
+      rteCallback = setupRTECallback(
         this,
-        (modelViewMatrixRTE, cameraPositionHigh, cameraPositionLow) =>
+        (modelViewMatrixRTE, cameraPositionHigh, cameraPositionLow) => {
           mutates.updateRteUniforms(
             modelViewMatrixRTE,
             cameraPositionHigh,
             cameraPositionLow,
             state,
-          ),
+          );
+          const w = this.material.userData.nvrWebgpu as
+            PolylineWebgpuHandles | undefined;
+          if (w?.rte) {
+            w.rte.matrix.value.copy(modelViewMatrixRTE);
+            w.rte.camHigh.value.copy(cameraPositionHigh);
+            w.rte.camLow.value.copy(cameraPositionLow);
+          }
+        },
         new Matrix4(),
         new Matrix4(),
       );
-      this.onBeforeRender = callback;
-      this.onBeforeShadow = callback;
+      this.onBeforeShadow = rteCallback;
 
       // Disable frustum culling for RTE mode
       this.frustumCulled = false;
+    }
+
+    if (this.isWebGPUBackend()) {
+      // The GLSL enhancer pipeline (onBeforeCompile) never runs on the WebGPU
+      // backend; swap in an equivalent TSL node material instead. The classic
+      // material stays alive as the enhancer's state store.
+      this.onBeforeRender = (
+        renderer,
+        scene,
+        camera,
+        geometry,
+        material,
+        group,
+      ) => {
+        this.syncWebgpuHandles();
+        rteCallback?.(renderer, scene, camera, geometry, material, group);
+      };
+      this._initBatchedMaterial();
+      this.initWebGPUMaterial(useRTE, meshMaterial.lit, isTexturized);
+      this._update(meshMaterial, mesh.active);
+      return;
+    }
+
+    if (rteCallback) {
+      this.onBeforeRender = rteCallback;
     }
 
     // Set up custom program cache key based on config flags that affect shader defines
@@ -351,6 +513,457 @@ export class PolylineMesh extends BatchedFeatureMesh<
     this._initBatchedMaterial();
 
     this._update(meshMaterial, mesh.active);
+  }
+
+  private isWebGPUBackend(): boolean {
+    const renderer = this.ctx.viewContext?.getRenderer() as
+      { isWebGPURenderer?: boolean } | undefined;
+    return !!renderer?.isWebGPURenderer;
+  }
+
+  /**
+   * WebGPU polyline material: a TSL node material reproducing the classic
+   * GLSL enhancer pipeline (polyline.vert/frag.glsl), which never runs on
+   * this backend:
+   *  - vertex: Cesium shadow-volume screen-space line-width expansion
+   *    (start/end/right plane intersection, metersPerPixel width, maxWidth
+   *    clamp, end forward-push), height extrusion along the miter height
+   *    normal, per-feature batch-texture color/show/opacity/height/lineWidth
+   *    (float RGBA bit-decode, see batch_texture_*.glsl), RTE high/low decode
+   *    + ellipsoidal horizon culling (both segment endpoints behind the
+   *    horizon collapses the clip position to vec4(0));
+   *  - fragment: batch color/show/opacity, pick coloring
+   *    (nvr_batchIdToColor) folded through uPickable, Lambert lighting with
+   *    vNormal = miter height normal.
+   * Uniform state is fed per frame from the enhancer by syncWebgpuHandles;
+   * RTE matrices ride the same onBeforeRender callback as the classic path.
+   * Not ported (logged once): selective-effect emissive.
+   */
+  private initWebGPUMaterial(
+    useRTE: boolean,
+    lit: boolean | undefined,
+    isTexturized: boolean,
+  ): void {
+    const { webgpu, tsl: T } = getWebGPU();
+    const src = this.material;
+
+    // The node graph fetches the batch texture in the vertex stage, so it
+    // must exist before the material is built (created lazily on the classic
+    // path).
+    this._initBatchDataTexture();
+    const batchTex = src.userData.batchDataTexture?.value as
+      DataTexture | null | undefined;
+    const batchCfg = src.userData.batchTextureConfig as
+      BatchTextureConfig | undefined;
+    const hasBatch =
+      batchTex != null &&
+      batchCfg != null &&
+      this.geometry.getAttribute("_batchid") != null;
+
+    const handles: PolylineWebgpuHandles = {
+      uMinMaxHeightAndWidth: T.uniform(new Vector3(0, 0, 1)) as unknown as {
+        value: Vector3;
+      },
+      uMaxWidth: T.uniform(1000) as unknown as { value: number },
+      uAddHeight: T.uniform(0) as unknown as { value: number },
+      uViewportAndPixelRatio: T.uniform(new Vector3(1, 1, 1)) as unknown as {
+        value: Vector3;
+      },
+      uFrustumNearFar: T.uniform(new Vector2(1, 1000)) as unknown as {
+        value: Vector2;
+      },
+      uFrustumRatio: T.uniform(new Vector4(1, 1, 1, 1)) as unknown as {
+        value: Vector4;
+      },
+      gateColorShow: T.uniform(0) as unknown as { value: number },
+      gateHeight: T.uniform(0) as unknown as { value: number },
+      gateLineWidth: T.uniform(0) as unknown as { value: number },
+      uPickable: T.uniform(0) as unknown as { value: number },
+      src,
+    };
+    const {
+      uMinMaxHeightAndWidth,
+      uMaxWidth,
+      uAddHeight,
+      uViewportAndPixelRatio,
+      uFrustumNearFar,
+      uFrustumRatio,
+      gateColorShow,
+      gateHeight,
+      gateLineWidth,
+      uPickable,
+      // TSL's chained node methods don't survive the library's generic
+      // typings; the graph is runtime-checked by the node builder instead
+      // (same `as any` idiom as the polygon WebGPU material).
+      /* eslint-disable @typescript-eslint/no-explicit-any */
+    } = handles as unknown as Record<string, any>;
+
+    // Vertex: batch-texture lookups (per-feature color/show/opacity, height,
+    // line width). texture().load() (texel fetch) works in the vertex stage
+    // and needs no sampler — float32 linear filtering is an optional WebGPU
+    // feature.
+    let addHeight: any = uAddHeight;
+    // Negative batchLineWidth means "use the default width" (see
+    // line_width_vertex.glsl + polyline.vert.glsl).
+    let batchLineWidth: any = T.float(-1);
+    let vBatchColor: any = T.varying(T.vec3(1, 1, 1), "nvr_batchColor");
+    let vShow: any = T.varying(T.float(1), "nvr_show");
+    let vOpacity: any = T.varying(T.float(1), "nvr_opacity");
+    if (hasBatch && batchTex && batchCfg) {
+      const rows = batchCfg.rows;
+      const rowCount = rows.length;
+      const texW = batchTex.image.width;
+      const texNode = T.texture(batchTex);
+      const bid: any = T.attribute("_batchid");
+      const col = bid.mod(texW).toUint();
+      const rowBase = bid.div(texW).floor().mul(rowCount).toUint();
+      const fetchRow = (rowKey: BatchTextureRowKey): any =>
+        texNode.load(T.uvec2(col, rowBase.add(rows.indexOf(rowKey))));
+      // decodeRGBAToFloat: 4 bytes little-endian reinterpreted as f32.
+      // NOTE: each component is converted individually — a vec4-wide
+      // `.toUint()` collapses to a scalar and every swizzle then reads the
+      // same (x) lane (observed in the generated WGSL).
+      const decode = (texel: any): any => {
+        const b = texel.mul(255);
+        const bx = b.x.toUint();
+        const by = b.y.toUint();
+        const bz = b.z.toUint();
+        const bw = b.w.toUint();
+        return T.uintBitsToFloat(
+          bx
+            .bitOr(by.shiftLeft(T.uint(8)))
+            .bitOr(bz.shiftLeft(T.uint(16)))
+            .bitOr(bw.shiftLeft(T.uint(24))),
+        );
+      };
+      const colorShow = fetchRow("COLOR_SHOW");
+      const packedByte = colorShow.a.mul(255).add(0.5).floor().clamp(0, 255);
+      vBatchColor = T.varying(colorShow.rgb, "nvr_batchColor");
+      vShow = T.varying(T.step(128, packedByte), "nvr_show");
+      vOpacity = T.varying(packedByte.mod(128).div(127), "nvr_opacity");
+      addHeight = T.mix(uAddHeight, decode(fetchRow("HEIGHT")), gateHeight);
+      batchLineWidth = decode(fetchRow("LINE_WIDTH"));
+    }
+
+    // line_width_vertex.glsl + polyline.vert.glsl: batch line width wins when
+    // the gate is on and the decoded value is non-negative.
+    const baseLineWidth = T.mix(
+      uMinMaxHeightAndWidth.z,
+      T.select(
+        batchLineWidth.greaterThanEqual(0),
+        batchLineWidth,
+        uMinMaxHeightAndWidth.z,
+      ),
+      gateLineWidth,
+    );
+
+    const Base = (lit === false || isTexturized
+      ? webgpu.MeshBasicNodeMaterial
+      : webgpu.MeshLambertNodeMaterial) as unknown as new () => ShaderMaterial;
+    let m: any;
+
+    if (isTexturized) {
+      // flatPolyline.vert.glsl: positions in normalized [-1, 1] tile
+      // coordinates, miter offset in xy; lighting is applied to the tile the
+      // drape bakes into, not to the line.
+      m = new Base();
+      const miter: any = T.attribute(
+        "right_normal_and_texture_coordinate_normalization_y",
+      );
+      // Positions span [-1, 1] (2.0 units) across the 512-texel render
+      // target, so one texel of width is 2.0 / 512.0 in normalized
+      // coordinates. Dividing by projectionMatrix[0][0] cancels the parent
+      // tile zoom-in magnification (see flatPolyline.vert.glsl).
+      const lineWidth = baseLineWidth
+        .mul(2.0 / 512.0)
+        .div((T.cameraProjectionMatrix as any).element(0).x);
+      m.positionNode = T.positionGeometry.add(
+        T.vec3(miter.xy.mul(lineWidth.mul(0.5).mul(miter.w)), 0),
+      );
+    } else {
+      // polyline.vert.glsl: Cesium PolylineShadowVolume screen-space width
+      // expansion in eye coordinates.
+      const startNormal: any = T.attribute("start_normal");
+      const endNormalAndX: any = T.attribute(
+        "end_normal_and_texture_coordinate_normalization_x",
+      );
+      const rightNormalAndY: any = T.attribute(
+        "right_normal_and_texture_coordinate_normalization_y",
+      );
+
+      let ecStart: any;
+      let ecEnd: any;
+      let offset: any;
+      let positionEC: any;
+      let startPlaneN: any;
+      let endPlaneN: any;
+      let rightPlaneN: any;
+      // Reference points for the top/bottom vertex classification: RTE works
+      // in eye coordinates (positionEC vs ecStart/ecEnd), non-RTE in local
+      // coordinates (position vs start/start+forward_offset).
+      let refNear: any;
+      let refFar: any;
+      let positionRaw: any;
+      let notCulled: any = T.float(1);
+
+      if (useRTE) {
+        const rteMatrix = T.uniform(new Matrix4());
+        const camHigh = T.uniform(new Vector3());
+        const camLow = T.uniform(new Vector3());
+        handles.rte = {
+          matrix: rteMatrix as unknown as { value: Matrix4 },
+          camHigh: camHigh as unknown as { value: Vector3 },
+          camLow: camLow as unknown as { value: Vector3 },
+        };
+        // u_rteOne (== 1.0) blocks fast-math reassociation of the RTE
+        // recombination — see rte_pars_vertex.glsl.
+        const uRteOne = T.uniform(1.0);
+        const posHigh: any = T.attribute("position_3d_high");
+        const posLow: any = T.attribute("position_3d_low");
+        const startHigh: any = T.attribute("start_3d_high");
+        const startLow: any = T.attribute("start_3d_low");
+        const endHigh: any = T.attribute("end_3d_high");
+        const endLow: any = T.attribute("end_3d_low");
+        const cameraRelative = (high: any, low: any): any =>
+          high.sub(camHigh).mul(uRteOne).add(low.sub(camLow));
+
+        // Horizon culling per segment (horizon_culling_pars_vertex.glsl):
+        // collapse only when BOTH endpoints are beyond the ellipsoidal
+        // horizon. The clip position is zeroed below (gl_Position = vec4(0)).
+        const ONE_OVER_WGS84_RADII = T.vec3(
+          1 / 6378137.0,
+          1 / 6378137.0,
+          1 / 6356752.3142451793,
+        );
+        const camScaled = camHigh.add(camLow).mul(ONE_OVER_WGS84_RADII);
+        const a = camScaled.dot(camScaled).sub(1);
+        const horizonCulled = (target: any): any =>
+          camScaled
+            .sub(target.mul(ONE_OVER_WGS84_RADII))
+            .dot(camScaled)
+            .greaterThan(a);
+        notCulled = horizonCulled(startHigh.add(startLow))
+          .and(horizonCulled(endHigh.add(endLow)))
+          .not()
+          .toFloat();
+
+        ecStart = rteMatrix.mul(
+          T.vec4(cameraRelative(startHigh, startLow), 1),
+        ).xyz;
+        ecEnd = rteMatrix.mul(T.vec4(cameraRelative(endHigh, endLow), 1)).xyz;
+        offset = ecEnd.sub(ecStart);
+        positionEC = rteMatrix.mul(
+          T.vec4(cameraRelative(posHigh, posLow), 1),
+        ).xyz;
+        startPlaneN = rteMatrix.mul(T.vec4(startNormal, 0)).xyz;
+        endPlaneN = rteMatrix.mul(T.vec4(endNormalAndX.xyz, 0)).xyz;
+        rightPlaneN = rteMatrix.mul(T.vec4(rightNormalAndY.xyz, 0)).xyz;
+        refNear = ecStart;
+        refFar = ecEnd;
+        positionRaw = positionEC;
+      } else {
+        const start: any = T.attribute("start");
+        const forwardOffset: any = T.attribute("forward_offset");
+        ecStart = T.modelViewMatrix.mul(T.vec4(start, 1)).xyz;
+        // normalMatrix * forward_offset
+        offset = T.transformNormalToView(forwardOffset);
+        ecEnd = ecStart.add(offset);
+        positionEC = T.modelViewMatrix.mul(T.vec4(T.positionGeometry, 1)).xyz;
+        startPlaneN = T.transformNormalToView(startNormal);
+        endPlaneN = T.transformNormalToView(endNormalAndX.xyz);
+        rightPlaneN = T.transformNormalToView(rightNormalAndY.xyz);
+        refNear = start;
+        refFar = start.add(forwardOffset);
+        positionRaw = T.positionGeometry;
+      }
+
+      // Start/end/right planes (Hessian form) in eye coordinates.
+      const startPlaneW = startPlaneN.dot(ecStart).negate();
+      const endPlaneW = endPlaneN.dot(ecEnd).negate();
+      const absStartPlaneDistance = startPlaneN
+        .dot(positionEC)
+        .add(startPlaneW)
+        .abs();
+      const absEndPlaneDistance = endPlaneN
+        .dot(positionEC)
+        .add(endPlaneW)
+        .abs();
+      const nearerStart = absStartPlaneDistance.lessThan(absEndPlaneDistance);
+
+      const planeDirection: any = T.select(nearerStart, startPlaneN, endPlaneN);
+      const upOrDown = rightPlaneN.cross(planeDirection).normalize();
+      const normalECBase = planeDirection.cross(upOrDown).normalize();
+      const heightNormal: any = (
+        T.select(
+          nearerStart,
+          rightPlaneN.cross(startPlaneN),
+          endPlaneN.cross(rightPlaneN),
+        ) as any
+      ).normalize();
+
+      // Height extrusion: pick min or max height by which side of the miter
+      // the vertex sits on (dot of the offset direction with heightNormal).
+      const distToRef = positionRaw
+        .sub(T.select(nearerStart, refNear, refFar))
+        .normalize();
+      const height = heightNormal.mul(
+        T.select(
+          distToRef.dot(heightNormal).greaterThan(0),
+          uMinMaxHeightAndWidth.y,
+          uMinMaxHeightAndWidth.x,
+        ),
+      );
+      positionEC = positionEC.add(height);
+      // Per-feature height offset from the batch texture or the uniform.
+      positionEC = positionEC.add(heightNormal.mul(addHeight));
+
+      // vNormal = normalize(heightNormal) (normal_vertex.glsl — the classic
+      // shader assigns transformedNormal = heightNormal directly).
+      const vNormal = T.varying(heightNormal.normalize(), "nvr_normal");
+
+      // metersPerPixel: pixel size in meters at this eye-space depth.
+      const vp = uViewportAndPixelRatio;
+      const distToPixel = positionEC.z.negate();
+      const inverseNear = T.float(1).div(uFrustumNearFar.x);
+      const pixelHeight = distToPixel
+        .mul(2)
+        .mul(uFrustumRatio.x.mul(inverseNear))
+        .div(vp.y.mul(vp.z));
+      const pixelWidth = distToPixel
+        .mul(2)
+        .mul(uFrustumRatio.z.mul(inverseNear))
+        .div(vp.x.mul(vp.z));
+      const metersPerPixel = T.max(pixelWidth, pixelHeight).mul(vp.z);
+
+      // Distance to push along R, clamped by maxWidth to bound overdraw.
+      let lineWidth = baseLineWidth.mul(T.max(T.float(0), metersPerPixel));
+      lineWidth = T.min(lineWidth, uMaxWidth);
+
+      // Extend the shadow volume past each end to cover the concave-side gap
+      // at joints.
+      const forwardDirectionEC = offset.normalize();
+      const pushDirection = T.select(nearerStart, T.float(-1), T.float(1));
+      positionEC = positionEC.add(
+        forwardDirectionEC.mul(pushDirection).mul(lineWidth.mul(0.5)),
+      );
+
+      // Distance to push along N.
+      lineWidth = lineWidth.div(normalECBase.dot(rightPlaneN));
+      const normalEC = normalECBase.mul(T.sign(endNormalAndX.w));
+      positionEC = positionEC.add(normalEC.mul(lineWidth));
+
+      const viewPositionNode = positionEC;
+      const cullFactorNode = notCulled;
+      class RtePolylineNodeMaterial extends Base {
+        // positionView is fully computed above (modelView already applied);
+        // the standard modelViewMatrix must not touch it.
+        setupPositionView(): unknown {
+          return viewPositionNode;
+        }
+        // Horizon-culled segments collapse to gl_Position = vec4(0).
+        setupModelViewProjection(): unknown {
+          return T.cameraProjectionMatrix
+            .mul(T.positionView)
+            .mul(cullFactorNode);
+        }
+      }
+      m = new RtePolylineNodeMaterial();
+      m.positionNode = viewPositionNode;
+      m.normalNode = vNormal;
+    }
+
+    // Fragment: pick color (matches pick.glsl nvr_batchIdToColor). The id
+    // varying must be FLAT like the classic `flat out float nvr_vBatchId`:
+    // batchIds reach 2^24 where f32 has ulp=1, so smooth interpolation can
+    // arrive a step off at some pixels and corrupt the low byte (the id then
+    // misses the property store — same idiom as pickableMeshWrapper.ts).
+    let pickId: any = T.float(0);
+    if (this.geometry.getAttribute("attrBatchId") != null) {
+      pickId = T.varying(T.attribute("attrBatchId"), "nvr_pickId");
+      T.nodeObject(pickId).setInterpolation("flat");
+    }
+    const pickColor = T.vec3(
+      pickId.div(65536).floor().div(255),
+      pickId.div(256).mod(256).floor().div(255),
+      pickId.mod(256).floor().div(255),
+    );
+    m.colorNode = T.Fn(() => {
+      // show_fragment.glsl: discard hidden / fully transparent features.
+      T.mix(T.float(1), vShow, gateColorShow).lessThan(0.5).discard();
+      T.mix(T.float(1), vOpacity, gateColorShow).lessThanEqual(0).discard();
+      return T.vec4(
+        T.materialColor.rgb
+          .mul(T.mix(T.vec3(1, 1, 1), vBatchColor, gateColorShow))
+          .mul(uPickable.oneMinus()),
+        1,
+      );
+    })();
+    m.emissiveNode =
+      // MeshBasicNodeMaterial (flat/texturized) has no `emissive` property —
+      // materialEmissive would build a color uniform with an undefined value
+      // and crash the WebGPU uniform update. Basic: pick color only, gated by
+      // uPickable (colorNode already zeroes diffuse when picking).
+      "emissive" in m
+        ? T.mix(T.materialEmissive, pickColor, uPickable)
+        : pickColor.mul(uPickable);
+    m.opacityNode = T.mix(
+      T.materialOpacity.mul(T.mix(T.float(1), vOpacity, gateColorShow)),
+      T.float(1),
+      uPickable,
+    );
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    // Polyline always renders without depth testing (see initMaterial).
+    m.depthTest = false;
+
+    // Point the batch plumbing (userData.defines / batchDataTexture /
+    // batchTextureConfig, written later by updateBatchAttribute) at the same
+    // objects the classic material used.
+    Object.assign(m.userData, src.userData);
+    m.userData.nvrWebgpu = handles;
+    this.material = m as ShaderMaterial;
+  }
+
+  /**
+   * Per-render sync of the TSL uniform handles from the enhancer state (which
+   * keeps mutating the classic material it was mounted on). No-op unless the
+   * WebGPU node material is installed.
+   */
+  private syncWebgpuHandles(): void {
+    const w = this.material.userData.nvrWebgpu as
+      PolylineWebgpuHandles | undefined;
+    if (!w) return;
+    const s = this.getEnhancer().states();
+    w.uMinMaxHeightAndWidth.value.set(
+      s.minMaxHeight[0],
+      s.minMaxHeight[1],
+      s.width,
+    );
+    w.uMaxWidth.value = s.maxWidth;
+    w.uAddHeight.value = s.addHeight;
+    w.gateColorShow.value = s.useBatchColorShow ? 1 : 0;
+    w.gateHeight.value = s.useBatchHeight ? 1 : 0;
+    w.gateLineWidth.value = s.useBatchLineWidth ? 1 : 0;
+    w.uPickable.value = s.pickable ? 1 : 0;
+
+    // External shared uniforms (CommonUniforms): the classic material's
+    // uniform entries hold live tuple references updated externally per frame.
+    const uniforms = w.src.uniforms;
+    const vp = uniforms.viewportAndPixelRatio?.value;
+    if (vp) w.uViewportAndPixelRatio.value.set(vp[0], vp[1], vp[2]);
+    const nf = uniforms.frustumNearFar?.value;
+    if (nf) w.uFrustumNearFar.value.set(nf[0], nf[1]);
+    const fr = uniforms.frustumRatio?.value;
+    if (fr) w.uFrustumRatio.value.set(fr[0], fr[1], fr[2], fr[3]);
+
+    // Props the enhancer writes on its own (classic) material.
+    const m = this.material;
+    m.transparent = w.src.transparent;
+    m.opacity = w.src.opacity;
+    m.depthWrite = w.src.depthWrite;
+    (m as unknown as { color: Color }).color.copy(
+      w.src.uniforms.color.value as Color,
+    );
   }
 
   _getBatchTextureRows(): BatchTextureRowKey[] {
@@ -483,6 +1096,11 @@ export class PolylineMesh extends BatchedFeatureMesh<
   }
 
   get color() {
+    // After the WebGPU material swap the color uniform lives on the classic
+    // (enhancer-mounted) material kept in userData.nvrWebgpu.
+    const w = this.material.userData?.nvrWebgpu as
+      PolylineWebgpuHandles | undefined;
+    if (w) return w.src.uniforms.color.value;
     return this.material.uniforms.color.value;
   }
 

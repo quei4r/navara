@@ -164,9 +164,8 @@ export class PickHelper {
       this.onHoverPointerMove(event);
     this.hoverLeaveHandler = () => this.onHoverPointerLeave();
 
-    this.isWebGPU = !!(
-      this._renderer as unknown as WebGPURendererLike
-    ).isWebGPURenderer;
+    this.isWebGPU = !!(this._renderer as unknown as WebGPURendererLike)
+      .isWebGPURenderer;
 
     let width: number;
     let height: number;
@@ -485,7 +484,11 @@ export class PickHelper {
    * viewport) around a client-space pointer position. `minY`/`pickingCoord`
    * are in texture space (see {@link isBottomUpTextureSpace}).
    */
-  private computePickWindow(clientX: number, clientY: number, radiusCss: number) {
+  private computePickWindow(
+    clientX: number,
+    clientY: number,
+    radiusCss: number,
+  ) {
     const rect = this.element.getBoundingClientRect();
     const x = clientX - rect.left;
     const y = clientY - rect.top;
@@ -613,7 +616,14 @@ export class PickHelper {
    */
   private scanPickBuffer(
     data: Uint8Array,
-    w: { pixelX: number; texY: number; minX: number; minY: number; width: number; height: number },
+    w: {
+      pixelX: number;
+      texY: number;
+      minX: number;
+      minY: number;
+      width: number;
+      height: number;
+    },
     rowStride: number,
   ): number {
     let bestId = 0;

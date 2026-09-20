@@ -107,7 +107,7 @@ import {
 } from "./layers/effect";
 import { FinalCopyEffectDesc } from "./layers/effect/FinalCopyEffectDesc";
 import { LayersManager } from "./layersManager";
-import { disposeTexture } from "./loaders";
+import { disposeTexture, flushRetiredTextures } from "./loaders";
 import {
   overrideMaterialsForMRT,
   GBUFFER_ATTACHMENT_NAMES,
@@ -322,8 +322,11 @@ export type Options = {
    * `init()`ed) switches the view to the experimental WebGPU forward path:
    * no EffectComposer, no MRT G-buffer; postprocessing-library effects are
    * replaced by a TSL PostProcessing chain (bloom/FXAA). Feature picking is
-   * fully functional (asynchronous readback). Subsystems that still degrade
-   * or no-op on that backend: tile texture compositing and draping, CSM
+   * fully functional (asynchronous readback). Clamp-to-ground vector draping
+   * works (the per-tile scenes bake into render targets that the tile node
+   * material samples directly). Subsystems that still degrade or no-op on
+   * that backend: the MRT composite atlas (per-slot water/heatmap/emissive
+   * composite features and Geographic-terrain latitude reprojection), CSM
    * shadows, TerrainPicker depth sampling, and the pick debug view.
    * @experimental
    */
@@ -1861,6 +1864,7 @@ export default class ThreeView<
       disposeTexture(tex);
     }
     this._loadedTexs.clear();
+    flushRetiredTextures();
 
     // Cleanup hillshade context (temp DEMs, generator, etc.)
     this._hillshadeContext.dispose();
@@ -2094,6 +2098,8 @@ export default class ThreeView<
     // WebGPU path: sync sky/sun/shadow frustum, then refresh the shadow
     // map for this frame (autoUpdate is off, like the WebGL path).
     if (this._webgpuEnvironment) {
+      this._webgpuEnvironment.appLightsActive =
+        this.renderPassOrchestrator.hasAppLights;
       this._webgpuEnvironment.update(this._camera.raw);
       this._renderer.shadowMap.needsUpdate = true;
     }

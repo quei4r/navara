@@ -3,14 +3,17 @@ import type {
   TextMaterial as NavaraTextMaterial,
   Transform,
 } from "@navaramap/engine";
-import type { FontManager } from "@navaramap/font";
+import { SDF_PX_SIZE, type FontManager } from "@navaramap/font";
 import { degreeToRadian } from "@navaramap/three-api";
 import {
   Color,
+  DataTexture,
+  type Material,
   type PerspectiveCamera,
   Object3D,
   ShaderMaterial,
   Vector2,
+  Vector3,
 } from "three";
 import invariant from "tiny-invariant";
 
@@ -27,13 +30,24 @@ import {
   type SdfTextBaseProps,
   type SdfTextBaseState,
 } from "../../material/enhancer/sdfText";
+import {
+  MSDF_FULL_DETAIL_PPEM,
+  MSDF_TRUE_SDF_END_PPEM,
+  SMALL_TEXT_STEM_DARKEN_END_PPEM,
+  SMALL_TEXT_STEM_DARKEN_FULL_PPEM,
+  SMALL_TEXT_STEM_DARKEN_MAX_PX,
+  SMALL_TEXT_SUPERSAMPLE_END_PPEM,
+  SMALL_TEXT_SUPERSAMPLE_FULL_PPEM,
+} from "../../material/enhancer/sdfText/sdfTextBaseEnhancer/coverage";
+import { sdfRadiusFor } from "../../material/enhancer/sdfText/sdfTextBaseEnhancer/types";
+import { getWebGPU } from "../../utils";
 import { GEOMETRY_TYPES } from "../constants";
 import { InstancedMesh, type InstancedMeshOptions } from "../instanced";
 import type { PickableMesh } from "../pickableMesh";
 
 import { GlyphBuffers } from "./glyphBuffers";
 import { GlyphSlotAllocator, type GlyphRun } from "./glyphSlots";
-import { LabelDataTexture, LabelRow } from "./labelData";
+import { LABEL_ROWS, LabelDataTexture, LabelRow } from "./labelData";
 import {
   createAnchorVisibilityState,
   isAnchorPotentiallyVisible,
@@ -46,6 +60,53 @@ import { PendingSettlement } from "./pendingSettlement";
 const _tmpSize = new Vector2();
 const _tmpColor = new Color();
 const _visibility = createAnchorVisibilityState();
+
+/**
+ * TSL uniform handles + prop source for the WebGPU node material built by
+ * _initWebGPUMaterial. Values are synced from the enhancer's uniform refs
+ * (which live on the classic material it stays mounted on) once per render —
+ * see _syncWebgpuHandles.
+ */
+type SdfTextWebgpuHandles = {
+  uCenter: { value: Vector2 };
+  uSizeInMeters: { value: number };
+  uOffsetDepth: { value: number };
+  uSdfThreshold: { value: number };
+  uOutlineWidth: { value: number };
+  uOutlineColor: { value: Color };
+  uOutlineOpacity: { value: number };
+  uShowBackground: { value: number };
+  uBackgroundColor: { value: Color };
+  uBackgroundOutlineColor: { value: Color };
+  uBackgroundOutlineWidth: { value: number };
+  uFovRad: { value: number };
+  uScreenHeightPx: { value: number };
+  uFarPlane: { value: number };
+  uRTCCenter: { value: Vector3 };
+  uRTCCenterView: { value: Vector3 };
+  uEyeRTEHigh: { value: Vector3 };
+  uEyeRTELow: { value: Vector3 };
+  uSdfAtlasSize: { value: Vector2 };
+  uColorAtlasSize: { value: Vector2 };
+  uLabelTexSize: { value: Vector2 };
+  uPickable: { value: number };
+  /** Texture nodes whose `.value` is swapped as atlases/label data grow. */
+  labelDataTex: { value: DataTexture };
+  atlasTex: { value: DataTexture };
+  colorAtlasTex: { value: DataTexture };
+  src: ShaderMaterial;
+};
+
+/** Stand-in for a not-yet-bound atlas (fonts still loading, no color glyphs).
+ *  Black-transparent so any accidental sample discards itself. */
+let _placeholderTexture: DataTexture | null = null;
+const getPlaceholderTexture = (): DataTexture => {
+  if (!_placeholderTexture) {
+    _placeholderTexture = new DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+    _placeholderTexture.needsUpdate = true;
+  }
+  return _placeholderTexture;
+};
 
 type PositionsInfoBase = {
   batchIDs: Float32Array<ArrayBufferLike> | null;
@@ -198,6 +259,9 @@ export class BatchedSdfTextMesh
   private _glyphs: GlyphBuffers;
   private _slots = new GlyphSlotAllocator();
   private _labelData: LabelDataTexture;
+  /** WebGPU node material (built by _setupMaterial on the WebGPU backend);
+   *  replaces the classic ShaderMaterial for rendering only. */
+  private _webgpuMaterial?: Material;
 
   /** Layout inputs baked into glyph quads; a change forces a re-layout. */
   private _maxWidth: number;
@@ -265,7 +329,7 @@ export class BatchedSdfTextMesh
     });
     this._enhancer = createSdfTextMaterialEnhancer(mat);
     this._setupMaterial(mat, material);
-    this.material = mat;
+    this.material = this._webgpuMaterial ?? mat;
     this.renderOrder = options.renderOrder ?? this.renderOrder;
     // Geometry positions are unit quads; the real transform happens in the
     // shader, so a three.js bounding sphere would be meaningless here.
@@ -326,6 +390,34 @@ export class BatchedSdfTextMesh
     const mutates = this._enhancer.mutates();
     mutates.updateUniforms(mat.uniforms, this._enhancer.states());
 
+    if (this._isWebGPUBackend()) {
+      // The GLSL enhancer pipeline (onBeforeCompile) never runs on the WebGPU
+      // backend, and the shared Renderer only invokes object.onBeforeRender —
+      // not material.onBeforeRender — so the per-frame uniform hook moves to
+      // the mesh. The classic material stays alive as the enhancer's state
+      // store; a TSL node material replaces it for rendering.
+      const state = this._enhancer.states();
+      this.onBeforeRender = (renderer, _scene, camera) => {
+        const pCam = camera as PerspectiveCamera;
+        mutates.updatePerFrame(
+          degreeToRadian(pCam.fov),
+          renderer.getDrawingBufferSize(_tmpSize).y / renderer.getPixelRatio(),
+          pCam.far,
+          camera.position.x,
+          camera.position.y,
+          camera.position.z,
+          camera.matrixWorldInverse,
+          state,
+        );
+        // Keep atlas-size uniforms in sync with the (possibly resized) shared
+        // DataTexture so glyph pixel rects always normalize to the right UV.
+        mutates.updateAtlasSizes();
+        this._syncWebgpuHandles();
+      };
+      this._webgpuMaterial = this._initWebGPUMaterial(mat);
+      return;
+    }
+
     mat.onBeforeCompile = this._enhancer.transformShader;
     mat.customProgramCacheKey = this._enhancer.programCacheKey;
 
@@ -347,6 +439,596 @@ export class BatchedSdfTextMesh
       // DataTexture so glyph pixel rects always normalize to the right UV.
       mutates.updateAtlasSizes();
     };
+  }
+
+  private _isWebGPUBackend(): boolean {
+    const renderer = this.ctx.viewContext?.getRenderer() as
+      { isWebGPURenderer?: boolean } | undefined;
+    return !!renderer?.isWebGPURenderer;
+  }
+
+  /**
+   * WebGPU sdfText material: a TSL node material reproducing the classic
+   * GLSL enhancer pipeline (sdfText.vert/frag.glsl), which never runs on this
+   * backend:
+   *  - vertex: per-label rows fetched from the uLabelData float texture
+   *    (anchor high/low, font size, height, color/opacity, box metrics,
+   *    declutter/show state), RTE high/low or RTC view-space anchor resolve,
+   *    ellipsoidal horizon culling + empty/background/hidden slot culling
+   *    (clip position collapsed to vec4(0)), view-space billboard expansion
+   *    with pxToWorld scaling when sizeInMeters is off;
+   *  - fragment: screen-pixel SDF/MTSDF coverage (subpixel supersampling and
+   *    stem darkening at small ppem), outline compositing, background quad,
+   *    COLRv1 color-glyph path, manual logarithmic depth with the fill-pull
+   *    outline-seam fix, pick coloring (nvr_batchIdToColor) via uPickable.
+   * Uniform state is fed per render from the enhancer's classic-material
+   * uniform refs by _syncWebgpuHandles; textures ride TSL texture nodes whose
+   * value is swapped when an atlas or the label texture is replaced.
+   * Not ported: gbuffer MRT writes / screen-space normal pass outputs.
+   */
+  private _initWebGPUMaterial(src: ShaderMaterial): Material {
+    const { webgpu, tsl } = getWebGPU();
+    // TSL's chained node methods don't survive the library's generic
+    // typings; the graph is runtime-checked by the node builder instead.
+    // (Same `as any` idiom as the polygon/polyline WebGPU materials, applied
+    // to the whole TSL namespace — this graph is far larger.)
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const T = tsl as any;
+    const state = this._enhancer.states();
+    const useRTE = state.useRTE;
+    const useMsdf = state.useMsdf;
+
+    const uniforms = src.uniforms;
+    const texValue = (name: string): DataTexture =>
+      (uniforms[name]?.value as DataTexture | null) ?? getPlaceholderTexture();
+
+    const handles: SdfTextWebgpuHandles = {
+      uCenter: T.uniform(new Vector2()) as unknown as { value: Vector2 },
+      uSizeInMeters: T.uniform(1) as unknown as { value: number },
+      uOffsetDepth: T.uniform(1) as unknown as { value: number },
+      uSdfThreshold: T.uniform(0.5) as unknown as { value: number },
+      uOutlineWidth: T.uniform(0) as unknown as { value: number },
+      uOutlineColor: T.uniform(new Color(1, 0, 0)) as unknown as {
+        value: Color;
+      },
+      uOutlineOpacity: T.uniform(1) as unknown as { value: number },
+      uShowBackground: T.uniform(0) as unknown as { value: number },
+      uBackgroundColor: T.uniform(new Color(1, 0, 0)) as unknown as {
+        value: Color;
+      },
+      uBackgroundOutlineColor: T.uniform(new Color(1, 0, 0)) as unknown as {
+        value: Color;
+      },
+      uBackgroundOutlineWidth: T.uniform(0.1) as unknown as { value: number },
+      uFovRad: T.uniform(1) as unknown as { value: number },
+      uScreenHeightPx: T.uniform(1080) as unknown as { value: number },
+      uFarPlane: T.uniform(1000) as unknown as { value: number },
+      uRTCCenter: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uRTCCenterView: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uEyeRTEHigh: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uEyeRTELow: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uSdfAtlasSize: T.uniform(new Vector2(1, 1)) as unknown as {
+        value: Vector2;
+      },
+      uColorAtlasSize: T.uniform(new Vector2(1, 1)) as unknown as {
+        value: Vector2;
+      },
+      uLabelTexSize: T.uniform(new Vector2(1, 1)) as unknown as {
+        value: Vector2;
+      },
+      uPickable: T.uniform(0) as unknown as { value: number },
+      labelDataTex: T.texture(texValue("uLabelData")) as unknown as {
+        value: DataTexture;
+      },
+      atlasTex: T.texture(texValue("uAtlas")) as unknown as {
+        value: DataTexture;
+      },
+      colorAtlasTex: T.texture(texValue("uColorAtlas")) as unknown as {
+        value: DataTexture;
+      },
+      src,
+    };
+    const {
+      uCenter,
+      uSizeInMeters,
+      uOffsetDepth,
+      uSdfThreshold,
+      uOutlineWidth,
+      uOutlineColor,
+      uOutlineOpacity,
+      uShowBackground,
+      uBackgroundColor,
+      uBackgroundOutlineColor,
+      uBackgroundOutlineWidth,
+      uFovRad,
+      uScreenHeightPx,
+      uFarPlane,
+      uRTCCenter,
+      uRTCCenterView,
+      uEyeRTEHigh,
+      uEyeRTELow,
+      uSdfAtlasSize,
+      uColorAtlasSize,
+      uLabelTexSize,
+      uPickable,
+      labelDataTex,
+      atlasTex,
+      colorAtlasTex,
+      // TSL's chained node methods don't survive the library's generic
+      // typings; the graph is runtime-checked by the node builder instead
+      // (same `as any` idiom as the polygon/polyline WebGPU materials).
+      /* eslint-disable @typescript-eslint/no-explicit-any */
+    } = handles as unknown as Record<string, any>;
+
+    // ---- Vertex ----
+
+    const flatVarying = (node: any, name: string): any => {
+      const v = T.varying(node, name);
+      T.nodeObject(v).setInterpolation("flat");
+      return v;
+    };
+
+    // Per-instance attributes (glyph instances; see sdfText.vert.glsl).
+    const kind: any = T.attribute("glyphKind");
+    const labelIndex: any = T.attribute("labelIndex");
+    const glyphOffset: any = T.attribute("glyphOffset");
+    const glyphSize: any = T.attribute("glyphSize");
+    const glyphUvRect: any = T.attribute("glyphUvRect");
+    // The quad uv is exactly position.xy + 0.5; deriving it keeps the `uv`
+    // attribute out of the node graph (WebGPU caps vertex buffers at 8).
+    const quad: any = T.positionGeometry;
+    const uvQuad = quad.xy.add(0.5);
+
+    // nvr_readLabel: row-block texel fetch from the per-label data texture.
+    const readLabel = (row: number): any => {
+      const i = labelIndex.mul(LABEL_ROWS).add(row);
+      return labelDataTex.load(
+        T.uvec2(
+          i.mod(uLabelTexSize.x).toUint(),
+          i.div(uLabelTexSize.x).floor().toUint(),
+        ),
+      );
+    };
+
+    const labelState = readLabel(LabelRow.STATE);
+    const declutterHide = labelState.x;
+    const showState = labelState.z;
+    const posSize = readLabel(LabelRow.POSITION_HIGH_SIZE);
+    const posHeight = readLabel(LabelRow.POSITION_LOW_HEIGHT);
+    const colorOpacity = readLabel(LabelRow.COLOR_OPACITY);
+    const box = readLabel(LabelRow.BOX);
+
+    const fontSize = posSize.w;
+    const addHeight = posHeight.w;
+    const textWidth = box.x;
+    const textHeight = box.y;
+    const bgMinY = box.z;
+    const bgMaxY = box.w;
+
+    const isEmpty = kind.equal(3.0);
+    const isBackground = kind.equal(2.0);
+    const isColor = kind.equal(1.0);
+
+    // Anchor resolve + view-space base position (RTE high/low split, or RTC
+    // with the center pre-transformed to view space on the CPU in float64).
+    let absTransformed: any;
+    let baseMv: any;
+    if (useRTE) {
+      // u_rteOne (== 1.0) blocks fast-math reassociation of the high/low
+      // recombination — see chunks/rte_pars_vertex.glsl.
+      const uRteOne = T.uniform(1.0);
+      const high = posSize.xyz;
+      const low = posHeight.xyz;
+      absTransformed = high.add(low);
+      const resolved = high
+        .sub(uEyeRTEHigh)
+        .mul(uRteOne)
+        .add(low.sub(uEyeRTELow));
+      // viewMatrixRTE with the translation column removed == rotation applied
+      // to a w=0 vector.
+      baseMv = T.cameraViewMatrix.mul(T.vec4(resolved, 0)).xyz;
+    } else {
+      const rtcPos = posSize.xyz;
+      absTransformed = rtcPos.add(uRTCCenter);
+      baseMv = T.cameraViewMatrix
+        .mul(T.vec4(rtcPos, 0))
+        .xyz.add(uRTCCenterView);
+    }
+
+    // Horizon culling (horizon_culling_*.glsl): flat varying + collapsed clip
+    // position, with a fragment-side discard like the classic shader.
+    const ONE_OVER_WGS84_RADII = T.vec3(
+      1 / 6378137.0,
+      1 / 6378137.0,
+      1 / 6356752.3142451793,
+    );
+    const camScaled = T.cameraPosition.mul(ONE_OVER_WGS84_RADII);
+    const horizonA = camScaled.dot(camScaled).sub(1);
+    const horizonCulled = camScaled
+      .sub(absTransformed.mul(ONE_OVER_WGS84_RADII))
+      .dot(camScaled)
+      .greaterThan(horizonA);
+    const vHorizonCulled = flatVarying(
+      horizonCulled.toFloat(),
+      "nvr_horizonCulled",
+    );
+
+    // mvr_getMvHeightOffset: height along the ellipsoid normal, rotated into
+    // view space (a w=0 transform, so the translation column never contributes).
+    const mvHeightOffset = T.cameraViewMatrix.mul(
+      T.vec4(absTransformed.normalize().mul(addHeight), 0),
+    ).xyz;
+    const mv = baseMv.add(mvHeightOffset);
+
+    // pxToWorld: constant screen-pixel size when sizeInMeters is off.
+    const pxScale = fontSize.mul(
+      T.tan(uFovRad.mul(0.5)).mul(mv.z.abs()).mul(2).div(uScreenHeightPx),
+    );
+    const scaleFactor = T.select(
+      uSizeInMeters.greaterThan(0.5),
+      fontSize,
+      pxScale,
+    );
+
+    const center = uCenter.clamp(-0.5, 0.5);
+
+    // Background quad spans the label box; glyph quads use their own rect.
+    const bgHeight = bgMaxY.sub(bgMinY);
+    const bgLocal = uvQuad
+      .mul(T.vec2(textWidth, bgHeight))
+      .add(T.vec2(0, bgMinY))
+      .sub(T.vec2(center.x.mul(textWidth), center.y.mul(textHeight)));
+    const glyphLocal = uvQuad
+      .mul(glyphSize)
+      .add(glyphOffset)
+      .sub(T.vec2(center.x.mul(textWidth), center.y.mul(textHeight)));
+    const localPos = T.select(isBackground, bgLocal, glyphLocal);
+    const finalMv = mv.add(T.vec3(localPos.mul(scaleFactor), 0));
+
+    // Varyings (flat ones are per-instance constants in the classic shader).
+    const atlasSize = T.select(isColor, uColorAtlasSize, uSdfAtlasSize);
+    const vAtlasUvMin = flatVarying(
+      glyphUvRect.xy.div(atlasSize),
+      "nvr_atlasUvMin",
+    );
+    const vAtlasUvMax = flatVarying(
+      glyphUvRect.zw.div(atlasSize),
+      "nvr_atlasUvMax",
+    );
+    const vAtlasUv = T.varying(
+      T.select(isBackground, uvQuad, T.mix(vAtlasUvMin, vAtlasUvMax, uvQuad)),
+      "nvr_atlasUv",
+    );
+    const vColor = flatVarying(colorOpacity.rgb, "nvr_labelColor");
+    const vOpacity = flatVarying(
+      colorOpacity.a.mul(declutterHide.oneMinus()),
+      "nvr_labelOpacity",
+    );
+    const vBatchID = flatVarying(labelState.y, "nvr_batchId");
+    const vBackGroundSprite = flatVarying(
+      isBackground.toFloat(),
+      "nvr_bgSprite",
+    );
+    const vBackGroundRatio = flatVarying(
+      T.select(isBackground, textWidth.div(T.max(bgHeight, 1e-6)), T.float(1)),
+      "nvr_bgRatio",
+    );
+    const vIsColor = flatVarying(isColor.toFloat(), "nvr_isColor");
+    // gl_Position.w + 1.0; for a perspective camera w == -viewZ.
+    const vFragDepth = T.varying(finalMv.z.negate().add(1), "nvr_fragDepth");
+
+    // Empty slots, background while disabled, hidden/decluttered labels and
+    // horizon-culled anchors all collapse the clip position (classic moves
+    // them outside clip space; vec4(0) is the polyline WebGPU idiom).
+    const culled = isEmpty
+      .or(isBackground.and(uShowBackground.lessThan(0.5)))
+      .or(showState.lessThan(0.5))
+      .or(declutterHide.greaterThanEqual(0.999))
+      .or(horizonCulled);
+    const notCulled = culled.not().toFloat();
+
+    const Base = webgpu.MeshBasicNodeMaterial as unknown as new () => Material;
+    const viewPositionNode = finalMv;
+    const cullFactorNode = notCulled;
+    class SdfTextNodeMaterial extends Base {
+      // positionView is fully computed above (view matrix already applied);
+      // the standard modelViewMatrix must not touch it.
+      setupPositionView(): unknown {
+        return viewPositionNode;
+      }
+      setupModelViewProjection(): unknown {
+        return T.cameraProjectionMatrix.mul(T.positionView).mul(cullFactorNode);
+      }
+    }
+    const m: any = new SdfTextNodeMaterial();
+    m.positionNode = viewPositionNode;
+
+    // ---- Fragment ----
+
+    // nvr_screenPxRange: distance-field range in output screen pixels, derived
+    // from UV gradients so narrow-stroke medial axes keep a stable AA width.
+    const uvDx: any = T.dFdx(vAtlasUv);
+    const uvDy: any = T.dFdy(vAtlasUv);
+    const uvGradient = uvDx.mul(uvDx).add(uvDy.mul(uvDy)).sqrt();
+    const screenTexSize = T.vec2(1, 1).div(
+      T.max(uvGradient, T.vec2(1e-6, 1e-6)),
+    );
+    const sdfPxRange = sdfRadiusFor(useMsdf);
+    const unitRange = T.vec2(sdfPxRange, sdfPxRange).div(
+      T.max(uSdfAtlasSize, T.vec2(1, 1)),
+    );
+    const screenPxRange = T.max(
+      unitRange.dot(screenTexSize).mul(0.5),
+      T.float(1),
+    );
+
+    const projectedPpem = screenPxRange.mul(SDF_PX_SIZE / sdfPxRange);
+    // MTSDF detail blend: alpha's true SDF takes over at small ppem.
+    const msdfDetail = useMsdf
+      ? T.smoothstep(
+          T.float(MSDF_TRUE_SDF_END_PPEM),
+          T.float(MSDF_FULL_DETAIL_PPEM),
+          projectedPpem,
+        )
+      : T.float(0);
+
+    // nvr_sampleDistances: (display distance, true SDF), clamped to the glyph
+    // rect so bilinear taps can't reach a neighbouring packed glyph.
+    const sampleDistances = (uv: any): any => {
+      const clampedUv = T.clamp(uv, vAtlasUvMin, vAtlasUvMax);
+      if (useMsdf) {
+        const sv = atlasTex.sample(clampedUv);
+        const msdf = T.max(T.min(sv.r, sv.g), T.min(T.max(sv.r, sv.g), sv.b));
+        return T.vec2(T.mix(sv.a, msdf, msdfDetail), sv.a);
+      }
+      const sdf = atlasTex.sample(clampedUv).r;
+      return T.vec2(sdf, sdf);
+    };
+
+    // nvr_edgeCoverage: linear one-screen-pixel coverage.
+    const edgeCoverage = (d: any, edge: any): any =>
+      screenPxRange.mul(d.sub(edge)).add(0.5).clamp(0, 1);
+
+    const outlineWidthClamped = uOutlineWidth.clamp(0, 0.4);
+    const stemDarkeningPx = T.float(SMALL_TEXT_STEM_DARKEN_MAX_PX).mul(
+      T.smoothstep(
+        T.float(SMALL_TEXT_STEM_DARKEN_FULL_PPEM),
+        T.float(SMALL_TEXT_STEM_DARKEN_END_PPEM),
+        projectedPpem,
+      ).oneMinus(),
+    );
+    const fillEdge = uSdfThreshold.sub(stemDarkeningPx.div(screenPxRange));
+    const outerEdge = uSdfThreshold.sub(outlineWidthClamped);
+
+    const centerDistances = sampleDistances(vAtlasUv);
+    const centerFill = edgeCoverage(centerDistances.x, fillEdge);
+    const centerOutline = edgeCoverage(centerDistances.y, outerEdge);
+
+    // Four subpixel quadrant taps approximate area coverage when several thin
+    // strokes fall inside one screen pixel; the blend fades out by 32 ppem.
+    // (The classic shader skips the taps when the blend is 0; here they are
+    // always evaluated and mixed out — same result, slightly more work.)
+    const ssBlend = T.smoothstep(
+      T.float(SMALL_TEXT_SUPERSAMPLE_FULL_PPEM),
+      T.float(SMALL_TEXT_SUPERSAMPLE_END_PPEM),
+      projectedPpem,
+    ).oneMinus();
+    const s0 = sampleDistances(
+      vAtlasUv.sub(uvDx.mul(0.25)).sub(uvDy.mul(0.25)),
+    );
+    const s1 = sampleDistances(
+      vAtlasUv.add(uvDx.mul(0.25)).sub(uvDy.mul(0.25)),
+    );
+    const s2 = sampleDistances(
+      vAtlasUv.sub(uvDx.mul(0.25)).add(uvDy.mul(0.25)),
+    );
+    const s3 = sampleDistances(
+      vAtlasUv.add(uvDx.mul(0.25)).add(uvDy.mul(0.25)),
+    );
+    const ssFill = edgeCoverage(s0.x, fillEdge)
+      .add(edgeCoverage(s1.x, fillEdge))
+      .add(edgeCoverage(s2.x, fillEdge))
+      .add(edgeCoverage(s3.x, fillEdge))
+      .mul(0.25);
+    const ssOutline = edgeCoverage(s0.y, outerEdge)
+      .add(edgeCoverage(s1.y, outerEdge))
+      .add(edgeCoverage(s2.y, outerEdge))
+      .add(edgeCoverage(s3.y, outerEdge))
+      .mul(0.25);
+    const fillAlpha = T.mix(centerFill, ssFill, ssBlend);
+    const outlineAlpha = T.mix(centerOutline, ssOutline, ssBlend);
+
+    // Outline-on composite: fill over outline, weighted by actual alpha.
+    const outlineLayer = outlineAlpha.mul(uOutlineOpacity);
+    const behindFill = outlineLayer.mul(fillAlpha.oneMinus());
+    const alphaO = fillAlpha.add(behindFill);
+    const colorO = T.select(
+      alphaO.greaterThan(0),
+      vColor.mul(fillAlpha).add(uOutlineColor.mul(behindFill)).div(alphaO),
+      vColor,
+    );
+    const hasOutline = outlineWidthClamped.greaterThan(0);
+    const sdfAlpha = T.select(hasOutline, alphaO, fillAlpha).mul(vOpacity);
+    const sdfColor = T.select(hasOutline, colorO, vColor);
+    // Fill-pull depth fix (sdfText.frag.glsl): fills move nearer so a
+    // neighbouring glyph's fill occludes this glyph's outline at overlaps.
+    const sdfDepthAdjust = T.select(
+      hasOutline,
+      fillAlpha.mul(0.0002),
+      T.float(0.0001),
+    );
+
+    // COLRv1 color glyph: pre-rasterized RGBA, SDF math bypassed.
+    const colorGlyph = colorAtlasTex.sample(vAtlasUv);
+    const colorGlyphOut = T.vec4(colorGlyph.rgb, colorGlyph.a.mul(vOpacity));
+
+    // Background quad: solid box with a border band, alpha = label opacity.
+    const bgP = vAtlasUv.sub(0.5).abs();
+    const bgBorder = bgP.x
+      .greaterThan(
+        T.float(0.5).sub(uBackgroundOutlineWidth.div(vBackGroundRatio)),
+      )
+      .or(bgP.y.greaterThan(T.float(0.5).sub(uBackgroundOutlineWidth)));
+    const bgOut = T.vec4(
+      T.select(bgBorder, uBackgroundOutlineColor, uBackgroundColor),
+      vOpacity,
+    );
+
+    // Pick color (matches pick.glsl nvr_batchIdToColor).
+    const pickColor = T.vec3(
+      vBatchID.div(65536).floor().div(255),
+      vBatchID.div(256).mod(256).floor().div(255),
+      vBatchID.mod(256).floor().div(255),
+    );
+
+    const isPick = uPickable.greaterThan(0);
+    const notPick = isPick.not();
+    const isBgFrag = vBackGroundSprite.greaterThan(0.5);
+    const isColorFrag = vIsColor.greaterThan(0.5);
+    const isSdfFrag = isBgFrag.not().and(isColorFrag.not());
+
+    m.colorNode = T.Fn(() => {
+      vHorizonCulled.greaterThan(0.5).discard();
+      // Color glyphs discard on zero coverage (not in pick mode — the classic
+      // pick return happens before this branch).
+      isColorFrag.and(notPick).and(colorGlyph.a.lessThanEqual(0)).discard();
+      const sdfDiscard = hasOutline
+        .and(outlineAlpha.lessThanEqual(0))
+        .or(sdfAlpha.lessThanEqual(0));
+      isSdfFrag.and(notPick).and(sdfDiscard).discard();
+      return T.select(
+        isPick,
+        T.vec4(pickColor, 1),
+        T.select(
+          isBgFrag,
+          bgOut,
+          T.select(isColorFrag, colorGlyphOut, T.vec4(sdfColor, sdfAlpha)),
+        ),
+      );
+    })();
+
+    // Manual logarithmic depth (the classic shader writes gl_FragDepth):
+    // base value for every path; the fill-pull adjust only applies to SDF
+    // glyph fragments outside pick mode.
+    const depthInput = T.select(
+      uOffsetDepth.greaterThan(0.5),
+      vFragDepth.mul(0.8),
+      vFragDepth,
+    );
+    const fragDepthBase = depthInput
+      .log()
+      .div(uFarPlane.add(1).log())
+      .add(0.0001)
+      .clamp(0, 1);
+    m.depthNode = fragDepthBase
+      .sub(sdfDepthAdjust.mul(isSdfFrag.toFloat()).mul(notPick.toFloat()))
+      .clamp(0, 1);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    m.userData.nvrWebgpu = handles;
+    this._syncWebgpuHandles(handles);
+    return m as Material;
+  }
+
+  /**
+   * Per-render sync of the TSL uniform handles from the enhancer's uniform
+   * refs (which live on the classic material, still mutated by the enhancer's
+   * mutates and the per-frame hook). No-op unless the WebGPU node material is
+   * installed.
+   */
+  private _syncWebgpuHandles(prebuilt?: SdfTextWebgpuHandles): void {
+    const w =
+      prebuilt ??
+      ((this.material as Material | undefined)?.userData.nvrWebgpu as
+        SdfTextWebgpuHandles | undefined);
+    if (!w) return;
+    const u = w.src.uniforms;
+    const setV2 = (
+      h: { value: Vector2 },
+      r: { value: Vector2 } | undefined,
+    ): void => {
+      if (r) h.value.set(r.value.x, r.value.y);
+    };
+    const setV3 = (
+      h: { value: Vector3 },
+      r: { value: Vector3 } | undefined,
+    ): void => {
+      if (r) h.value.set(r.value.x, r.value.y, r.value.z);
+    };
+    const setC = (
+      h: { value: Color },
+      r: { value: Color } | undefined,
+    ): void => {
+      if (r) h.value.set(r.value.r, r.value.g, r.value.b);
+    };
+    const setN = (
+      h: { value: number },
+      r: { value: number } | undefined,
+    ): void => {
+      if (r !== undefined && typeof r.value === "number") h.value = r.value;
+    };
+    const setB = (
+      h: { value: number },
+      r: { value: boolean } | undefined,
+    ): void => {
+      if (r !== undefined) h.value = r.value ? 1 : 0;
+    };
+
+    setV2(w.uCenter, u.uCenter as { value: Vector2 } | undefined);
+    setB(w.uSizeInMeters, u.uSizeInMeters as { value: boolean } | undefined);
+    setB(w.uOffsetDepth, u.uOffsetDepth as { value: boolean } | undefined);
+    setN(w.uSdfThreshold, u.uSdfThreshold as { value: number } | undefined);
+    setN(w.uOutlineWidth, u.uOutlineWidth as { value: number } | undefined);
+    setC(w.uOutlineColor, u.uOutlineColor as { value: Color } | undefined);
+    setN(w.uOutlineOpacity, u.uOutlineOpacity as { value: number } | undefined);
+    setB(
+      w.uShowBackground,
+      u.uShowBackground as { value: boolean } | undefined,
+    );
+    setC(
+      w.uBackgroundColor,
+      u.uBackgroundColor as { value: Color } | undefined,
+    );
+    setC(
+      w.uBackgroundOutlineColor,
+      u.uBackgroundOutlineColor as { value: Color } | undefined,
+    );
+    setN(
+      w.uBackgroundOutlineWidth,
+      u.uBackgroundOutlineWidth as { value: number } | undefined,
+    );
+    setN(w.uFovRad, u.uFovRad as { value: number } | undefined);
+    setN(w.uScreenHeightPx, u.uScreenHeightPx as { value: number } | undefined);
+    setN(w.uFarPlane, u.uFarPlane as { value: number } | undefined);
+    setV3(w.uRTCCenter, u.uRTCCenter as { value: Vector3 } | undefined);
+    setV3(w.uRTCCenterView, u.uRTCCenterView as { value: Vector3 } | undefined);
+    setV3(w.uEyeRTEHigh, u.uEyeRTEHigh as { value: Vector3 } | undefined);
+    setV3(w.uEyeRTELow, u.uEyeRTELow as { value: Vector3 } | undefined);
+    setV2(w.uSdfAtlasSize, u.uSdfAtlasSize as { value: Vector2 } | undefined);
+    setV2(
+      w.uColorAtlasSize,
+      u.uColorAtlasSize as { value: Vector2 } | undefined,
+    );
+    setV2(w.uLabelTexSize, u.uLabelTexSize as { value: Vector2 } | undefined);
+    setN(w.uPickable, u.nvr_uPickable as { value: number } | undefined);
+
+    // Textures are replaced wholesale when an atlas or the label data texture
+    // grows; re-point the TSL texture nodes (NodeSampledTexture rebinds on
+    // value change).
+    w.labelDataTex.value =
+      (u.uLabelData?.value as DataTexture | null) ?? getPlaceholderTexture();
+    w.atlasTex.value =
+      (u.uAtlas?.value as DataTexture | null) ?? getPlaceholderTexture();
+    w.colorAtlasTex.value =
+      (u.uColorAtlas?.value as DataTexture | null) ?? getPlaceholderTexture();
+
+    // Props the enhancer writes on its own (classic) material.
+    const m = this.material as Material | undefined;
+    if (m) {
+      m.transparent = w.src.transparent;
+      m.depthTest = w.src.depthTest;
+      m.depthWrite = w.src.depthWrite;
+    }
   }
 
   /** Re-point the shader at the label texture (it is swapped on grow). */
@@ -1451,6 +2133,12 @@ export class BatchedSdfTextMesh
     this._labelData.dispose();
     this._glyphs.dispose();
     (this.material as ShaderMaterial).dispose();
+    // The classic ShaderMaterial survives as the enhancer's state store when
+    // the WebGPU node material replaced it for rendering.
+    if (this._webgpuMaterial) {
+      (this._enhancer.material as ShaderMaterial).dispose();
+      this._webgpuMaterial = undefined;
+    }
 
     const unload =
       this._loadedFaceUrls.size > 0

@@ -1,0 +1,1 @@
+{"asset": {"version": "1.0"}, "geometricError": 100000, "root": {"boundingVolume": {"box": [-2735490.5412553856, 5125400.478824272, 2623283.1344112814, 1000, 0, 0, 0, 1000, 0, 0, 0, 1000]}, "geometricError": 10000, "refine": "REPLACE", "content": {"uri": "tile.pnts"}}}

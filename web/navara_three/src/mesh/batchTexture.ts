@@ -126,7 +126,12 @@ export function initBatchDataTexture(
   const data = new Float32Array(textureWidth * 4 * textureHeight);
 
   // Initialize COLOR_SHOW alpha channel with packed show=material.visible, opacity=1 for all batch IDs
-  // (default is fully opaque, and visible/hidden based on material.visible)
+  // (default is fully opaque, and visible/hidden based on material.visible).
+  // RGB initializes to WHITE (identity): once USE_BATCH_COLOR_SHOW turns on,
+  // every feature reads this row — untouched features must keep their original
+  // color (classic: vColor.rgb = batchColor.rgb with material.color forced
+  // white; WebGPU: materialColor * batchColor). A zero default would turn all
+  // unevaluated features black the moment any single feature is recolored.
   const colorShowRowIndex = config.rows.indexOf("COLOR_SHOW");
   if (colorShowRowIndex >= 0) {
     const defaultPacked = packShowOpacity(material.visible ? 1 : 0, 1);
@@ -137,7 +142,9 @@ export function initBatchDataTexture(
         batchId,
         colorShowRowIndex,
       );
-      // R, G, B remain 0 (will be set when color is first written)
+      data[baseIndex] = 1; // R = identity
+      data[baseIndex + 1] = 1; // G = identity
+      data[baseIndex + 2] = 1; // B = identity
       data[baseIndex + 3] = defaultPacked; // A = packed(show=material.visible, opacity=1)
     }
   }

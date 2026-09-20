@@ -93,6 +93,13 @@ export type RasterDrapeHost = {
   material: () => TileMaterial;
   /** Re-report the tile's drape GPU footprint after the RT pool changed. */
   reportDrapeGpuBytes: () => void;
+  /**
+   * Push the material's per-slot userData arrays into the WebGPU tile node
+   * material's uniform nodes. No-op on the classic (WebGL) material — the
+   * GLSL shader reads the userData uniforms directly. Called after
+   * {@link BakedRasterDrapeResolver.bindSlots} rewrites baked slots.
+   */
+  syncWebGPUSlotNodes: () => void;
 };
 
 /**
@@ -419,5 +426,9 @@ export class BakedRasterDrapeResolver implements DrapeResolver {
       const absSlot = this.bakedSlotIndices[ordinal];
       textures[absSlot] = this.renderTargets[ordinal]?.texture ?? null;
     }
+    // WebGPU tile material: push the rebound textures into the slot uniform
+    // nodes (synced from these arrays at setupTextures time, before this
+    // re-bind). No-op on the classic material.
+    this.host.syncWebGPUSlotNodes();
   }
 }

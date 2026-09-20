@@ -32,6 +32,16 @@ const DAY_SKY = new Color(0x87b0e0);
 export class WebGPUEnvironment {
   readonly sun: DirectionalLight;
 
+  /**
+   * Set by the view when the app has configured its own lights in
+   * `scenes.light` (mirrored into the rendered scenes by the orchestrator).
+   * The built-in rig then stops illuminating — the sun stays visible with
+   * zero intensity so it remains the shadow-map caster — instead of
+   * double-lighting the scene. The fallback rig drives illumination only
+   * while no app lights exist.
+   */
+  appLightsActive = false;
+
   private readonly ambient: AmbientLight;
   private readonly target = new Object3D();
   private readonly lightDir = new Vector3(0, 1, 0);
@@ -88,13 +98,20 @@ export class WebGPUEnvironment {
     this.renderer.setClearColor(this.skyColor);
 
     const dayFactor = Math.min(Math.max((elevation + 0.05) / 0.3, 0), 1);
-    this.sun.intensity = 2.2 * dayFactor;
-    this.sun.color.setRGB(
-      1,
-      0.96 - 0.25 * (1 - dayFactor),
-      0.9 - 0.5 * (1 - dayFactor),
-    );
-    this.ambient.intensity = 0.15 + 0.3 * dayFactor;
+    if (this.appLightsActive) {
+      // Illumination is owned by the app's mirrored lights; keep the sun at
+      // zero intensity but visible so its shadow map still renders.
+      this.sun.intensity = 0;
+      this.ambient.intensity = 0;
+    } else {
+      this.sun.intensity = 2.2 * dayFactor;
+      this.sun.color.setRGB(
+        1,
+        0.96 - 0.25 * (1 - dayFactor),
+        0.9 - 0.5 * (1 - dayFactor),
+      );
+      this.ambient.intensity = 0.15 + 0.3 * dayFactor;
+    }
 
     // Ground point under the camera (spherical approximation).
     this.groundPos.copy(this.localUp).multiplyScalar(EARTH_RADIUS);

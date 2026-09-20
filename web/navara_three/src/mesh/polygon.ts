@@ -7,20 +7,24 @@ import {
   BufferAttribute,
   BufferGeometry,
   Color,
+  Matrix4,
   MeshBasicMaterial,
   MeshLambertMaterial,
   RGBADepthPacking,
   Sphere,
   SphereGeometry,
   Mesh as ThreeMesh,
+  Vector2,
   Vector3,
 } from "three";
+import type { DataTexture } from "three";
 
 import { PolygonOutlineMesh } from "..";
 import type { EventContext } from "../event/context";
 import { applyLitOption } from "../material";
 import type { PolygonMaterialProps } from "../material/enhancer/polygon";
 import { createPolygonMaterialEnhancer } from "../material/enhancer/polygon/polygonMaterialEnhancer";
+import { getWebGPU } from "../utils";
 
 import {
   BatchedFeatureMesh,
@@ -29,6 +33,7 @@ import {
 } from "./batchedFeature";
 import type {
   BatchedAttributeName,
+  BatchTextureConfig,
   BatchTextureRowKey,
   DefaultBatchAttributeValues,
 } from "./batchTexture";
@@ -38,6 +43,29 @@ import { setupRTECallback } from "./rtcRteHelper";
 
 /** Set to true to render bounding spheres as wireframe spheres for debugging. */
 const DEBUG_BOUNDING_SPHERE = false;
+
+/**
+ * TSL uniform handles + prop source for the WebGPU node material built by
+ * initWebGPUMaterial. Values are synced from the enhancer state once per
+ * render (see syncWebgpuHandles) because the enhancer remains mounted on the
+ * classic material it was created with.
+ */
+type PolygonWebgpuHandles = {
+  uMinMaxHeight: { value: Vector2 };
+  uAddHeight: { value: number };
+  uAddExtrudedHeight: { value: number };
+  gateColorShow: { value: number };
+  gateHeight: { value: number };
+  gateExtrudedHeight: { value: number };
+  uPickable: { value: number };
+  /** Enhancer-mounted classic material; per-frame prop source. */
+  src: MeshLambertMaterial;
+  rte?: {
+    matrix: { value: Matrix4 };
+    camHigh: { value: Vector3 };
+    camLow: { value: Vector3 };
+  };
+};
 
 type Attributes = BatchedFeatureAttributes<{
   position?: BufferAttribute; // Present when use_rte = false
@@ -344,23 +372,56 @@ export class PolygonMesh extends BatchedFeatureMesh<
 
     // Set up RTE if needed
     const { base } = enhancer.states();
+    let rteCallback: ReturnType<typeof setupRTECallback> | undefined;
     if (base.useRTE) {
       const { base: baseMutates } = enhancer.mutates();
-      const callback = setupRTECallback(
+      rteCallback = setupRTECallback(
         this,
-        (modelViewMatrixRTE, cameraPositionHigh, cameraPositionLow) =>
+        (modelViewMatrixRTE, cameraPositionHigh, cameraPositionLow) => {
           baseMutates.updateRteUniforms(
             modelViewMatrixRTE,
             cameraPositionHigh,
             cameraPositionLow,
             base,
-          ),
+          );
+          const w = this.material.userData.nvrWebgpu as
+            PolygonWebgpuHandles | undefined;
+          if (w?.rte) {
+            w.rte.matrix.value.copy(modelViewMatrixRTE);
+            w.rte.camHigh.value.copy(cameraPositionHigh);
+            w.rte.camLow.value.copy(cameraPositionLow);
+          }
+        },
       );
-      this.onBeforeRender = callback;
-      this.onBeforeShadow = callback;
+      this.onBeforeShadow = rteCallback;
     }
+    this.onBeforeRender = (
+      renderer,
+      scene,
+      camera,
+      geometry,
+      material,
+      group,
+    ) => {
+      this.syncWebgpuHandles();
+      rteCallback?.(renderer, scene, camera, geometry, material, group);
+    };
 
     this.enableWater();
+
+    if (this.isWebGPUBackend()) {
+      // The GLSL enhancer pipeline (onBeforeCompile) never runs on the WebGPU
+      // backend; swap in an equivalent TSL node material instead. The classic
+      // material stays alive as the enhancer's state store.
+      this._initBatchedMaterial();
+      this.initWebGPUMaterial(
+        useRTE,
+        meshMaterial.lit,
+        !!meshMaterial.clampToGround,
+      );
+      this._update(meshMaterial, mesh.active, isTexturized);
+      return;
+    }
 
     // Set up custom program cache key based on config flags that affect shader defines
     material.customProgramCacheKey = enhancer.programCacheKey;
@@ -373,6 +434,252 @@ export class PolygonMesh extends BatchedFeatureMesh<
     this._initBatchedMaterial();
 
     this._update(meshMaterial, mesh.active, isTexturized);
+  }
+
+  private isWebGPUBackend(): boolean {
+    const renderer = this.ctx.viewContext?.getRenderer() as
+      { isWebGPURenderer?: boolean } | undefined;
+    return !!renderer?.isWebGPURenderer;
+  }
+
+  /**
+   * WebGPU polygon material: a TSL node material reproducing the classic
+   * GLSL enhancer pipeline, which never runs on this backend:
+   *  - vertex: RTE high/low decode (or plain position) + extrusion along
+   *    scaleNormalAndCap, with per-feature heights from the batch texture
+   *    (float RGBA bit-decode, see batch_texture_*.glsl);
+   *  - fragment: batch color/show/opacity, pick coloring
+   *    (nvr_batchIdToColor) folded through uPickable.
+   * Uniform state is fed per frame from the enhancer by syncWebgpuHandles;
+   * RTE matrices ride the same onBeforeRender callback as the classic path.
+   * Clamp-to-ground (draped) polygons force the unlit Basic base: the classic
+   * fragment outputs raw diffuse for `uClampToGround` regardless of `lit`,
+   * and a Lambert baked into the light-less drape scene would come out black.
+   * Not ported (logged once): water enhancer, selective-effect emissive.
+   */
+  private initWebGPUMaterial(
+    useRTE: boolean,
+    lit: boolean | undefined,
+    clampToGround: boolean,
+  ): void {
+    const { webgpu, tsl: T } = getWebGPU();
+    const src = this.material;
+
+    // The node graph fetches the batch texture in the vertex stage, so it
+    // must exist before the material is built (created lazily on the classic
+    // path).
+    this._initBatchDataTexture();
+    const batchTex = src.userData.batchDataTexture?.value as
+      DataTexture | null | undefined;
+    const batchCfg = src.userData.batchTextureConfig as
+      BatchTextureConfig | undefined;
+    const hasBatch =
+      batchTex != null &&
+      batchCfg != null &&
+      this.geometry.getAttribute("_batchid") != null;
+
+    const handles: PolygonWebgpuHandles = {
+      uMinMaxHeight: T.uniform(new Vector2(0, 0)) as unknown as {
+        value: Vector2;
+      },
+      uAddHeight: T.uniform(0) as unknown as { value: number },
+      uAddExtrudedHeight: T.uniform(0) as unknown as { value: number },
+      gateColorShow: T.uniform(0) as unknown as { value: number },
+      gateHeight: T.uniform(0) as unknown as { value: number },
+      gateExtrudedHeight: T.uniform(0) as unknown as { value: number },
+      uPickable: T.uniform(0) as unknown as { value: number },
+      src,
+    };
+    const {
+      uMinMaxHeight,
+      uAddHeight,
+      uAddExtrudedHeight,
+      gateColorShow,
+      gateHeight,
+      gateExtrudedHeight,
+      uPickable,
+      // TSL's chained node methods don't survive the library's generic
+      // typings; the graph is runtime-checked by the node builder instead
+      // (same `as any` idiom as the tile WebGPU material).
+      /* eslint-disable @typescript-eslint/no-explicit-any */
+    } = handles as unknown as Record<string, any>;
+
+    // Vertex: batch-texture lookups (per-feature color/show/opacity/heights).
+    // texture().load() (texel fetch) works in the vertex stage and needs no
+    // sampler — float32 linear filtering is an optional WebGPU feature.
+    let addHeight: any = uAddHeight;
+    let addExtrudedHeight: any = uAddExtrudedHeight;
+    let vBatchColor: any = T.varying(T.vec3(1, 1, 1), "nvr_batchColor");
+    let vShow: any = T.varying(T.float(1), "nvr_show");
+    let vOpacity: any = T.varying(T.float(1), "nvr_opacity");
+    if (hasBatch && batchTex && batchCfg) {
+      const rows = batchCfg.rows;
+      const rowCount = rows.length;
+      const texW = batchTex.image.width;
+      const texNode = T.texture(batchTex);
+      const bid: any = T.attribute("_batchid");
+      const col = bid.mod(texW).toUint();
+      const rowBase = bid.div(texW).floor().mul(rowCount).toUint();
+      const fetchRow = (rowKey: BatchTextureRowKey): any =>
+        texNode.load(T.uvec2(col, rowBase.add(rows.indexOf(rowKey))));
+      // decodeRGBAToFloat: 4 bytes little-endian reinterpreted as f32.
+      // NOTE: each component is converted individually — a vec4-wide
+      // `.toUint()` collapses to a scalar and every swizzle then reads the
+      // same (x) lane (observed in the generated WGSL).
+      const decode = (texel: any): any => {
+        const b = texel.mul(255);
+        const bx = b.x.toUint();
+        const by = b.y.toUint();
+        const bz = b.z.toUint();
+        const bw = b.w.toUint();
+        return T.uintBitsToFloat(
+          bx
+            .bitOr(by.shiftLeft(T.uint(8)))
+            .bitOr(bz.shiftLeft(T.uint(16)))
+            .bitOr(bw.shiftLeft(T.uint(24))),
+        );
+      };
+      const colorShow = fetchRow("COLOR_SHOW");
+      const packedByte = colorShow.a.mul(255).add(0.5).floor().clamp(0, 255);
+      vBatchColor = T.varying(colorShow.rgb, "nvr_batchColor");
+      vShow = T.varying(T.step(128, packedByte), "nvr_show");
+      vOpacity = T.varying(packedByte.mod(128).div(127), "nvr_opacity");
+      addHeight = T.mix(uAddHeight, decode(fetchRow("HEIGHT")), gateHeight);
+      addExtrudedHeight = T.mix(
+        uAddExtrudedHeight,
+        decode(fetchRow("EXTRUDED_HEIGHT")),
+        gateExtrudedHeight,
+      );
+    }
+
+    // Vertex: base position + extrusion (transformed += scaleNormalAndCap.xyz
+    // * (cap ? uMinMaxHeight.y + addExtrudedHeight : uMinMaxHeight.x + addHeight)).
+    const cap: any = T.attribute("scaleNormalAndCap");
+    const height = T.select(
+      cap.w.equal(0),
+      uMinMaxHeight.x.add(addHeight),
+      uMinMaxHeight.y.add(addExtrudedHeight),
+    );
+
+    const Base = (lit === false || clampToGround
+      ? webgpu.MeshBasicNodeMaterial
+      : webgpu.MeshLambertNodeMaterial) as unknown as new () => MeshLambertMaterial;
+    let m: any;
+    if (useRTE) {
+      const rteMatrix = T.uniform(new Matrix4());
+      const camHigh = T.uniform(new Vector3());
+      const camLow = T.uniform(new Vector3());
+      handles.rte = {
+        matrix: rteMatrix as unknown as { value: Matrix4 },
+        camHigh: camHigh as unknown as { value: Vector3 },
+        camLow: camLow as unknown as { value: Vector3 },
+      };
+      // u_rteOne (== 1.0) blocks fast-math reassociation of the RTE
+      // recombination — see rte_pars_vertex.glsl.
+      const uRteOne = T.uniform(1.0);
+      const posHigh: any = T.attribute("position_3d_high");
+      const posLow: any = T.attribute("position_3d_low");
+      const camRelative = posHigh
+        .sub(camHigh)
+        .mul(uRteOne)
+        .add(posLow.sub(camLow));
+      class RtePolygonMaterial extends Base {
+        // positionLocal is already camera-relative (RTE decode above), so the
+        // standard modelViewMatrix (with its -R*camPos translation) must not
+        // touch it; the rotation-only RTE matrix replaces it.
+        setupPositionView(): unknown {
+          return rteMatrix.mul(T.positionLocal).xyz;
+        }
+      }
+      m = new RtePolygonMaterial();
+      m.positionNode = camRelative.add(cap.xyz.mul(height));
+    } else {
+      m = new Base();
+      m.positionNode = T.positionGeometry.add(cap.xyz.mul(height));
+    }
+
+    // Fragment: pick color (matches pick.glsl nvr_batchIdToColor). The id
+    // varying must be FLAT like the classic `flat out float nvr_vBatchId`:
+    // batchIds reach 2^24 where f32 has ulp=1, so smooth interpolation can
+    // arrive a step off at some pixels and corrupt the low byte (the id then
+    // misses the property store — same idiom as pickableMeshWrapper.ts).
+    let pickId: any = T.float(0);
+    if (this.geometry.getAttribute("attrBatchId") != null) {
+      pickId = T.varying(T.attribute("attrBatchId"), "nvr_pickId");
+      T.nodeObject(pickId).setInterpolation("flat");
+    }
+    const pickColor = T.vec3(
+      pickId.div(65536).floor().div(255),
+      pickId.div(256).mod(256).floor().div(255),
+      pickId.mod(256).floor().div(255),
+    );
+    m.colorNode = T.Fn(() => {
+      // show_fragment.glsl: discard hidden / fully transparent features.
+      T.mix(T.float(1), vShow, gateColorShow).lessThan(0.5).discard();
+      T.mix(T.float(1), vOpacity, gateColorShow).lessThanEqual(0).discard();
+      return T.vec4(
+        T.materialColor.rgb
+          .mul(T.mix(T.vec3(1, 1, 1), vBatchColor, gateColorShow))
+          .mul(uPickable.oneMinus()),
+        1,
+      );
+    })();
+    m.emissiveNode =
+      // MeshBasicNodeMaterial (clamp-to-ground drape) has no `emissive`
+      // property — materialEmissive would build a color uniform with an
+      // undefined value and crash the WebGPU uniform update. Basic: pick
+      // color only, gated by uPickable (colorNode zeroes diffuse when picking).
+      "emissive" in m
+        ? T.mix(T.materialEmissive, pickColor, uPickable)
+        : pickColor.mul(uPickable);
+    m.opacityNode = T.mix(
+      T.materialOpacity.mul(T.mix(T.float(1), vOpacity, gateColorShow)),
+      T.float(1),
+      uPickable,
+    );
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    // Point the batch plumbing (userData.defines / batchDataTexture /
+    // batchTextureConfig, written later by updateBatchAttribute) at the same
+    // objects the classic material used.
+    Object.assign(m.userData, src.userData);
+    m.userData.nvrWebgpu = handles;
+    this.material = m as MeshLambertMaterial;
+  }
+
+  /**
+   * Per-render sync of the TSL uniform handles from the enhancer state (which
+   * keeps mutating the classic material it was mounted on). No-op unless the
+   * WebGPU node material is installed.
+   */
+  private syncWebgpuHandles(): void {
+    const w = this.material.userData.nvrWebgpu as
+      PolygonWebgpuHandles | undefined;
+    if (!w) return;
+    const b = this.getEnhancer().states().base;
+    w.uMinMaxHeight.value.set(
+      b.minMaxHeight?.[0] ?? 0,
+      b.minMaxHeight?.[1] ?? 0,
+    );
+    w.uAddHeight.value = b.addHeight;
+    w.uAddExtrudedHeight.value = b.addExtrudedHeight;
+    w.gateColorShow.value = b.useBatchColorShow ? 1 : 0;
+    w.gateHeight.value = b.useBatchHeight ? 1 : 0;
+    w.gateExtrudedHeight.value = b.useBatchExtrudedHeight ? 1 : 0;
+    w.uPickable.value = b.pickable ? 1 : 0;
+    // Props the enhancer writes on its own (classic) material.
+    const m = this.material;
+    m.color.copy(w.src.color);
+    m.opacity = w.src.opacity;
+    m.transparent = w.src.transparent;
+    m.wireframe = w.src.wireframe;
+    // MeshBasicNodeMaterial (clamp-to-ground drape) has no emissive props.
+    if ("emissive" in m) {
+      m.emissive.copy(w.src.emissive);
+      m.emissiveIntensity = w.src.emissiveIntensity;
+    }
+    // Batch color rides the TSL graph, not the color attribute.
+    m.vertexColors = false;
   }
 
   /**

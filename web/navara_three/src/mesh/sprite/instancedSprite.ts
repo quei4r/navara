@@ -12,9 +12,11 @@ import {
   BufferAttribute,
   type BufferGeometry,
   Color,
+  DataTexture,
   type Material,
   PerspectiveCamera,
   Vector2,
+  Vector3,
 } from "three";
 import invariant from "tiny-invariant";
 
@@ -26,6 +28,7 @@ import {
 import type { EventContext } from "../../event/context";
 import { createInstancedSpriteMaterialEnhancer } from "../../material/enhancer";
 import type { CustomObject3DEventMap } from "../../object3DEvent";
+import { getWebGPU } from "../../utils";
 import { GEOMETRY_TYPES, type GeometryType } from "../constants";
 import { PickableMesh } from "../pickableMesh";
 
@@ -59,6 +62,43 @@ type PositionsInfo = {
 
 /** Reusable Vector2 to avoid per-frame allocations in onBeforeRender. */
 const _tmpSize = new Vector2();
+
+/**
+ * TSL uniform handles + prop source for the WebGPU node material built by
+ * _initWebGPUMaterial. Values are synced from the enhancer's uniform refs
+ * (which live on the classic material it stays mounted on) once per render —
+ * see _syncWebgpuHandles.
+ */
+type InstancedSpriteWebgpuHandles = {
+  uRTCCenter: { value: Vector3 };
+  uRTCCenterView: { value: Vector3 };
+  uEyeRTEHigh: { value: Vector3 };
+  uEyeRTELow: { value: Vector3 };
+  uScale: { value: number };
+  uCenter: { value: Vector2 };
+  uSizeInMeters: { value: number };
+  uOffsetDepth: { value: number };
+  uAlphaTest: { value: number };
+  uFarPlane: { value: number };
+  uAtlasSize: { value: Vector2 };
+  uFovRad: { value: number };
+  uScreenHeightPx: { value: number };
+  uPickable: { value: number };
+  /** Texture node whose `.value` is swapped as the billboard atlas grows. */
+  spriteTex?: { value: unknown };
+  src: ShaderMaterial;
+};
+
+/** Stand-in for a not-yet-packed billboard atlas. Empty atlas rects cull
+ *  their instances in the vertex stage, so it is never visibly sampled. */
+let _placeholderTexture: DataTexture | null = null;
+const getPlaceholderTexture = (): DataTexture => {
+  if (!_placeholderTexture) {
+    _placeholderTexture = new DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+    _placeholderTexture.needsUpdate = true;
+  }
+  return _placeholderTexture;
+};
 
 // Coupled with crates/navara_feature/src/geometry/point.rs::pixel_to_world
 export class InstancedSpriteMesh
@@ -99,6 +139,9 @@ export class InstancedSpriteMesh
   private _enhancedMaterial?: ReturnType<
     typeof createInstancedSpriteMaterialEnhancer
   >;
+  /** The classic ShaderMaterial the enhancer stays mounted on when the WebGPU
+   *  node material replaced it for rendering (state store + visibility). */
+  private _classicMaterial?: ShaderMaterial;
   /** Per-instance world anchors in ECEF meters (f64, 3 per instance), kept in
    *  sync with the position attributes for the declutter pass. */
   private _anchors: Float64Array | null = null;
@@ -328,7 +371,9 @@ export class InstancedSpriteMesh
 
   async _update(m: NavaraPointMesh | NavaraBillboardMesh) {
     const enhancer = this.getEnhancer();
-    const material = this.material as ShaderMaterial;
+    // On the WebGPU backend the enhancer's classic material is the state
+    // store (this.material is the node material); identical object otherwise.
+    const material = (this._classicMaterial ?? this.material) as ShaderMaterial;
 
     this._cacheDeclutterState(m);
 
@@ -590,37 +635,75 @@ export class InstancedSpriteMesh
     const mutates = enhancer.mutates();
     mutates.updateUniforms(material.uniforms, enhancer.states());
 
-    // Set up onBeforeRender for per-frame updates (farPlane + RTE eye position)
-    material.onBeforeRender = (
-      _renderer,
-      _scene,
-      camera,
-      _geometry,
-      _mat,
-      _group,
-    ) => {
-      const pCam = camera as PerspectiveCamera;
-      mutates.updateFarPlane(pCam.far);
-      mutates.updateFovRad(degreeToRadian(pCam.fov));
-      mutates.updateScreenHeightPx(
-        _renderer.getDrawingBufferSize(_tmpSize).y / _renderer.getPixelRatio(),
-      );
-
-      if (positionsInfo.RTE) {
-        mutates.updateRteUniforms(
-          camera.position.x,
-          camera.position.y,
-          camera.position.z,
-          enhancer.states(),
+    let nodeMaterial: Material | null = null;
+    if (this._isWebGPUBackend()) {
+      // The GLSL enhancer pipeline (onBeforeCompile) never runs on the WebGPU
+      // backend, and the shared Renderer only invokes object.onBeforeRender —
+      // not material.onBeforeRender — so the per-frame uniform hook moves to
+      // the mesh. The classic material stays alive as the enhancer's state
+      // store; a TSL node material replaces it for rendering.
+      this._classicMaterial = material;
+      this.onBeforeRender = (renderer, _scene, camera) => {
+        const pCam = camera as PerspectiveCamera;
+        mutates.updateFarPlane(pCam.far);
+        mutates.updateFovRad(degreeToRadian(pCam.fov));
+        mutates.updateScreenHeightPx(
+          renderer.getDrawingBufferSize(_tmpSize).y / renderer.getPixelRatio(),
         );
-      } else {
-        mutates.updateRtcUniforms(camera.matrixWorldInverse, enhancer.states());
-      }
-    };
 
-    // Set custom program cache key and onBeforeCompile
-    material.customProgramCacheKey = enhancer.programCacheKey;
-    material.onBeforeCompile = enhancer.transformShader;
+        if (positionsInfo.RTE) {
+          mutates.updateRteUniforms(
+            camera.position.x,
+            camera.position.y,
+            camera.position.z,
+            enhancer.states(),
+          );
+        } else {
+          mutates.updateRtcUniforms(
+            camera.matrixWorldInverse,
+            enhancer.states(),
+          );
+        }
+        this._syncWebgpuHandles();
+      };
+      nodeMaterial = this._initWebGPUMaterial(material);
+    } else {
+      // Set up onBeforeRender for per-frame updates (farPlane + RTE eye position)
+      material.onBeforeRender = (
+        _renderer,
+        _scene,
+        camera,
+        _geometry,
+        _mat,
+        _group,
+      ) => {
+        const pCam = camera as PerspectiveCamera;
+        mutates.updateFarPlane(pCam.far);
+        mutates.updateFovRad(degreeToRadian(pCam.fov));
+        mutates.updateScreenHeightPx(
+          _renderer.getDrawingBufferSize(_tmpSize).y /
+            _renderer.getPixelRatio(),
+        );
+
+        if (positionsInfo.RTE) {
+          mutates.updateRteUniforms(
+            camera.position.x,
+            camera.position.y,
+            camera.position.z,
+            enhancer.states(),
+          );
+        } else {
+          mutates.updateRtcUniforms(
+            camera.matrixWorldInverse,
+            enhancer.states(),
+          );
+        }
+      };
+
+      // Set custom program cache key and onBeforeCompile
+      material.customProgramCacheKey = enhancer.programCacheKey;
+      material.onBeforeCompile = enhancer.transformShader;
+    }
 
     // Handle billboard texture
     if (isBillboard && m.material.url) {
@@ -629,11 +712,338 @@ export class InstancedSpriteMesh
 
     material.visible = m.material.show ?? true;
     this.updateVisibility();
-    return material;
+    return nodeMaterial ?? material;
+  }
+
+  private _isWebGPUBackend(): boolean {
+    const renderer = this.ctx.viewContext?.getRenderer() as
+      { isWebGPURenderer?: boolean } | undefined;
+    return !!renderer?.isWebGPURenderer;
+  }
+
+  /**
+   * WebGPU instancedSprite material: a TSL node material reproducing the
+   * classic GLSL enhancer pipeline (instancedSprite.vert/frag.glsl), which
+   * never runs on this backend:
+   *  - vertex: per-instance params/color/batchId/declutter attributes, RTE
+   *    high/low or RTC view-space anchor resolve, ellipsoidal horizon culling
+   *    + hidden/decluttered/empty-rect culling (clip position collapsed to
+   *    vec4(0)), view-space billboard expansion with pxToWorld scaling when
+   *    sizeInMeters is off, atlas sub-rect UVs normalized by uAtlasSize;
+   *  - fragment: atlas tint (billboard) or anti-aliased circle (point),
+   *    alphaTest discard, manual logarithmic depth with the offsetDepth
+   *    shift, pick coloring (nvr_batchIdToColor) via uPickable.
+   * Uniform state is fed per render from the enhancer's classic-material
+   * uniform refs by _syncWebgpuHandles; the atlas texture rides a TSL texture
+   * node whose value is swapped when the atlas is repacked.
+   * Not ported (same as the polyline WebGPU material): selective-effect
+   * emissive, gbuffer MRT writes.
+   */
+  private _initWebGPUMaterial(src: ShaderMaterial): Material {
+    const { webgpu, tsl } = getWebGPU();
+    // TSL's chained node methods don't survive the library's generic
+    // typings; the graph is runtime-checked by the node builder instead.
+    // (Same `as any` idiom as the polygon/polyline WebGPU materials, applied
+    // to the whole TSL namespace.)
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const T = tsl as any;
+    const state = this.getEnhancer().states();
+    const useRTE = state.useRTE;
+    const billboard = state.billboard;
+
+    const handles: InstancedSpriteWebgpuHandles = {
+      uRTCCenter: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uRTCCenterView: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uEyeRTEHigh: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uEyeRTELow: T.uniform(new Vector3()) as unknown as { value: Vector3 },
+      uScale: T.uniform(100) as unknown as { value: number },
+      uCenter: T.uniform(new Vector2()) as unknown as { value: Vector2 },
+      uSizeInMeters: T.uniform(1) as unknown as { value: number },
+      uOffsetDepth: T.uniform(1) as unknown as { value: number },
+      uAlphaTest: T.uniform(0) as unknown as { value: number },
+      uFarPlane: T.uniform(1000) as unknown as { value: number },
+      uAtlasSize: T.uniform(new Vector2(1, 1)) as unknown as { value: Vector2 },
+      uFovRad: T.uniform(1) as unknown as { value: number },
+      uScreenHeightPx: T.uniform(1080) as unknown as { value: number },
+      uPickable: T.uniform(0) as unknown as { value: number },
+      src,
+    };
+    if (billboard) {
+      handles.spriteTex = T.texture(
+        (src.uniforms.uTexture?.value as DataTexture | null) ??
+          getPlaceholderTexture(),
+      ) as unknown as { value: unknown };
+    }
+    const {
+      uRTCCenter,
+      uRTCCenterView,
+      uEyeRTEHigh,
+      uEyeRTELow,
+      uScale,
+      uCenter,
+      uSizeInMeters,
+      uOffsetDepth,
+      uAlphaTest,
+      uFarPlane,
+      uAtlasSize,
+      uFovRad,
+      uScreenHeightPx,
+      uPickable,
+      spriteTex,
+    } = handles as unknown as Record<string, any>;
+
+    // ---- Vertex ----
+
+    // Per-instance attributes (instancedSprite.vert.glsl). The quad uv is
+    // exactly position.xy + 0.5; deriving it keeps the `uv` attribute out of
+    // the node graph (WebGPU caps vertex buffers at 8, and the RTE billboard
+    // path needs every remaining slot).
+    const params: any = T.attribute("instanceParams");
+    const instanceColor: any = T.attribute("instanceColor");
+    const instanceBatchID: any = T.attribute("instanceBatchID");
+    const declutterHide: any = T.attribute("instanceDeclutterHide");
+    const uvRect: any = billboard ? T.attribute("instanceUvRect") : null;
+    const quad: any = T.positionGeometry;
+    const uvQuad = quad.xy.add(0.5);
+
+    const instanceHeight = params.x;
+    const instanceSize = params.y;
+    const instanceShow = params.z;
+    const vOpacity = T.varying(
+      params.w.mul(declutterHide.oneMinus()),
+      "nvr_opacity",
+    );
+
+    // Anchor resolve + view-space base position (RTE high/low split, or RTC
+    // with the center pre-transformed to view space on the CPU in float64).
+    let absTransformed: any;
+    let baseMv: any;
+    if (useRTE) {
+      // u_rteOne (== 1.0) blocks fast-math reassociation of the high/low
+      // recombination — see chunks/rte_pars_vertex.glsl.
+      const uRteOne = T.uniform(1.0);
+      const high: any = T.attribute("instancePositionHIGH");
+      const low: any = T.attribute("instancePositionLOW");
+      absTransformed = high.add(low);
+      const resolved = high
+        .sub(uEyeRTEHigh)
+        .mul(uRteOne)
+        .add(low.sub(uEyeRTELow));
+      // viewMatrixRTE with the translation column removed == rotation applied
+      // to a w=0 vector.
+      baseMv = T.cameraViewMatrix.mul(T.vec4(resolved, 0)).xyz;
+    } else {
+      const pos: any = T.attribute("instancePosition");
+      absTransformed = pos.add(uRTCCenter);
+      baseMv = T.cameraViewMatrix.mul(T.vec4(pos, 0)).xyz.add(uRTCCenterView);
+    }
+
+    // Horizon culling (horizon_culling_*.glsl): the classic vertex shader
+    // collapses the clip position to vec4(0); same via the cull factor below.
+    const ONE_OVER_WGS84_RADII = T.vec3(
+      1 / 6378137.0,
+      1 / 6378137.0,
+      1 / 6356752.3142451793,
+    );
+    const camScaled = T.cameraPosition.mul(ONE_OVER_WGS84_RADII);
+    const horizonA = camScaled.dot(camScaled).sub(1);
+    const horizonCulled = camScaled
+      .sub(absTransformed.mul(ONE_OVER_WGS84_RADII))
+      .dot(camScaled)
+      .greaterThan(horizonA);
+
+    // An empty atlas rect means no image is packed for this instance yet —
+    // cull rather than stretch texel (0, 0) over the whole quad.
+    const hasImage = billboard
+      ? uvRect.z.greaterThan(0).and(uvRect.w.greaterThan(0))
+      : T.bool(true);
+    const culled = instanceShow
+      .lessThanEqual(0.5)
+      .or(declutterHide.greaterThanEqual(0.999))
+      .or(hasImage.not())
+      .or(horizonCulled);
+    const notCulled = culled.not().toFloat();
+
+    const vUv = T.varying(
+      billboard ? uvRect.xy.add(uvQuad.mul(uvRect.zw)).div(uAtlasSize) : uvQuad,
+      "nvr_uv",
+    );
+    const vBatchIDNode = T.varying(instanceBatchID, "nvr_batchId");
+    T.nodeObject(vBatchIDNode).setInterpolation("flat");
+    const vBatchID = vBatchIDNode;
+    const vColor = T.varying(instanceColor, "nvr_instanceColor");
+
+    // mvr_getMvHeightOffset: height along the ellipsoid normal, rotated into
+    // view space (a w=0 transform, so the translation column never contributes).
+    const mvHeightOffset = T.cameraViewMatrix.mul(
+      T.vec4(absTransformed.normalize().mul(instanceHeight), 0),
+    ).xyz;
+    const mv = baseMv.add(mvHeightOffset);
+
+    const center = uCenter.clamp(-0.5, 0.5);
+
+    // Per-instance size wins when set (>= 0); a negative value means "use
+    // uScale". Per-instance image aspect comes from the atlas rect.
+    const scale = T.select(
+      instanceSize.greaterThanEqual(0),
+      instanceSize,
+      uScale,
+    );
+    let clampedScale = T.max(T.float(0), scale);
+    const aspect = billboard
+      ? T.select(uvRect.w.greaterThan(0), uvRect.z.div(uvRect.w), T.float(1))
+      : T.float(1);
+    // pxToWorld: constant screen-pixel size when sizeInMeters is off.
+    const pxScale = clampedScale.mul(
+      T.tan(uFovRad.mul(0.5)).mul(mv.z.abs()).mul(2).div(uScreenHeightPx),
+    );
+    clampedScale = T.select(
+      uSizeInMeters.greaterThan(0.5),
+      clampedScale,
+      pxScale,
+    );
+
+    // Screen-aligned expansion in view space.
+    const finalMv = mv.add(
+      T.vec3(quad.xy.sub(center).mul(T.vec2(aspect, 1)).mul(clampedScale), 0),
+    );
+    // gl_Position.w + 1.0; for a perspective camera w == -viewZ.
+    const vFragDepth = T.varying(finalMv.z.negate().add(1), "nvr_fragDepth");
+
+    const Base = webgpu.MeshBasicNodeMaterial as unknown as new () => Material;
+    const viewPositionNode = finalMv;
+    const cullFactorNode = notCulled;
+    class InstancedSpriteNodeMaterial extends Base {
+      // positionView is fully computed above (view matrix already applied);
+      // the standard modelViewMatrix must not touch it.
+      setupPositionView(): unknown {
+        return viewPositionNode;
+      }
+      setupModelViewProjection(): unknown {
+        return T.cameraProjectionMatrix.mul(T.positionView).mul(cullFactorNode);
+      }
+    }
+    const m: any = new InstancedSpriteNodeMaterial();
+    m.positionNode = viewPositionNode;
+
+    // ---- Fragment ----
+
+    // Billboard: atlas sample tinted by the instance color (RGB only, texture
+    // alpha preserved). Point: anti-aliased circle (point.frag.glsl —
+    // clamp((radius - len) / border, 0, 1) unrolled).
+    const texC = billboard ? spriteTex.sample(vUv) : T.vec4(1, 1, 1, 1);
+    const circleAlpha = T.float(0.5)
+      .sub(vUv.sub(0.5).length())
+      .div(0.01)
+      .clamp(0, 1);
+    const alphaForTest = billboard ? texC.a : circleAlpha;
+    const alphaForColor = billboard ? texC.a.mul(vOpacity) : vOpacity;
+    const baseRgb = billboard ? texC.rgb.mul(vColor) : vColor;
+
+    // Pick color (matches pick.glsl nvr_batchIdToColor).
+    const pickColor = T.vec3(
+      vBatchID.div(65536).floor().div(255),
+      vBatchID.div(256).mod(256).floor().div(255),
+      vBatchID.mod(256).floor().div(255),
+    );
+
+    m.colorNode = T.Fn(() => {
+      alphaForTest.lessThanEqual(uAlphaTest).discard();
+      return T.select(
+        uPickable.greaterThan(0).and(alphaForTest.greaterThan(0)),
+        T.vec4(pickColor, 1),
+        T.vec4(baseRgb, alphaForColor),
+      );
+    })();
+
+    // Manual logarithmic depth (the classic shader writes gl_FragDepth);
+    // offsetDepth shifts sprites slightly nearer the ellipsoid surface.
+    const fragDepth = vFragDepth.log().div(uFarPlane.add(1).log());
+    m.depthNode = T.select(
+      uOffsetDepth.greaterThan(0.5),
+      fragDepth.sub(0.01),
+      fragDepth,
+    );
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    m.userData.nvrWebgpu = handles;
+    this._syncWebgpuHandles(handles);
+    return m as Material;
+  }
+
+  /**
+   * Per-render sync of the TSL uniform handles from the enhancer's uniform
+   * refs (which live on the classic material, still mutated by the enhancer's
+   * mutates and the per-frame hook). No-op unless the WebGPU node material is
+   * installed.
+   */
+  private _syncWebgpuHandles(prebuilt?: InstancedSpriteWebgpuHandles): void {
+    const w =
+      prebuilt ??
+      ((this.material as Material | undefined)?.userData.nvrWebgpu as
+        InstancedSpriteWebgpuHandles | undefined);
+    if (!w) return;
+    const u = w.src.uniforms;
+    const setV2 = (
+      h: { value: Vector2 },
+      r: { value: Vector2 } | undefined,
+    ): void => {
+      if (r) h.value.set(r.value.x, r.value.y);
+    };
+    const setV3 = (
+      h: { value: Vector3 },
+      r: { value: Vector3 } | undefined,
+    ): void => {
+      if (r) h.value.set(r.value.x, r.value.y, r.value.z);
+    };
+    const setN = (
+      h: { value: number },
+      r: { value: number } | undefined,
+    ): void => {
+      if (r !== undefined && typeof r.value === "number") h.value = r.value;
+    };
+    const setB = (
+      h: { value: number },
+      r: { value: boolean } | undefined,
+    ): void => {
+      if (r !== undefined) h.value = r.value ? 1 : 0;
+    };
+
+    setV3(w.uRTCCenter, u.uRTCCenter as { value: Vector3 } | undefined);
+    setV3(w.uRTCCenterView, u.uRTCCenterView as { value: Vector3 } | undefined);
+    setV3(w.uEyeRTEHigh, u.uEyeRTEHigh as { value: Vector3 } | undefined);
+    setV3(w.uEyeRTELow, u.uEyeRTELow as { value: Vector3 } | undefined);
+    setN(w.uScale, u.uScale as { value: number } | undefined);
+    setV2(w.uCenter, u.uCenter as { value: Vector2 } | undefined);
+    setB(w.uSizeInMeters, u.uSizeInMeters as { value: boolean } | undefined);
+    setB(w.uOffsetDepth, u.uOffsetDepth as { value: boolean } | undefined);
+    setN(w.uAlphaTest, u.uAlphaTest as { value: number } | undefined);
+    setN(w.uFarPlane, u.uFarPlane as { value: number } | undefined);
+    setV2(w.uAtlasSize, u.uAtlasSize as { value: Vector2 } | undefined);
+    setN(w.uFovRad, u.uFovRad as { value: number } | undefined);
+    setN(w.uScreenHeightPx, u.uScreenHeightPx as { value: number } | undefined);
+    setN(w.uPickable, u.nvr_uPickable as { value: number } | undefined);
+
+    // The atlas texture object is replaced whenever the atlas grows;
+    // re-point the TSL texture node (NodeSampledTexture rebinds on change).
+    if (w.spriteTex) {
+      w.spriteTex.value =
+        (u.uTexture?.value as DataTexture | null) ?? getPlaceholderTexture();
+    }
+
+    // Props the enhancer writes on its own (classic) material.
+    const m = this.material as Material | undefined;
+    if (m) {
+      m.transparent = w.src.transparent;
+      m.depthTest = w.src.depthTest;
+      m.depthWrite = w.src.depthWrite;
+    }
   }
 
   private updateVisibility() {
-    const material = this.material;
+    // On the WebGPU backend the classic material holds the show/hide flag
+    // (this.material is the node material); identical object otherwise.
+    const material = this._classicMaterial ?? this.material;
     const materialVisible =
       material instanceof ShaderMaterial ? material.visible : true;
     this.visible = this._active && materialVisible;
@@ -1064,6 +1474,12 @@ export class InstancedSpriteMesh
     }
 
     (this.material as ShaderMaterial).dispose();
+    // The classic ShaderMaterial survives as the enhancer's state store when
+    // the WebGPU node material replaced it for rendering.
+    if (this._classicMaterial) {
+      this._classicMaterial.dispose();
+      this._classicMaterial = undefined;
+    }
 
     // Clear internal collections to release references
     this._batchIndexToInstances = null;

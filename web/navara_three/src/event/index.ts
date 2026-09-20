@@ -20,7 +20,7 @@ import { canWorkerProcessImmediately } from "@navaramap/worker";
 import { Mesh, Object3D, Sprite } from "three";
 
 import { BatchedSdfTextMesh, Layer } from "..";
-import { disposeTexture } from "../loaders";
+import { retireTexture } from "../loaders";
 import { getImageDataFromBlob } from "../tasks/getImageDataFromBlob";
 
 import { type EventContext } from "./context";
@@ -613,7 +613,7 @@ function processDataRequesterRemoved(
   if (loadedTexs) {
     const texture = loadedTexs.get(id);
     if (texture && !texture.isRenderTargetTexture) {
-      disposeTexture(texture);
+      retireTexture(texture, () => ctx.scenes);
     }
     loadedTexs.delete(id);
   }
@@ -685,7 +685,7 @@ function processTextureFragmentRemoved(ctx: EventContext, req: EntityEvent) {
   // Check isRenderTargetTexture to avoid double-dispose
   const texture = loadedTexs.get(id);
   if (texture && !texture.isRenderTargetTexture) {
-    disposeTexture(texture);
+    retireTexture(texture, () => ctx.scenes);
   }
   loadedTexs.delete(id);
 

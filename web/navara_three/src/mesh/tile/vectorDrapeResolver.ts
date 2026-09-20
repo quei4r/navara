@@ -82,6 +82,13 @@ export type VectorDrapeHost = {
   material: () => TileMaterial;
   /** Re-report the tile's drape GPU footprint after the RT pool changed. */
   reportDrapeGpuBytes: () => void;
+  /**
+   * Push the material's per-slot userData arrays into the WebGPU tile node
+   * material's uniform nodes. No-op on the classic (WebGL) material — the
+   * GLSL shader reads the userData uniforms directly. Called after
+   * {@link VectorDrapeResolver.bindSlots} rewrites the vector region.
+   */
+  syncWebGPUSlotNodes: () => void;
 };
 
 /**
@@ -358,6 +365,10 @@ export class VectorDrapeResolver implements DrapeResolver {
       m.userData.shows.value[lastIdx] = mesh ? 1 : 0;
       if (mesh) this.copyMeshAttrs(lastIdx, mesh);
     }
+
+    // WebGPU tile material: the slot uniform nodes were synced from these
+    // arrays at setupTextures time, before this re-bind — push the new state.
+    this.host.syncWebGPUSlotNodes();
   }
 
   /**
