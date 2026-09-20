@@ -67,6 +67,22 @@ export const PICK_RADIUS = 3;
 /** Pick search radius for touch: fingertips land less precisely than a cursor. */
 export const TOUCH_PICK_RADIUS = 10;
 
+/** One queued WebGPU pick request (hover or click). */
+type WebGPUPickRequest = {
+  x: number;
+  y: number;
+  radius: number;
+  callback: (pickArr: number[]) => void;
+};
+
+/**
+ * Bound on the FIFO click-pick queue. Clicks are never overwritten by hover
+ * traffic, but a pathological burst (scripted clicks far faster than the
+ * ~frame-scale readback) drops the oldest stale intent rather than growing
+ * unboundedly.
+ */
+const MAX_QUEUED_CLICK_PICKS = 16;
+
 /**
  * GPU picking using a dedicated render pass over a small search window.
  *
@@ -104,13 +120,13 @@ export class PickHelper {
   private readonly isWebGPU: boolean;
   /** A GPU pick is awaiting its async readback. */
   private gpuPickRunning = false;
-  /** Latest queued GPU pick request; newer requests replace older ones. */
-  private gpuPickPending?: {
-    x: number;
-    y: number;
-    radius: number;
-    callback: (pickArr: number[]) => void;
-  };
+  /** Latest queued hover pick; a newer hover replaces an unserviced older one
+   *  (stale pointer positions are worthless). */
+  private gpuPickPendingHover?: WebGPUPickRequest;
+  /** Queued click picks, serviced FIFO. Clicks are discrete user intent and
+   *  must never be overwritten by hover traffic (or each other, up to the
+   *  queue bound); hover stays latest-only. */
+  private gpuPickPendingClicks: WebGPUPickRequest[] = [];
 
   /** Dedicated scene used only during the pick render. */
   private readonly pickScene = new Scene();
@@ -428,10 +444,11 @@ export class PickHelper {
   }
 
   /**
-   * Queues a WebGPU pick. Readbacks are async, so picks run one at a time;
-   * while one is in flight only the newest request is kept (hover streams
-   * would otherwise pile up stale frames, and a click that lands during a
-   * hover pick still gets serviced right after it).
+   * Queues a WebGPU pick. Readbacks are async, so picks run one at a time.
+   * Hover requests share one latest-only slot (a stale pointer position is
+   * worthless); click requests are queued FIFO and never overwritten, so a
+   * click landing during a hover pick — or a burst of clicks — is always
+   * serviced.
    */
   private requestWebGPUPick(
     x: number,
@@ -439,14 +456,27 @@ export class PickHelper {
     radius: number,
     callback: (pickArr: number[]) => void,
   ) {
-    this.gpuPickPending = { x, y, radius, callback };
+    const request: WebGPUPickRequest = { x, y, radius, callback };
+    if (callback === this.onPickCallback) {
+      this.gpuPickPendingClicks.push(request);
+      if (this.gpuPickPendingClicks.length > MAX_QUEUED_CLICK_PICKS) {
+        this.gpuPickPendingClicks.shift();
+      }
+    } else {
+      this.gpuPickPendingHover = request;
+    }
     if (this.gpuPickRunning) return;
     this.gpuPickRunning = true;
     void (async () => {
       try {
-        while (this.gpuPickPending) {
-          const pending = this.gpuPickPending;
-          this.gpuPickPending = undefined;
+        for (;;) {
+          // Clicks first: they carry user intent, hover is best-effort.
+          const pending =
+            this.gpuPickPendingClicks.shift() ?? this.gpuPickPendingHover;
+          if (!pending) break;
+          if (pending === this.gpuPickPendingHover) {
+            this.gpuPickPendingHover = undefined;
+          }
           try {
             const batchId = await this.pickBatchIdAtWebGPU(
               pending.x,

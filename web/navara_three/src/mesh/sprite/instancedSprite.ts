@@ -175,6 +175,12 @@ export class InstancedSpriteMesh
   /** The classic ShaderMaterial the enhancer stays mounted on when the WebGPU
    *  node material replaced it for rendering (state store + visibility). */
   private _classicMaterial?: ShaderMaterial;
+  /** First-write flags gating the replacing batch attributes in the WebGPU
+   *  node graph (the classic path uses write-time USE_BATCH_* defines, but
+   *  the eager batch allocation stamps them all at init on this backend). */
+  private _batchColorUsed = false;
+  private _batchHeightUsed = false;
+  private _batchShowOpacityUsed = false;
   /** Per-instance world anchors in ECEF meters (f64, 3 per instance), kept in
    *  sync with the position attributes for the declutter pass. */
   private _anchors: Float64Array | null = null;
@@ -428,9 +434,14 @@ export class InstancedSpriteMesh
     // `color` only until batch color is enabled: from then on every feature
     // reads the texture (written value or the fixed default), same semantics
     // as PolygonMesh._update.
-    const batchColorEnabled = !!(
-      material.userData.defines as Record<string, unknown> | undefined
-    )?.USE_BATCH_COLOR;
+    // On WebGPU the eager batch allocation stamps USE_BATCH_COLOR at init,
+    // so the define cannot mark real per-feature writes there; the mesh's
+    // first-write flag (set by _updateBatchAttribute) does.
+    const batchColorEnabled = this._classicMaterial
+      ? this._batchColorUsed
+      : !!(
+          material.userData.defines as Record<string, unknown> | undefined
+        )?.USE_BATCH_COLOR;
     enhancer.update({
       base: {
         scale: m.material.size ?? 100.0,
@@ -850,7 +861,12 @@ export class InstancedSpriteMesh
         : null;
     if (batch) handles.batchTex = batch.texNode;
     const batchShowOpacity = batch?.showOpacity() ?? null;
-    const instanceShow = batchShowOpacity?.show ?? T.float(1);
+    // instanceShow/instanceOpacity sample the eagerly-backfilled texture from
+    // init on; the gate keeps the classic default (visible, uOpacity) until a
+    // real per-feature show/opacity write lands.
+    const instanceShow = batchShowOpacity
+      ? T.mix(T.float(1), batchShowOpacity.show, gateShowOpacity)
+      : T.float(1);
     const batchHeight = batch?.scalar("height");
     const instanceHeight = batchHeight
       ? T.mix(uAddHeight, batchHeight, gateHeight)
@@ -1086,12 +1102,12 @@ export class InstancedSpriteMesh
     setN(w.uOpacity, u.uOpacity as { value: number } | undefined);
     const uColor = u.uColor as { value: Color } | undefined;
     if (uColor) w.uColor.value.copy(uColor.value);
-    // Batch gates mirror the classic write-time USE_BATCH_* defines, stamped
-    // on every attached material by the batch texture module.
-    const defines = (w.src.userData.defines ?? {}) as Record<string, unknown>;
-    w.gateColor.value = defines.USE_BATCH_COLOR ? 1 : 0;
-    w.gateHeight.value = defines.USE_BATCH_HEIGHT ? 1 : 0;
-    w.gateShowOpacity.value = defines.USE_BATCH_SHOW_OPACITY ? 1 : 0;
+    // Batch gates mirror the classic write-time USE_BATCH_* defines. Those
+    // defines are stamped at init here (eager batch allocation), so the
+    // mesh's first-write flags gate the replacing attributes instead.
+    w.gateColor.value = this._batchColorUsed ? 1 : 0;
+    w.gateHeight.value = this._batchHeightUsed ? 1 : 0;
+    w.gateShowOpacity.value = this._batchShowOpacityUsed ? 1 : 0;
     if (w.batchTex) syncWebgpuBatchTexture({ texNode: w.batchTex }, w.src);
 
     // The atlas texture object is replaced whenever the atlas grows;
@@ -1326,12 +1342,29 @@ export class InstancedSpriteMesh
     attribute: BatchedAttributeName,
     value: number | number[] | boolean,
   ): boolean {
-    return updateBatchAttribute(
+    const written = updateBatchAttribute(
       this.material as ShaderMaterial,
       batchIndex,
       attribute,
       value,
     );
+    if (written) {
+      // WebGPU first-write gates (eager allocation stamped the defines
+      // already, so they cannot mark real writes on this backend).
+      switch (attribute) {
+        case "color":
+          this._batchColorUsed = true;
+          break;
+        case "height":
+          this._batchHeightUsed = true;
+          break;
+        case "show":
+        case "opacity":
+          this._batchShowOpacityUsed = true;
+          break;
+      }
+    }
+    return written;
   }
 
   setFeatureColorByBatchIndex(batchIndex: number, color: Color) {
