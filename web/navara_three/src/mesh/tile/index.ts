@@ -83,17 +83,24 @@ import {
 } from "./rasterDrapeResolver";
 import { VectorDrapeResolver } from "./vectorDrapeResolver";
 
-const WEBGPU_SLOT_PLACEHOLDER = new DataTexture(
-  new Uint8Array([255, 255, 255, 255]),
-  1,
-  1,
-);
-WEBGPU_SLOT_PLACEHOLDER.needsUpdate = true;
+// 1×1 white stand-in for inactive texture slots. Each slot MUST get its own
+// instance: TextureNode.getUniformHash() is the texture's uuid, so nodes that
+// share a placeholder object hash identically and the node builder collapses
+// them into a single binding — later `.value` rebinds on the other slots then
+// never reach the GPU (the deduped winner's texture is sampled for all).
+function createWebGPUSlotPlaceholder(): DataTexture {
+  const t = new DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+  t.needsUpdate = true;
+  return t;
+}
 
 // Uniform-node shape of one WebGPU tile texture slot (see initWebGPUMaterial)
 type WebgpuSlotNodes = {
   has: any; // UniformNode<number>
   node: ReturnType<typeof texture>;
+  // This slot's private inactive stand-in (see createWebGPUSlotPlaceholder);
+  // _syncWebgpuSlotNodes rebinds it whenever the slot has no live texture.
+  placeholder: DataTexture;
   offset: any; // UniformNode<Vector2>
   scale: any; // UniformNode<Vector2>
   tint: any; // UniformNode<Color>
@@ -830,9 +837,11 @@ export class TileMesh
     // default 16 sampled-textures-per-stage WebGPU limit.
     const slots: WebgpuSlotNodes[] = [];
     for (let i = 0; i < this.maxTextures; i++) {
+      const placeholder = createWebGPUSlotPlaceholder();
       slots.push({
         has: uniform(0),
-        node: texture(WEBGPU_SLOT_PLACEHOLDER),
+        node: texture(placeholder),
+        placeholder,
         offset: uniform(new Vector2(0, 0)),
         scale: uniform(new Vector2(1, 1)),
         tint: uniform(new Color(1, 1, 1)),
@@ -840,9 +849,11 @@ export class TileMesh
         flipV: uniform(0),
       });
     }
+    const hsPlaceholder = createWebGPUSlotPlaceholder();
     const hillshade = {
       has: uniform(0),
-      node: texture(WEBGPU_SLOT_PLACEHOLDER),
+      node: texture(hsPlaceholder),
+      placeholder: hsPlaceholder,
       offset: uniform(new Vector2(0, 0)),
       scale: uniform(new Vector2(1, 1)),
       exaggeration: uniform(1),
@@ -1760,7 +1771,7 @@ ${generateTileCommonInjection(maxTextures)}
 
       const slot = slots[i];
       const active = shown && !isHs;
-      const tex = active ? t : WEBGPU_SLOT_PLACEHOLDER;
+      const tex = active ? t : slot.placeholder;
       if (slot.node.value !== tex) slot.node.value = tex;
       slot.has.value = active ? 1 : 0;
       // Baked drape render targets carry the WebGPU top-down texel layout;

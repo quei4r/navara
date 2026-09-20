@@ -56,6 +56,12 @@ const bootstrap = async () => {
     canvas,
     renderer: renderer as unknown as WebGLRenderer,
     animation: true,
+    webgpuDebug: {
+      rawPost: query.has("rawpost"),
+      noPost: query.has("nopost"),
+      noEnv: query.has("noenv"),
+      tileBasic: query.has("tilebasic"),
+    },
   });
   view.addPlugin(new DefaultPlugin());
   await view.init();
