@@ -9,9 +9,9 @@
 
 > **This is a personal fork** ([quei4r/navara](https://github.com/quei4r/navara)) of [reearth/navara](https://github.com/reearth/navara): **a personal, self-use experimental WebGPU port** — the renderer is being migrated from WebGL2 to three.js `WebGPURenderer` (TSL node materials) on the `webgpu-renderer-port` branch.
 >
-> - 个人自用 WebGPU 实验版，不向上游提交 PR。
-> - 尽量保持与上游 reearth/navara 的同步更新（merge 上游变更进本 fork）。
-> - 欢迎提 PR 和 issue（包括与上游同步相关的改进）。
+> - Personal, self-use experimental WebGPU port — no PRs will be submitted upstream.
+> - Best-effort sync with upstream reearth/navara (upstream changes are merged into this fork).
+> - PRs and issues are welcome (including improvements related to upstream syncing).
 >
 > For the upstream README, read on below.
 
