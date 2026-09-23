@@ -144,6 +144,15 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
     return this.renderPassOrchestrator.renderer;
   }
 
+  /**
+   * Light groups attached to each rendered scene during the main render.
+   * Auxiliary cameras rendering `scenes` should attach the same groups, or
+   * the scenes render unlit.
+   */
+  getRenderLights(): Object3D[] {
+    return this.renderPassOrchestrator.renderLights;
+  }
+
   /** Debug switches for the experimental WebGPU forward path. */
   get webgpuDebugFlags(): WebGpuDebugFlags {
     return this.renderPassOrchestrator.debugFlags;

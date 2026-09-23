@@ -364,6 +364,16 @@ export class RenderPassOrchestrator {
     return ((this.scenes as { light?: Scene }).light?.children.length ?? 0) > 0;
   }
 
+  /**
+   * The light groups the WebGPU forward path nests into each scene while it
+   * renders: the environment rig plus the mirror of `scenes.light`. Auxiliary
+   * cameras rendering the same scenes (e.g. picture-in-picture) attach them
+   * identically, or the scenes render unlit.
+   */
+  get renderLights(): Group[] {
+    return [this.lights, this.lightMirror];
+  }
+
   /** Rebuild (on light-scene changes) and per-frame sync the light mirror. */
   private syncLightMirror(): void {
     const lightScene = (this.scenes as { light?: Scene }).light;
