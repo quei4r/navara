@@ -14,6 +14,15 @@ pub struct CameraFlightEnded {
     pub completed: bool,
 }
 
+/// The terrain exaggeration in effect from this frame on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainExaggerationUpdated {
+    pub scale: f64,
+    pub relative_height: f64,
+    /// `TerrainExaggeration::horizon_minimum_height`.
+    pub horizon_minimum_height: f64,
+}
+
 #[derive(Debug)]
 pub struct ComponentEvent<T = ()> {
     pub ind: u32,
@@ -147,6 +156,13 @@ impl<'a, T: Component, U: Component, V: Component>
         };
 
         Some(Self::new(e, (a, b, c)))
+    }
+}
+
+impl<'a, T: Component, U: Component> ReconstructableComponentEvent<(&'a T, Option<&'a U>)> {
+    pub fn from_world_and_option(e: Entity, world: &'a World) -> Option<Self> {
+        let a = world.get::<T>(e)?;
+        Some(Self::new(e, (a, world.get::<U>(e))))
     }
 }
 

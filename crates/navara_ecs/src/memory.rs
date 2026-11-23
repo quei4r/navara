@@ -1,15 +1,13 @@
 use bevy_ecs::{
     entity::Entity,
     prelude::{Query, Res, ResMut},
-    query::Without,
 };
 use navara_buffer_store::BufferStore;
 use navara_cesium3dtiles::ModelContentIndex;
-use navara_component::Deleted;
 use navara_feature_component::render::RenderableFeature;
 use navara_fog::{DynamicSse, DynamicSseConfig, Fog, LodFogConfig};
 use navara_memory::{MemoryLedger, TileCost};
-use navara_tile_component::{TerrainTileGpuCost, TileHandle, TileMeshMarker};
+use navara_tile_component::{TerrainTileGpuCost, TileHandle};
 use navara_vector_tile::{OwningVectorTile, VectorTileGpuCost};
 
 use crate::App;
@@ -128,25 +126,23 @@ impl App {
         }
     }
 
-    /// Updates a terrain tile's drape render-target GPU footprint, measured on
-    /// the JS side where the `WebGLRenderTarget`s are lazily allocated (one per
-    /// live clamp-to-ground vector layer draped onto this tile). Preserves the
+    /// Updates a terrain tile's drape GPU footprint, measured on the JS side
+    /// where the `WebGLRenderTarget`s are lazily allocated (the composite atlas
+    /// once the tile is rendered, plus one per live clamp-to-ground vector
+    /// layer draped onto this tile). Preserves the
     /// mesh geometry estimate and re-derives `TileCost.gpu_est = geometry +
     /// drape`, so the memory ledger tracks drape memory that scales with terrain
     /// subdivision past the vector `maxZoom`. No-op if the tile was already
     /// evicted before the report arrived.
     pub fn report_terrain_drape_gpu_bytes(&mut self, handle: TileHandle, gpu_bytes: u64) {
         let world = self.app.world_mut();
-        // Exclude meshes marked `Deleted` (deferred despawn): during a mesh
-        // replacement the old entity survives a frame while a new mesh reuses
-        // the same position-stable handle. Landing the report on the doomed
-        // entity would drop the drape cost from the ledger when it despawns,
-        // leaving the live tile's drape memory uncounted.
-        let mut query = world.query_filtered::<(Entity, &TileMeshMarker), Without<Deleted>>();
-        let Some(entity) = query
-            .iter(world)
-            .find(|(_, marker)| marker.handle == handle)
-            .map(|(e, _)| e)
+        // Resolved through the tile cache: a destroyed tile's entry is gone,
+        // so the report never lands on a mesh marked `Deleted` (deferred
+        // despawn) while a new mesh reuses the same position-stable handle.
+        let Some(entity) = world
+            .get_resource::<navara_tile::tile::tile_cache_manager::TileCacheManager>()
+            .and_then(|tc| tc.rendered_tile_caches.get(&handle))
+            .and_then(|cache| cache.mesh_entity)
         else {
             return;
         };
@@ -191,7 +187,9 @@ impl App {
     }
 
     /// Sets the dynamic screen-space-error relaxation (CesiumJS
-    /// `dynamicScreenSpaceError` equivalent) applied by every tile traversal.
+    /// `dynamicScreenSpaceError` equivalent) applied by every tile traversal
+    /// (3D Tiles, terrain, raster, vector), each scaling it by its own max SSE
+    /// (`DynamicSseTerm::for_max_sse`).
     /// Buffered into [`DynamicSseConfig`] so a call before the first
     /// `App::update()` is honored, and applied to the live entity directly —
     /// same two-path shape as [`App::set_lod_fog`].
@@ -242,6 +240,41 @@ impl App {
             .get_resource_mut::<navara_data_requester::RequestLimits>()
         {
             limits.max_pendings = value;
+        }
+    }
+
+    /// Caps the number of delegated worker tasks in flight across all task
+    /// kinds; the frontend derives it from its worker pool size.
+    pub fn set_max_worker_tasks(&mut self, value: u32) {
+        if let Some(mut limits) = self
+            .app
+            .world_mut()
+            .get_resource_mut::<navara_worker::WorkerLimits>()
+        {
+            limits.max_pendings = value;
+        }
+    }
+
+    /// Reports the pool work the frontend runs outside delegated tasks; it
+    /// takes from the delegated-task cap (see `WorkerLimits`).
+    pub fn set_worker_external_load(&mut self, value: u32) {
+        if let Some(mut limits) = self
+            .app
+            .world_mut()
+            .get_resource_mut::<navara_worker::WorkerLimits>()
+        {
+            limits.external_load = value;
+        }
+    }
+
+    /// Pauses or resumes worker intake (see `WorkerLimits`).
+    pub fn set_worker_intake_paused(&mut self, paused: bool) {
+        if let Some(mut limits) = self
+            .app
+            .world_mut()
+            .get_resource_mut::<navara_worker::WorkerLimits>()
+        {
+            limits.intake_paused = paused;
         }
     }
 
@@ -614,6 +647,29 @@ mod report_billboard_atlas_bytes_tests {
 #[cfg(test)]
 mod report_terrain_drape_gpu_bytes_tests {
     use super::*;
+    use navara_component::Deleted;
+    use navara_tile::tile::tile_cache_manager::{RenderedTileCache, TileCacheManager};
+    use navara_tile_component::TileMeshMarker;
+
+    /// Makes `mesh_entity` the mesh the terrain tile cache holds for `handle`.
+    fn register_mesh(world: &mut bevy_ecs::world::World, handle: TileHandle, mesh_entity: Entity) {
+        let rendered_tile_entity = world.spawn_empty().id();
+        world
+            .resource_mut::<TileCacheManager>()
+            .rendered_tile_caches
+            .insert(
+                handle,
+                RenderedTileCache {
+                    mesh_entity: Some(mesh_entity),
+                    ready_parent_tile_handle: None,
+                    layer_parents: None,
+                    rendered_tile_entity,
+                    mesh_prepared: true,
+                    needs_material_update: false,
+                    prefetched: false,
+                },
+            );
+    }
 
     #[test]
     fn adds_drape_to_geometry_and_corrects_ledger() {
@@ -623,20 +679,23 @@ mod report_terrain_drape_gpu_bytes_tests {
 
         // A terrain mesh tile with a geometry-only cost, keyed by its handle.
         let handle: TileHandle = 42;
-        world.spawn((
-            TileMeshMarker {
-                handle,
-                ready_parent_tile_handle: None,
-            },
-            TerrainTileGpuCost {
-                geometry: 1000,
-                drape: 0,
-            },
-            TileCost {
-                cpu: 0,
-                gpu_est: 1000,
-            },
-        ));
+        let mesh = world
+            .spawn((
+                TileMeshMarker {
+                    handle,
+                    ready_parent_tile_handle: None,
+                },
+                TerrainTileGpuCost {
+                    geometry: 1000,
+                    drape: 0,
+                },
+                TileCost {
+                    cpu: 0,
+                    gpu_est: 1000,
+                },
+            ))
+            .id();
+        register_mesh(world, handle, mesh);
         assert_eq!(
             app.app.world().resource::<MemoryLedger>().gpu_bytes_est,
             1000
@@ -718,6 +777,7 @@ mod report_terrain_drape_gpu_bytes_tests {
                 },
             ))
             .id();
+        register_mesh(world, handle, live_mesh);
 
         app.report_terrain_drape_gpu_bytes(handle, 500);
 

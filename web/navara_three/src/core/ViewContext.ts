@@ -1,11 +1,21 @@
-import { EventHandler } from "@navaramap/core";
+import { EventHandler, type JobDispatcher } from "@navaramap/core";
 import type { Core } from "@navaramap/engine";
-import type { ConcurrencyManager } from "@navaramap/worker";
+import {
+  reserveWorkerCore,
+  type ReadonlyConcurrencyManager,
+} from "@navaramap/worker";
 import type { Pass as PostProcessingPass } from "postprocessing";
-import type { Material, Object3D, Texture, WebGLRenderer } from "three";
+import type {
+  Material,
+  Matrix4,
+  Object3D,
+  Texture,
+  WebGLRenderer,
+} from "three";
 import invariant from "tiny-invariant";
 
 import type { LayersManager } from "../layersManager";
+import { LineDashAtlas, type LineCap } from "../lineDash";
 import { type ResolvedGBufferOptions } from "../material/gbufferLayout";
 import type { PickableMesh } from "../mesh/pickableMesh";
 import type {
@@ -15,6 +25,9 @@ import type {
 import type { CustomRenderPass } from "../passes";
 import type { Scenes } from "../scene";
 import type { MeshCache } from "../type";
+import type { CommonUniforms, RefThree } from "../uniforms";
+import type { RenderTargetEntry } from "../utils/fixedGpuFootprint";
+import type { WaterState } from "../water/waterState";
 
 import type { EffectHandle, LightHandle, MeshHandle } from "./BaseHandle";
 import type { EffectDesc } from "./EffectDesc";
@@ -40,17 +53,29 @@ type ViewContextEvents = {
    */
   effectSlotsChanged: () => void;
   /**
-   * Emitted when the derived G-buffer configuration changes. Meshes re-evaluate
-   * their pass placement: outside the MRT pass they would leave the G-buffer
-   * holding whatever lies behind them.
+   * Emitted whenever the view re-derives its G-buffer configuration, even
+   * when it is unchanged: an added or removed effect can flip
+   * `requiresMrtPass`. Meshes re-evaluate their pass placement: outside the
+   * MRT pass they would leave the G-buffer holding whatever lies behind them.
    */
   gbufferChanged: () => void;
   /**
-   * Emitted when a mesh moves between render scenes. The view re-derives the
-   * buffer configuration from it: draped meshes need the globe normal but,
-   * not being effects, cannot declare `requiredBuffers` themselves.
+   * Emitted by an effect or mesh descriptor whose `getRequiredBuffers()` result
+   * changed after creation. The view re-derives the G-buffer configuration.
    */
-  meshPassKeyChanged: () => void;
+  gbufferRequirementsChanged: () => void;
+  /** Emitted when a pass is added to, inserted into or removed from the pipeline. */
+  passesChanged: () => void;
+};
+
+/** In-flight frontend jobs of one kind (see `guide/FRONTEND_JOB_PROTOCOL.md`). */
+export type JobKindStats = {
+  /** The job handler's name (`"tile mesh"`, `"data requester"`, ...). */
+  name: string;
+  /** Live jobs of this kind, settled ones included. */
+  jobs: number;
+  /** Jobs whose `start` or `change` call has not settled yet. */
+  inFlight: number;
 };
 
 /**
@@ -70,16 +95,21 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
   private _selectiveEffectRegistry: SelectiveEffectRegistry;
   private _renderPass?: CustomRenderPass;
   private _registries?: Registries;
+  private _lineDashAtlas = new LineDashAtlas();
+  /** Objects of {@link registerPickableMesh} by key: the mesh cache entries descriptors own. */
+  private _pickables = new Map<string, Object3D>();
 
   constructor(
     /** Scene containers for different rendering passes. */
     private _scenes: Scenes,
     private layersManager: LayersManager,
     private renderPassOrchestrator: RenderPassOrchestrator,
-    /** Manager for scheduling work on Web Workers. */
-    private _concurrencyManager: ConcurrencyManager,
+    /** Worker pool size and the pool tasks in flight. */
+    private _concurrencyManager: ReadonlyConcurrencyManager,
     private _core: Core,
     private _meshes: MeshCache,
+    private _commonUniforms: CommonUniforms,
+    private _dispatcher: JobDispatcher,
   ) {
     super();
 
@@ -93,20 +123,59 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
     return this._scenes;
   }
 
-  /** Manager for scheduling work on Web Workers. */
-  get concurrencyManager(): ConcurrencyManager {
+  /** Worker pool size and the pool tasks in flight. */
+  get concurrencyManager(): ReadonlyConcurrencyManager {
     return this._concurrencyManager;
+  }
+
+  /**
+   * Hold one CPU core for a thread outside the worker pool (e.g. a decoder
+   * worker of its own) while it works: one pool worker stops taking tasks
+   * until the returned function is called. Release it as soon as the work
+   * ends; calling it again is a no-op.
+   */
+  reserveWorkerCore(): () => void {
+    return reserveWorkerCore();
   }
 
   get selectiveEffectRegistry(): SelectiveEffectRegistry {
     return this._selectiveEffectRegistry;
   }
 
+  /**
+   * Keep each terrain and polygon geometry's CPU arrays after its GPU
+   * upload instead of releasing them (`releaseGeometryArraysAfterUpload`).
+   * three.js builds a wireframe from the CPU index, so polygon `wireframe`
+   * and `globe.wireframe` draw only while this is on. Costs a JS-heap copy of
+   * every geometry, which the memory ledger does not count. Applies to
+   * geometries built after it is set: debug tooling sets it in `init()`,
+   * before any layer loads.
+   */
+  retainGeometryArrays = false;
+
   // --- Pass management ---
 
   /** Get a post-processing pass by name. */
   getPass(name: string): PostProcessingPass | undefined {
     return this.renderPassOrchestrator.getPass(name);
+  }
+
+  /** Names of every registered pass, in render order. */
+  getPassNames(): string[] {
+    return this.renderPassOrchestrator.getPassNames();
+  }
+
+  /**
+   * Every render target of the fixed (screen-sized) stack, attributed to the
+   * pass that owns it. Snapshot: a pass-list change or resize replaces targets.
+   */
+  getRenderTargets(): RenderTargetEntry[] {
+    return this.renderPassOrchestrator.listRenderTargets();
+  }
+
+  /** Per-kind counts of the frontend jobs the engine has in flight. */
+  getJobStats(): JobKindStats[] {
+    return this._dispatcher.stats();
   }
 
   /** Add a post-processing pass to the end of the pipeline. */
@@ -187,6 +256,13 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
     this.emit("gbufferChanged");
   }
 
+  /**
+   * @internal
+   * Whether an active effect sets `requiresMrtPass`. Kept by the view next to
+   * the G-buffer configuration, since every mesh reads it in `getPassKey()`.
+   */
+  _mrtPassRequired = false;
+
   /** @internal No-op until the pass exists (see {@link _setGBufferOptions}). */
   _setLit(lit: boolean): void {
     this._renderPass?.setLit(lit);
@@ -206,6 +282,102 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
   getGlobeNormalTexture() {
     invariant(this._renderPass, "CustomRenderPass isn't initialized yet.");
     return this._renderPass.globeNormalCopyPass.texture;
+  }
+
+  // The `*Uniform` getters return refs the view updates every frame. Bind the
+  // ref itself to a material, not its current `value`.
+
+  /** Uniform ref to {@link getGlobeDepthTexture}. */
+  getGlobeDepthTextureUniform(): RefThree<Texture> {
+    return this._commonUniforms.tGlobeDepth;
+  }
+
+  /** Uniform ref to {@link getGlobeNormalTexture}. */
+  getGlobeNormalTextureUniform(): RefThree<Texture> {
+    return this._commonUniforms.tGlobeNormal;
+  }
+
+  /** Uniform ref to the sky environment map. */
+  getSkyEnvMapTextureUniform(): RefThree<Texture> {
+    return this._commonUniforms.tSkyEnvMap;
+  }
+
+  /**
+   * The view's water state, for a custom material that calls the water shader
+   * chunk: `uniforms` holds what water materials share, and `createWaves` holds
+   * one surface's waves. The first read of `uniforms` generates the wave
+   * texture.
+   */
+  getWaterState(): WaterState {
+    return this._commonUniforms.water;
+  }
+
+  /** Uniform ref to `[width, height, pixelRatio]` of the viewport in CSS pixels. */
+  getViewportAndPixelRatioUniform(): RefThree<[number, number, number]> {
+    return this._commonUniforms.viewportAndPixelRatio;
+  }
+
+  /** Uniform ref to the camera's `[near, far]`. */
+  getFrustumNearFarUniform(): RefThree<[number, number]> {
+    return this._commonUniforms.frustumNearFar;
+  }
+
+  /** Uniform ref to the camera frustum's `[top, bottom, right, left]` on the near plane. */
+  getFrustumRatioUniform(): RefThree<[number, number, number, number]> {
+    return this._commonUniforms.frustumRatio;
+  }
+
+  /** Uniform ref to the camera's inverse projection matrix. */
+  getInverseProjectionMatrixUniform(): RefThree<Matrix4> {
+    return this._commonUniforms.inverseProjectionMatrix;
+  }
+
+  /**
+   * Uniform ref to the view's line dash atlas, which holds one dash pattern
+   * per row. Rows come from {@link registerLineDash}.
+   */
+  getLineDashAtlasUniform(): RefThree<Texture> {
+    return this._lineDashAtlas.uniform;
+  }
+
+  /**
+   * Returns the row of the line dash atlas holding the pattern of `dashArray`
+   * (alternating dash and gap lengths in line widths) drawn with `cap`, adding
+   * it on first use. A solid line is row `0`. Every call holds the row until a
+   * matching {@link releaseLineDash}.
+   */
+  registerLineDash(
+    dashArray: readonly number[] | null | undefined,
+    cap?: LineCap,
+  ): number {
+    return this._lineDashAtlas.register(dashArray, cap);
+  }
+
+  /**
+   * Ends one {@link registerLineDash} of `row`, once nothing draws with it.
+   * A row no registration holds is reused for another pattern.
+   */
+  releaseLineDash(row: number): void {
+    this._lineDashAtlas.release(row);
+  }
+
+  /** @internal */
+  _dispose(): void {
+    this._lineDashAtlas.dispose();
+  }
+
+  /** Uniform ref to the frame timestamp passed to `preUpdate`. */
+  getTimeUniform(): RefThree<number> {
+    return this._commonUniforms.time;
+  }
+
+  /**
+   * Uniform ref to the height (never positive) the ellipsoid is shrunk by
+   * for horizon culling, bound as `nvrHorizonMinHeight` by materials whose
+   * shaders horizon-cull.
+   */
+  getHorizonMinHeightUniform(): { value: number } {
+    return this._commonUniforms.horizonMinHeight;
   }
 
   /**
@@ -353,6 +525,7 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
    */
   registerPickableMesh(key: string, mesh: PickableMesh & Object3D): void {
     this._meshes?.set(key, mesh);
+    this._pickables.set(key, mesh);
   }
 
   /**
@@ -360,6 +533,15 @@ export class ViewContext extends EventHandler<ViewContextEvents> {
    * @param key - The key used during registration.
    */
   unregisterPickableMesh(key: string): void {
-    this._meshes?.delete(key);
+    // Keep an engine product that has since taken over the key.
+    if (this._meshes?.get(key) === this._pickables.get(key)) {
+      this._meshes?.delete(key);
+    }
+    this._pickables.delete(key);
+  }
+
+  /** @internal Whether `obj` is the pickable a descriptor registered as `key`. */
+  _isDescriptorPickable(key: string, obj: Object3D): boolean {
+    return this._pickables.get(key) === obj;
   }
 }

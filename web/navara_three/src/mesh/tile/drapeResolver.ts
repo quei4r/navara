@@ -1,7 +1,9 @@
-import type {
-  MagnificationTextureFilter,
-  MinificationTextureFilter,
-  Texture,
+import {
+  LinearFilter,
+  NearestFilter,
+  type MagnificationTextureFilter,
+  type MinificationTextureFilter,
+  type Texture,
 } from "three";
 
 import type { TextureOptions } from "../../textures";
@@ -55,6 +57,12 @@ export type DrapeResolver = {
    */
   invalidate(): void;
 
+  /**
+   * Free the render targets of a tile that is not drawn. The next `update()`
+   * allocates and bakes them again.
+   */
+  release(): void;
+
   /** Live drape render targets, counted into the tile's GPU byte report. */
   liveRenderTargetCount(): number;
 
@@ -62,7 +70,10 @@ export type DrapeResolver = {
 };
 
 /** Apply the shared texturized-slot sampler settings to a drape render target's
- * texture. Returns the texture for call-site chaining. */
+ * texture. Returns the texture for call-site chaining.
+ *
+ * three allocates and regenerates the mip chain after every bake whenever
+ * `generateMipmaps` is set, even if the min filter never samples it. */
 export function configureTexturizedTexture(
   tex: Texture,
   textureOptions: TextureOptions,
@@ -70,7 +81,10 @@ export function configureTexturizedTexture(
   tex.minFilter = textureOptions.minFilter as MinificationTextureFilter;
   tex.magFilter = textureOptions.magFilter as MagnificationTextureFilter;
   tex.anisotropy = textureOptions.maxAnisotropy;
-  tex.generateMipmaps = textureOptions.useMipmaps;
+  tex.generateMipmaps =
+    textureOptions.useMipmaps &&
+    tex.minFilter !== LinearFilter &&
+    tex.minFilter !== NearestFilter;
   // Only the first configuration bumps the version. On the WebGPU backend a
   // version bump on an already-initialized render target texture destroys and
   // recreates its GPUTexture, wiping the baked content — and reconfigurations

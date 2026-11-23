@@ -1,4 +1,5 @@
 export * from "./arraysEqual";
+export * from "./dom";
 export * from "./geometry";
 export * from "./worker";
 export * from "./replacer";
@@ -7,3 +8,4 @@ export * from "./blendModes";
 export * from "./object";
 export * from "./textureFragmentIndex";
 export * from "./webgpuLoader";
+export * from "./floatDataTexture";

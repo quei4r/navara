@@ -18,8 +18,9 @@ import type { ExecOptions } from "workerpool/types/types";
 // bounded even under sustained load (no pool-wide idle moment is required)
 // and never discards more than one warm WASM instance at a time. The
 // trade-off versus a single shared queue is possible head-of-line blocking
-// within a slot, but upstream backpressure (ConcurrencyManager) keeps
-// per-slot queues shallow.
+// within a slot, but upstream backpressure keeps per-slot queues shallow:
+// the engine admits only about two tasks per worker, and its intake pauses
+// while every slot is draining (see canAcceptTasks).
 //
 // A burst that stays under the heap budget would otherwise keep its heaps
 // forever, so an idle sweep additionally recycles every used slot once the
@@ -62,6 +63,12 @@ type Slot = {
   tasksSinceSpawn: number;
   /** Dispatched but not yet settled tasks, including warm-ups and probes. */
   inflight: number;
+  /** Warm-ups and probes in flight (the pool's own traffic, part of
+   * `inflight`). */
+  internal: number;
+  /** Kept free for a thread outside the pool: receives no new task, so its
+   * worker idles once the tasks it has finish (see setReservedSlots). */
+  reserved: boolean;
   /** Set once the slot exceeds its heap budget; drained slots recycle. */
   draining: boolean;
   /** Whether a heap probe is already in flight (probes are coalesced). */
@@ -84,11 +91,24 @@ export type WorkerPoolHeapStats = {
   maxWorkerHeapBytes: number;
 };
 
+/**
+ * Tasks a slot's worker still has ahead of a new one. `inflight` drops as
+ * soon as a task is cancelled, but a task cancelled while running keeps the
+ * worker busy until it finishes (the worker-side abort listener lets it run
+ * to completion), so the worker's own busy/queued counts are consulted too.
+ * Cancelled tasks still queued are skipped instantly once the worker frees;
+ * counting them only steers new work away from a busy worker.
+ */
+const slotLoad = (slot: Slot): number => {
+  const { activeTasks, pendingTasks } = slot.pool.stats();
+  return Math.max(slot.inflight, activeTasks + pendingTasks);
+};
+
 const createPool = (url: string) =>
   workerpool.pool(url, {
     // One worker per pool so each worker can be recycled independently.
     maxWorkers: 1,
-    // Avoid oversubscribing CPU when combined with other systems (e.g., DRACO loader).
+    // Avoid oversubscribing CPU when combined with other systems (e.g., the font worker).
     minWorkers: 0,
     workerTerminateTimeout: WORKER_TERMINATE_TIMEOUT_MS,
     workerOpts: {
@@ -116,6 +136,8 @@ export class RecyclingWorkerPool {
       pool: createPool(url),
       tasksSinceSpawn: 0,
       inflight: 0,
+      internal: 0,
+      reserved: false,
       draining: false,
       probing: false,
       lastHeapBytes: undefined,
@@ -189,7 +211,62 @@ export class RecyclingWorkerPool {
    * least-loaded draining slot).
    */
   canAcceptTasks(): boolean {
-    return this.slots.some((slot) => !slot.draining);
+    return this.slots.some((slot) => !slot.draining && !slot.reserved);
+  }
+
+  /**
+   * Keep `count` slots free for threads outside the pool (clamped so one
+   * slot always takes tasks): a reserved slot receives no new task, so its
+   * worker idles and leaves its core to them once its queued tasks finish.
+   * Newly reserved slots are the least loaded ones, which free soonest.
+   */
+  setReservedSlots(count: number): void {
+    const target = Math.max(0, Math.min(count, this.slots.length - 1));
+    let reserved = this.reservedSlots();
+    while (reserved < target) {
+      let least: Slot | undefined;
+      let leastLoad = Infinity;
+      for (const slot of this.slots) {
+        if (slot.reserved) continue;
+        const load = slotLoad(slot);
+        if (load < leastLoad) {
+          least = slot;
+          leastLoad = load;
+        }
+      }
+      if (!least) break;
+      least.reserved = true;
+      reserved++;
+    }
+    for (const slot of this.slots) {
+      if (reserved <= target) break;
+      if (slot.reserved) {
+        slot.reserved = false;
+        reserved--;
+      }
+    }
+  }
+
+  /** Slots currently kept free (see setReservedSlots). */
+  reservedSlots(): number {
+    let reserved = 0;
+    for (const slot of this.slots) {
+      if (slot.reserved) reserved++;
+    }
+    return reserved;
+  }
+
+  /**
+   * Tasks handed to the pool that the workers still have, summed over the
+   * slots: running and queued, including tasks cancelled while running (see
+   * slotLoad). The pool's own warm-ups and probes are left out.
+   */
+  load(): number {
+    let load = 0;
+    for (const slot of this.slots) {
+      load += Math.max(0, slotLoad(slot) - slot.internal);
+    }
+    return load;
   }
 
   stats(): WorkerPoolStats {
@@ -253,14 +330,23 @@ export class RecyclingWorkerPool {
   }
 
   private pickSlot(): Slot {
+    // Reserved slots never take a task (one slot always stays unreserved).
     // Prefer slots still under their heap budget; fall back to a draining
     // slot only when every slot is draining at once (it recycles once it
     // finally drains, so this cannot starve the recycling).
-    const candidates = this.slots.filter((slot) => !slot.draining);
-    const eligible = candidates.length > 0 ? candidates : this.slots;
-    return eligible.reduce((least, slot) =>
-      slot.inflight < least.inflight ? slot : least,
-    );
+    const open = this.slots.filter((slot) => !slot.reserved);
+    const candidates = open.filter((slot) => !slot.draining);
+    const eligible = candidates.length > 0 ? candidates : open;
+    let least = eligible[0];
+    let leastLoad = slotLoad(least);
+    for (const slot of eligible) {
+      const load = slotLoad(slot);
+      if (load < leastLoad) {
+        least = slot;
+        leastLoad = load;
+      }
+    }
+    return least;
   }
 
   private onSettled(slot: Slot): void {
@@ -297,9 +383,14 @@ export class RecyclingWorkerPool {
   // perpetuate itself through the work it triggers.
 
   private warmSlot(slot: Slot): Promise<void> {
+    // A terminated workerpool still spawns a worker on exec, and the
+    // background warm-ups can start after terminate().
+    if (this.terminated) return Promise.resolve();
     slot.inflight++;
+    slot.internal++;
     const settle = () => {
       slot.inflight--;
+      slot.internal--;
       // Same as the probe: if the slot drained while this warm-up was in
       // flight, its settlement is the last task boundary, so recycle here.
       if (!this.terminated && slot.draining && slot.inflight === 0) {
@@ -336,9 +427,11 @@ export class RecyclingWorkerPool {
     if (slot.probing) return;
     slot.probing = true;
     slot.inflight++;
+    slot.internal++;
     const settle = (overBudget: boolean) => {
       slot.probing = false;
       slot.inflight--;
+      slot.internal--;
       if (this.terminated) return;
       if (overBudget) {
         slot.draining = true;

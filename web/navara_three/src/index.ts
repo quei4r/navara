@@ -1,19 +1,23 @@
-import { EventManager, EventHandler, Globe, Plugin } from "@navaramap/core";
+import { JobDispatcher, EventHandler, Globe, Plugin } from "@navaramap/core";
 import type {
   CameraPosition,
-  ColorMap,
+  CameraState,
   GlobeOptions,
   Nullable,
   XYZ,
   Color as CoreColor,
   LatLngHeight,
   LatLng,
+  RegisteredJobKind,
 } from "@navaramap/core";
 import initCore, {
   Core,
   CameraDirection,
   DynamicSse as EngineDynamicSse,
+  exaggerateTerrainHeight,
+  ExtentRadianF32,
   LLE,
+  type TerrainHeightRangeUpdatedEvent,
   type TerrainHeightUpdatedEvent,
   type TextureFragmentStatus,
 } from "@navaramap/engine";
@@ -23,14 +27,28 @@ import {
   type FontWorkerMemoryStats,
 } from "@navaramap/font";
 import FontWorkerURL from "@navaramap/font/fontWorker?worker&url";
-import { initNavaraApi, degreeToRadian } from "@navaramap/three-api";
+// Make a consuming bundler emit each worker's .wasm beside its worker chunk,
+// which loads it by relative URL.
+import "@navaramap/engine-font-worker";
+import "@navaramap/engine-worker";
 import {
-  initializeWorkerPool,
+  initNavaraApi,
+  degreeToRadian,
+  type GeographicExtent,
+} from "@navaramap/three-api";
+import {
+  acquireWorkerPool,
+  canWorkerPoolAcceptTasks,
+  workerPoolLoad,
+  workerPoolReservedSlots,
+  reserveWorkerCore,
   probeWorkerPoolHeap,
-  terminateWorkerPool,
+  sharedWorkerPoolSize,
   warmUpWorkerPool,
   workerPoolHeapStats,
+  workerPoolHolders,
   type WorkerPoolHeapStats,
+  type WorkerPoolLease,
 } from "@navaramap/worker";
 import {
   Scene,
@@ -39,8 +57,6 @@ import {
   Texture,
   Vector2,
   LinearFilter,
-  ClampToEdgeWrapping,
-  RepeatWrapping,
   Group,
   PCFShadowMap,
 } from "three";
@@ -49,12 +65,14 @@ import invariant from "tiny-invariant";
 import { Atmosphere, type AtmosphereOptions } from "./atmosphere";
 import { flushBatchTextureUpdates } from "./batchTexture";
 import { ThreeViewCamera } from "./camera";
+import { applyCameraState, readCameraState } from "./cameraState";
 import { Color } from "./Color";
+import { ColorMapAtlas } from "./colorMapAtlas";
 import { createDefaultConcurrencyManager } from "./concurrency";
-import { WATER_NORMAL_URL } from "./constants/assets";
 import {
   LightDesc,
   EffectDesc,
+  MeshDesc,
   ViewContext,
   type MeshConfig,
   type LightConfig,
@@ -69,6 +87,7 @@ import {
   LightHandle,
   EffectHandle,
   type AnyMeshDesc,
+  type BaseHandle,
 } from "./core/BaseHandle";
 import { Registries } from "./core/Registries";
 import { DeclutterManager, wasmDeclutterKernel } from "./declutter";
@@ -81,10 +100,12 @@ import {
   getDevicePixelRatio,
   isMobileDevice,
   type DynamicSseSettings,
+  type MemoryBudgets,
   type LodFogSettings,
 } from "./device";
 import {
   processEvent,
+  registerEventHandlers,
   EventContext,
   HillshadeContext,
   type BufferLoader,
@@ -96,7 +117,7 @@ import {
   type TileHandler,
   type WorkerTaskHandler,
 } from "./event";
-import { TEXTURE_LOADER } from "./event/loaders";
+import { disposeAllObjects } from "./event/objectRemoved";
 import { createTileHandler } from "./event/tileHandler";
 import { InMemoryBufferStore } from "./inMemoryBufferStore";
 import { registerInputEvents } from "./input";
@@ -111,7 +132,8 @@ import { LayersManager } from "./layersManager";
 import { disposeTexture, flushRetiredTextures } from "./loaders";
 import {
   overrideMaterialsForMRT,
-  GBUFFER_ATTACHMENT_NAMES,
+  countGBufferAttachments,
+  exceededGBufferCapacity,
   resolveGBufferOptions,
   unionGBufferRequirements,
   type GBufferName,
@@ -134,11 +156,14 @@ import {
   reconstructWebgpuWorldPosition,
   TerrainPicker,
 } from "./pick/pickTerrain";
+import { TerrainDistanceCache } from "./pick/terrainDistance";
 import { AttributionPlugin, type AttributionPluginOptions } from "./plugins";
 import { TexturizedSceneByTileCoordinates, type Scenes } from "./scene";
 import { ShadowMapViewers } from "./ShadowMapViewers";
 import { Source } from "./source";
 import { RendererStats } from "./stats";
+import { queueTask } from "./tasks/queueTask";
+import { IDENTITY_TERRAIN_EXAGGERATION } from "./terrain/exaggeration";
 import {
   sampleTerrainMostDetailed,
   type SampleTerrainOptions,
@@ -149,7 +174,6 @@ import { hasObservedTerrainHeight } from "./terrain/terrainHeightEvent";
 import type { TextureOptions } from "./textures";
 import { TileTextureCompositor } from "./tileTexture";
 import {
-  type AbortControllers,
   type LayerDescription,
   type SourceDescription,
   type BuiltInEffectDescription,
@@ -158,7 +182,6 @@ import {
   type OmitType,
   type MeshCache,
   type PickedFeature,
-  type WorkerPoolPromises,
   type RenderFlag,
   type TileMapByHandle,
   type SourceRef,
@@ -168,8 +191,10 @@ import {
   isWorker,
   convertScreenPos,
   loadWebGPU,
+  positionIfStatic,
   type TextureSlot,
 } from "./utils";
+import { WaterState } from "./water/waterState";
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 /** @ts-ignore ignore: https://v3.vitejs.dev/guide/features.html#import-with-query-suffixes  */
 import WorkerURL from "./worker?url&worker";
@@ -191,6 +216,15 @@ export type FlyToOptions = {
   easing?: FlyToEasing;
 };
 
+/** In-flight worker tasks the engine may hold per pool worker: one running
+ * plus one queued, so a worker never idles between tasks. */
+const WORKER_TASKS_PER_WORKER = 2;
+
+/** In-flight frontend jobs stop holding off `idle` once their count has not
+ * changed for this long (a server that never answers, an image that never
+ * loads). */
+const STALLED_JOBS_MS = 10_000;
+
 // Must mirror `FlyToEasing`'s `TryFrom<u8>` mapping on the Rust side.
 const FLY_TO_EASING_CODE: Record<FlyToEasing, number> = {
   linear: 0,
@@ -208,6 +242,7 @@ export type {
   LatLngHeight,
   CameraOrientation,
   CameraPosition,
+  CameraState,
   ColorTuple,
   LUT,
   Globe,
@@ -226,6 +261,10 @@ export type {
 export * from "./constants";
 export * from "./light";
 export * from "./batchTexture";
+export {
+  SOLID_DASH_ROW,
+  createLineSegmentTextureReleasedOnUpload,
+} from "./lineDash";
 export * from "./mesh";
 export * from "./layer";
 export * from "./source";
@@ -234,6 +273,7 @@ export * from "./shaders";
 export * from "./material";
 export * from "./core";
 export { BufferView } from "./bufferView";
+export { createGltfLoader } from "./loaders";
 export * from "./plugins";
 export * from "./layers";
 export * from "./passes";
@@ -247,8 +287,21 @@ export {
 } from "./pick/pickHelper";
 export * from "@navaramap/three-api";
 export * from "./Color";
-export { type BlendMode, blendFunction, createReplacer } from "./utils";
+export {
+  type BlendMode,
+  blendFunction,
+  boundingSphereOfRte,
+  createReplacer,
+} from "./utils";
+export type { RenderTargetEntry } from "./utils/fixedGpuFootprint";
+
 export { Atmosphere, type AtmosphereOptions } from "./atmosphere";
+export type {
+  WaterState,
+  WaterUniforms,
+  WaterWaves,
+  WaterWavesRef,
+} from "./water/waterState";
 export type { Quality } from "./quality";
 export type { WebGpuDebugFlags } from "./orchestrators/RenderPassOrchestrator";
 export type { CustomObject3DEventMap } from "./object3DEvent";
@@ -273,10 +326,12 @@ export {
   getDefaultDynamicSse,
   getDefaultLodFog,
   getDefaultMemoryBudgets,
+  getDefaultSunShadow,
   MB,
   type DynamicSseSettings,
   type LodFogSettings,
   type MemoryBudgets,
+  type SunShadowDefaults,
 } from "./device";
 
 /**
@@ -319,7 +374,11 @@ export type WorkerMemoryStats = {
  * Configuration options for initializing ThreeView.
  */
 export type Options = {
-  /** Container element to append the canvas to. */
+  /**
+   * Container element to append the canvas to. The view follows its size, so
+   * it needs a size of its own. A statically positioned container is set to
+   * `position: relative` until the view is disposed.
+   */
   container?: HTMLElement;
   /** Canvas element for rendering. If not provided, a new canvas is created. */
   canvas?: HTMLCanvasElement | OffscreenCanvas;
@@ -342,7 +401,7 @@ export type Options = {
    * render targets grow quadratically with pixel ratio and dominate mobile
    * GPU memory. An explicit value bypasses the caps. */
   pixelRatio?: number;
-  /** Disables automatic resize handling on window resize events. */
+  /** Disables automatically resizing the view when its container changes size. */
   disableAutoResize?: boolean;
   /** Enables debug mode with performance stats overlay. */
   debug?: boolean;
@@ -376,7 +435,7 @@ export type Options = {
   /** Enables mobile device optimizations such as lower pixel ratio. */
   mobileOptimization?: boolean;
   /**
-   * Milliseconds of inactivity (no Rust-side events) before the `idle` event fires.
+   * Milliseconds of inactivity (no Rust-side events and no in-flight fetch / worker / mesh job) before the `idle` event fires. In-flight jobs stop counting once their number has not changed for 10 s.
    * @defaultValue 100
    */
   idleThreshold?: number;
@@ -407,6 +466,19 @@ export type Options = {
    */
   dynamicSse?: Partial<DynamicSseSettings>;
   /**
+   * Number of tile workers. Each has its own JS isolate and WASM heap, so a
+   * smaller pool uses less memory but loads tiles slower after fast camera
+   * moves. Clamped to an integer in `[1, navigator.hardwareConcurrency]`
+   * (with a console warning); also replaces the mobile cap. The default
+   * `memoryBudget.maxWorkerHeapBytes` is a fixed amount per worker on mobile
+   * and without `navigator.deviceMemory`, so there more workers mean more
+   * peak memory. Read only by `init()`. All views share one pool: the first
+   * view to `init()` sets its size, and a later view's value only logs a
+   * warning.
+   * @defaultValue `navigator.hardwareConcurrency` (at most 2 with `mobileOptimization`)
+   */
+  workerPoolSize?: number;
+  /**
    * Overrides for the worker-side memory budgets (per-tile-worker WASM heap
    * recycle threshold and the font worker's cache budget). Defaults derive
    * from the device memory together with `cacheBytes` — see
@@ -432,16 +504,6 @@ export type Options = {
     sseMultiplierMax?: number;
   };
   /**
-   * Enables shared water texture. When enabled, a single water normal texture
-   * is loaded once and shared across all meshes that have water effects enabled.
-   */
-  waterTexture?: {
-    /** Whether to enable the shared water texture. */
-    enabled: boolean;
-    /** Custom water normal texture URL. Uses built-in texture if not specified. */
-    url?: string;
-  };
-  /**
    * Attribution (credit) UI, on by default (accessed via
    * {@link ThreeView.attribution}). Pass `false` to opt out (e.g. to build your
    * own UI), or an object to configure the initial style / corner. Skipped in a
@@ -459,6 +521,24 @@ export type MapPointerEvent = {
   /** World coordinates (ECEF) at the pointer position on the globe surface. */
   map: XYZ;
 } & PointerEvent;
+
+/** Timings of one animation-loop tick, delivered by the `frame` event. */
+export type FrameTiming = {
+  /** The tick's `DOMHighResTimeStamp`. */
+  time: number;
+  /** Ticks since the loop started. */
+  tick: number;
+  /** Whether this tick rendered a frame. */
+  rendered: boolean;
+  /** `Core.update()`: the WASM tick. */
+  updateMs: number;
+  /** Reading the engine's events and running the frontend job handlers. */
+  eventsMs: number;
+  /** The render pass pipeline (0 when nothing was rendered). */
+  renderMs: number;
+  /** The whole tick, feature updates and idle bookkeeping included. */
+  totalMs: number;
+};
 
 /**
  * Event types emitted by ThreeView. Subscribe using `view.on(eventName, callback)`.
@@ -498,8 +578,17 @@ export type ViewEvents = {
   preRender: (t: number) => void;
   /** Emitted after rendering. With `animation: true`, fires every frame. Receives `DOMHighResTimeStamp` as a timestamp. */
   postRender: (t: number) => void;
+  /**
+   * Emitted at the end of every animation-loop tick, rendered or not, with
+   * the tick's timings. The same object is reused across ticks: copy what you
+   * keep. Timings are taken only while at least one listener is registered.
+   */
+  frame: (timing: FrameTiming) => void;
+
   /** @private Emitted when terrain height sampling completes. */
   _sample_terrain_height_received: (ev: TerrainHeightUpdatedEvent) => void;
+  /** @private Emitted when an observed terrain height range changes. */
+  _terrain_height_range_received: (ev: TerrainHeightRangeUpdatedEvent) => void;
   /** Emitted on pointerdown with map coordinates, for every input type. */
   pointerdown: (event: MapPointerEvent) => void;
   /** Emitted when a pointer enters the canvas with map coordinates, for every input type. */
@@ -520,8 +609,20 @@ export type ViewEvents = {
    * input kinds apart.
    */
   click: (event: MapPointerEvent) => void;
-  /** Emitted when the engine becomes idle (no Rust-side events for `idleThreshold` ms). */
+  /** Emitted when the engine becomes idle (no Rust-side events and no in-flight fetch / worker / mesh job for `idleThreshold` ms; jobs stalled for 10 s stop counting). */
   idle: () => void;
+  /** Emitted when a source is registered through `addSource`, with its description. */
+  sourceAdded: (source: Source, description: SourceDescription) => void;
+  /** Emitted when a resource layer is added through `addLayer`, with its description. */
+  layerAdded: (layer: Layer, description: LayerDescription) => void;
+  /** Emitted when a resource layer is deleted, after its `deleted` event. */
+  layerRemoved: (layer: Layer) => void;
+  /**
+   * Emitted once at the start of `dispose()`, while the view still works.
+   * Plugins are the caller's to dispose; a plugin can listen to release
+   * what it holds on the view.
+   */
+  disposed: () => void;
 };
 
 /**
@@ -544,12 +645,8 @@ export default class ThreeView<
 
   /** Handle for the sky environment map effect descriptor. Used for sky reflections. */
   private skyEnvMap!: EffectHandle<SkyEnvMapEffectDesc>;
-  /** Handle for the Multi-Render Target pass that outputs color and normal buffers. */
+  /** Handle for the Multi-Render Target pass that outputs color and the optional G-buffers. */
   private mrtPass!: EffectHandle<MRTPassEffectDesc>;
-  /** Handle for the transparent objects rendering pass. */
-  private transparentPass!: EffectHandle<TransparentPassEffectDesc>;
-  /** Handle for the final compositing pass that outputs to screen. */
-  private finalPass!: EffectHandle<FinalCopyEffectDesc>;
 
   /** The render pass orchestrator that manages the post-processing effect pipeline. */
   private renderPassOrchestrator: RenderPassOrchestrator;
@@ -560,14 +657,39 @@ export default class ThreeView<
   private _fontManager = new FontManager(FontWorkerURL);
   private _options: Options;
   private _stats: RendererStats | undefined;
+  /** Whether a `frame` listener exists; timings are taken only then. */
+  private _profiling = false;
+  private _frameTick = 0;
+  /** Reused across ticks (see the `frame` event). */
+  private _frameTiming: FrameTiming = {
+    time: 0,
+    tick: 0,
+    rendered: false,
+    updateMs: 0,
+    eventsMs: 0,
+    renderMs: 0,
+    totalMs: 0,
+  };
+
   private _eventDisposer: (() => void) | undefined;
+  /** Removes the view's own canvas listeners on dispose. */
+  private _canvasListeners = new AbortController();
   private _disposed = false;
   private _renderFlag: RenderFlag = {
     forceUpdate: false,
     animation: false,
   };
   /** Shared screen-space label declutterer for text/sprite features. */
-  private _declutter = new DeclutterManager(wasmDeclutterKernel);
+  private _declutter: DeclutterManager = new DeclutterManager(
+    wasmDeclutterKernel,
+    // Land the frame once the throttle allows the pass: an earlier one would
+    // only report "throttled" and reschedule. The main loop's frame time
+    // shares `performance.now()`'s origin.
+    () =>
+      this._scheduleDeclutterFrame(
+        this._declutter.remainingThrottleMs(performance.now()),
+      ),
+  );
   /** Reusable Vector2 for the declutter pass's per-frame viewport query. */
   private _declutterSize = new Vector2();
   /** Pending follow-up frame for a throttled declutter pass or an active
@@ -575,17 +697,36 @@ export default class ThreeView<
   private _declutterRetry: ReturnType<typeof setTimeout> | undefined;
   private _declutterRetryDelay = 0;
   private _isIdle = false;
+  /** Last frame a frontend job (fetch, worker task, mesh build) was still in
+   * flight; the view is not idle before `idleThreshold` has passed since. */
+  private _jobsBusyAt = 0;
+  private _jobsInFlight = 0;
+  /** Last frame the in-flight job count changed. */
+  private _jobsProgressedAt = 0;
+  private _workerPoolSize = 0;
+  private _releaseWorkerPool: (() => void) | undefined;
+  /** The delegated-task cap last sent to the engine. */
+  private _maxWorkerTasks = 0;
+  /** Whether the engine's worker-task intake is paused because every pool
+   * worker is draining (over its heap budget). */
+  private _workerIntakePaused = false;
+  /** Pool tasks outside the engine's delegated tasks, as last reported. */
+  private _workerExternalLoad = 0;
+  private _workerTaskJobs?: RegisteredJobKind;
   private _uniforms: CommonUniforms;
   /** Pending `flyTo` promises keyed by flight id, settled by
    *  `camera_flight_ended` events from the engine. */
   private _pendingFlights = new Map<number, (completed: boolean) => void>();
+  /** {@link observeTerrainHeightRange} callbacks by observer entity bits. */
+  private _terrainHeightRangeObservers = new Map<
+    TerrainHeightRangeUpdatedEvent["bits"],
+    (range: { min: number; max: number }) => void
+  >();
 
   /** Currently hovered feature, used to diff-synthesize hover events. */
   private _hoveredFeature: Nullable<PickedFeature> = null;
 
   private _meshes: MeshCache = new Map();
-  private _abortControllers: AbortControllers = new Map();
-  private _workerPoolPromises: WorkerPoolPromises = new Map();
   private _loadedTexs = new Map<string, Texture>();
   private _texturizedSceneByTileCoordinates: TexturizedSceneByTileCoordinates;
   private _tileTextureCompositor!: TileTextureCompositor;
@@ -603,6 +744,9 @@ export default class ThreeView<
   // Hillshade processing context
   // Scoped to this view instance to prevent cross-view contamination
   private _hillshadeContext = new HillshadeContext();
+  // ColorMap atlas for elevation heatmap layers
+  // Manages 2D texture containing all layers' colorMaps
+  private _colorMapAtlas = new ColorMapAtlas();
   private _initialized = false;
 
   /**
@@ -756,8 +900,8 @@ export default class ThreeView<
     triggerDataRequesterLoaded: (bits: bigint, handle: number) => {
       this._core?.triggerDataRequesterLoaded(bits, handle);
     },
-    triggerDataRequesterFailed: (bits: bigint) => {
-      this._core?.triggerDataRequesterFailed(bits);
+    triggerDataRequesterFailed: (bits: bigint, handle: number) => {
+      this._core?.triggerDataRequesterFailed(bits, handle);
     },
   };
   private _texFragment: TextureFragmentHandler = {
@@ -768,13 +912,10 @@ export default class ThreeView<
       this._core?.triggerTextureFragmentLoaded(bits, status);
     },
   };
-  // Per-frame snapshot of the WASM vector resolution revision, refreshed in `_render`.
-  private _vectorRevision = 0;
   // Per-frame snapshot of the WASM raster drape resolution revision, refreshed in `_render`.
   private _rasterRevision = 0;
   private _tileHandler: TileHandler = createTileHandler({
     getCore: () => this._core,
-    getVectorRevision: () => this._vectorRevision,
     getRasterRevision: () => this._rasterRevision,
   });
   private _globeHandler: GlobeHandler = {
@@ -803,9 +944,6 @@ export default class ThreeView<
     getWireframe: () => {
       return this._core?.getGlobeWireframe();
     },
-    getElevationColormap: () => {
-      return this._core?.getGlobeElevationColormap();
-    },
     setTransparent: (value: boolean) => {
       this._core?.setGlobeTransparent(value);
     },
@@ -829,27 +967,6 @@ export default class ThreeView<
     },
     setWireframe: (value: boolean) => {
       this._core?.setGlobeWireframe(value);
-    },
-    setElevationColormap: (value: ColorMap) => {
-      this._core?.setGlobeElevationColormap(value.flatten());
-
-      const canvas = value.createImage();
-      const texture = new Texture(canvas);
-      texture.wrapS = ClampToEdgeWrapping;
-      texture.wrapT = ClampToEdgeWrapping;
-      texture.minFilter = LinearFilter;
-      texture.magFilter = LinearFilter;
-      texture.generateMipmaps = false;
-      texture.flipY = false;
-      texture.needsUpdate = true;
-
-      this._uniforms.colorMapTexture.value = texture;
-
-      // Track additional texture usage
-      this._defaultTextureOptions.additionalTexturesInUse = {
-        ...this._defaultTextureOptions.additionalTexturesInUse,
-        colorMapTexture: true,
-      };
     },
   };
   private _workerTaskHandler: WorkerTaskHandler = {
@@ -896,8 +1013,17 @@ export default class ThreeView<
       return this._core?.getLayerIndex(layerId);
     },
   };
-  private _ownedRootElement: HTMLElement | undefined;
-  private _eventManager = new EventManager();
+  /** The element the view created itself; removed on dispose. */
+  private _ownedElement: HTMLElement | undefined;
+  private _restoreContainer: (() => void) | undefined;
+  private _resizeObserver: ResizeObserver | undefined;
+  private _resizePending = false;
+  private _dispatcher = new JobDispatcher({
+    // A job landed something new on screen (tile mesh, feature, texture).
+    onSettled: () => {
+      this._renderFlag.forceUpdate = true;
+    },
+  });
   private _pickHelper?: PickHelper;
   private _terrainPicker: TerrainPicker;
   private _webgpuEnvironment?: WebGPUEnvironment;
@@ -983,20 +1109,31 @@ export default class ThreeView<
     this._buffers = resolveGBufferOptions();
 
     if (!options.canvas) {
-      const div = document.createElement("div");
-      div.id = "navara-root";
-      div.style.width = "100vw";
-      div.style.height = "100vh";
-
       options.canvas = document.createElement("canvas");
       options.canvas.id = "navara-canvas";
+      // Out of flow: the canvas is sized in px to match its container, so in
+      // flow it would keep the container from shrinking.
+      options.canvas.style.position = "absolute";
+      options.canvas.style.top = "0";
+      options.canvas.style.left = "0";
       options.canvas.style.width = "100%";
       options.canvas.style.height = "100%";
 
-      div.appendChild(options.canvas);
+      if (options.container) {
+        this._restoreContainer = positionIfStatic(options.container);
+        this._ownedElement = options.canvas;
+      } else {
+        const div = document.createElement("div");
+        div.id = "navara-root";
+        div.style.position = "relative";
+        div.style.width = "100vw";
+        div.style.height = "100vh";
 
-      document.body.appendChild(div);
-      this._ownedRootElement = div;
+        div.appendChild(options.canvas);
+
+        document.body.appendChild(div);
+        this._ownedElement = div;
+      }
     }
 
     this._options = options;
@@ -1015,9 +1152,13 @@ export default class ThreeView<
     this._terrainPicker = new TerrainPicker();
 
     // disable right-click
-    options.canvas?.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-    });
+    options.canvas?.addEventListener(
+      "contextmenu",
+      (e) => {
+        e.preventDefault();
+      },
+      { signal: this._canvasListeners.signal },
+    );
 
     const renderer =
       options.renderer ??
@@ -1109,8 +1250,12 @@ export default class ThreeView<
     }
 
     this.renderPassOrchestrator.setSize(width, height);
-    this.renderPassOrchestrator.onPassesChanged = () =>
+    this.renderPassOrchestrator.onPassesChanged = () => {
       this._scheduleFixedGpuBytesReport();
+      // The context exists once `init()` has run; the built-in passes are
+      // registered after it, so nothing is missed before then.
+      (this.viewContext as ViewContext | undefined)?.emit("passesChanged");
+    };
 
     // Background color
     const bgColor = options.backgroundColor
@@ -1119,7 +1264,13 @@ export default class ThreeView<
     this._renderer.setClearColor(bgColor);
 
     if (!options.disableAutoResize && !isWorker()) {
-      window.addEventListener("resize", this._handleResize);
+      // Observers are notified after the frame has rendered and resizing
+      // clears the canvas, so the main loop applies the new size right before
+      // it renders.
+      this._resizeObserver = new ResizeObserver(() => {
+        this._resizePending = true;
+      });
+      this._resizeObserver.observe(this._getSizeElement());
       // Observe a change in devicePixelRatio.
       this.pixelRatioMatchedMedia = window.matchMedia(
         `(resolution: ${window.devicePixelRatio}dppx)`,
@@ -1136,7 +1287,6 @@ export default class ThreeView<
       if (t) {
         this._stats = new RendererStats(
           {
-            beginRender: () => this._renderer.info.reset(),
             endRender: () => ({
               ...this._renderer.info.render,
               memGeometries: this._renderer.info.memory.geometries,
@@ -1190,8 +1340,21 @@ export default class ThreeView<
       fov: { value: (this._camera.raw.fov * Math.PI) / 180 },
       screenHeightPx: { value: height },
       time: { value: 0 },
-      colorMapTexture: { value: null },
-      waterTexture: { value: null },
+      water: new WaterState(
+        (
+          this._renderer as {
+            capabilities?: { getMaxAnisotropy?: () => number };
+            getMaxAnisotropy?: () => number;
+          }
+        ).capabilities?.getMaxAnisotropy?.() ??
+          (this._renderer as { getMaxAnisotropy?: () => number })
+            .getMaxAnisotropy?.() ??
+          1,
+        () => queueTask("generateWaveTexture"),
+      ),
+      terrainExaggeration: { value: IDENTITY_TERRAIN_EXAGGERATION },
+      // Set from the engine's first `terrain_exaggeration_updated` event.
+      horizonMinHeight: { value: 0 },
     };
 
     // This is necessary to avoid attaching a texture beyond the max textures capabilities of GPU.
@@ -1224,28 +1387,7 @@ export default class ThreeView<
         Math.max(caps?.maxTextures ?? 16, 8) - NUM_CASCADED_SHADOW_MAPS,
     };
 
-    // Load shared water texture if enabled
-    if (options.waterTexture?.enabled) {
-      const waterUrl = options.waterTexture.url ?? WATER_NORMAL_URL;
-      this._uniforms.waterTexture.value = TEXTURE_LOADER.load(
-        waterUrl,
-        (texture) => {
-          texture.wrapS = RepeatWrapping;
-          texture.wrapT = RepeatWrapping;
-        },
-      );
-      // Track additional texture usage
-      this._defaultTextureOptions.additionalTexturesInUse = {
-        ...this._defaultTextureOptions.additionalTexturesInUse,
-        waterTexture: true,
-      };
-    }
-
-    this._atmosphere = new Atmosphere(
-      this._renderer,
-      options.atmosphere,
-      this._camera,
-    );
+    this._atmosphere = new Atmosphere(options.atmosphere, this._camera);
     this._atmosphere.on("needsUpdate", this.forceUpdate);
     // Textures load lazily, kicked off by the first consumer registering via
     // onTexturesReady(); re-render whenever they arrive.
@@ -1295,10 +1437,10 @@ export default class ThreeView<
         // debugNormal: true,
       },
     });
-    this.transparentPass = this.addEffect<TransparentPassEffectDesc>({
+    this.addEffect<TransparentPassEffectDesc>({
       transparent: {},
     });
-    this.finalPass = this.addEffect<FinalCopyEffectDesc>({
+    this.addEffect<FinalCopyEffectDesc>({
       final: {},
     });
   }
@@ -1476,6 +1618,16 @@ export default class ThreeView<
     };
   }
 
+  /** Screen center in CSS client coordinates. */
+  private _viewportCenter(): [number, number] {
+    const rect = this._renderer.domElement.getBoundingClientRect();
+    return [rect.left + rect.width / 2, rect.top + rect.height / 2];
+  }
+
+  private _distanceFromCamera(pos: Nullable<Vector3>): number | null {
+    return pos ? this._camera.raw.position.distanceTo(pos) : null;
+  }
+
   private get globeDepthTexture() {
     return this.renderPass.globeDepthCopyPass.texture;
   }
@@ -1506,7 +1658,7 @@ export default class ThreeView<
    * Must be called before using the view.
    */
   async init() {
-    if (this._core || this._initialized) return;
+    if (this._core || this._initialized || this._disposed) return;
 
     this._initialized = true;
 
@@ -1518,7 +1670,10 @@ export default class ThreeView<
     }
 
     const mobileOptimized = this.isMobileOptimized();
-    const concurrencyManager = createDefaultConcurrencyManager(mobileOptimized);
+    const defaultConcurrencyManager = createDefaultConcurrencyManager(
+      mobileOptimized,
+      this._options.workerPoolSize,
+    );
     if (mobileOptimized) {
       this._hillshadeContext.normalMapScale = 0.5;
     }
@@ -1527,21 +1682,45 @@ export default class ThreeView<
     // tile-worker pool, and the font worker derive their budgets together.
     const budgets = getDefaultMemoryBudgets({
       isMobile: mobileOptimized,
-      poolSize: concurrencyManager.total,
+      // A later view joins the live pool, so split the heap budget over the
+      // workers it actually has.
+      poolSize: sharedWorkerPoolSize() ?? defaultConcurrencyManager.total,
     });
 
-    initializeWorkerPool(WorkerURL, concurrencyManager, {
+    // Every view on the page shares one pool; the first view's settings
+    // create it.
+    const workerPool = acquireWorkerPool(WorkerURL, defaultConcurrencyManager, {
       // A worker over this WASM heap budget is recycled; tighter on mobile,
       // where the process is killed at much lower memory pressure.
       maxWorkerHeapBytes:
         this._options.memoryBudget?.maxWorkerHeapBytes ??
         budgets.maxWorkerHeapBytes,
     });
+    this._releaseWorkerPool = workerPool.release;
+
+    try {
+      await this._initWithWorkerPool(workerPool, mobileOptimized, budgets);
+    } catch (e) {
+      workerPool.release();
+      // Nothing was built yet, so a later init() can retry.
+      if (!this._core && !this._disposed) this._initialized = false;
+      throw e;
+    }
+  }
+
+  private async _initWithWorkerPool(
+    workerPool: WorkerPoolLease,
+    mobileOptimized: boolean,
+    budgets: MemoryBudgets,
+  ) {
+    const concurrencyManager = workerPool.manager;
 
     // Fetch WASM resources. Atmosphere textures are not fetched here: they
     // load lazily once a consumer (sky, sun light, aerial perspective, ...)
     // registers via atmosphere.onTexturesReady().
-    await Promise.all([initCore(), initNavaraApi()]);
+    await Promise.all([initEngine(), initNavaraApi()]);
+    // dispose() during the await already released the pool.
+    if (this._disposed) return;
 
     this._core = new Core(newId());
     this._core.start();
@@ -1556,6 +1735,7 @@ export default class ThreeView<
       this._options.memoryBudget?.maxPendingRequests ??
         budgets.maxPendingRequests,
     );
+    this._workerPoolSize = concurrencyManager.total;
 
     // Memory-pressure SSE degrade range. min > 1 (mobile) keeps far tiles
     // coarser at rest; max is the ceiling the dynamic degrade can climb to
@@ -1603,7 +1783,7 @@ export default class ThreeView<
       ),
     );
 
-    this._fontManager.setConcurrencyManager(concurrencyManager);
+    this._fontManager.setWorkerCoreReservation(reserveWorkerCore);
     this._fontManager.setMemoryBudget(
       this._options.memoryBudget?.fontBudgetBytes ?? budgets.fontBudgetBytes,
     );
@@ -1618,16 +1798,18 @@ export default class ThreeView<
       concurrencyManager,
       this._core,
       this._meshes,
+      this._uniforms,
+      this._dispatcher,
     );
     this.registries = new Registries(this, this.viewContext);
-    this.viewContext.on("meshPassKeyChanged", this._syncGBuffers);
+
+    this.viewContext.on("gbufferRequirementsChanged", this._syncGBuffers);
     this.viewContext._setRegistries(this.registries);
     this.eventContext = new EventContext({
-      eventManager: this._eventManager,
+      dispatcher: this._dispatcher,
       scenes: this._scenes,
       camera: this._camera,
       meshes: this._meshes,
-      abortControllers: this._abortControllers,
       buf: this._buf,
       texFragment: this._texFragment,
       tileHandler: this._tileHandler,
@@ -1635,7 +1817,6 @@ export default class ThreeView<
       meshHandler: this._meshHandler,
       featureHandler: this._featureHandler,
       loadedTexs: this._loadedTexs,
-      workerPoolPromises: this._workerPoolPromises,
       uniforms: this._uniforms,
       texturizedSceneByTileCoordinates: this._texturizedSceneByTileCoordinates,
       tileTextureCompositor: this._tileTextureCompositor,
@@ -1658,25 +1839,39 @@ export default class ThreeView<
       tileMeshToFragmentIds: this._tileMeshToFragmentIds,
       hillshadeContext: this._hillshadeContext,
       declutter: this._declutter,
+      colorMapAtlas: this._colorMapAtlas,
     });
+    this._workerTaskJobs = registerEventHandlers(this.eventContext).workerTasks;
 
     // Register built-in descriptors
     this.registerBuiltIns();
 
     if (!isWorker()) {
+      // Input deltas are scaled by the distance to whatever is under the
+      // screen center; served from a cache so wheel bursts don't each block
+      // on a GPU readback.
+      const terrainDistance = new TerrainDistanceCache(
+        () =>
+          this._distanceFromCamera(
+            this.pickDepthPosition(...this._viewportCenter()),
+          ),
+        async () => {
+          const [x, y] = this._viewportCenter();
+          const pos = await this._terrainPicker.pickAsync(
+            x,
+            y,
+            this._renderer,
+            this.depthTexture,
+            this._camera.raw,
+          );
+          return this._distanceFromCamera(pos);
+        },
+      );
       this._eventDisposer = registerInputEvents(
         this._core,
         this._renderer.domElement,
-        () => {
-          const el = this._renderer.domElement;
-          const rect = el.getBoundingClientRect();
-          const pos = this.pickDepthPosition(
-            rect.left + rect.width / 2,
-            rect.top + rect.height / 2,
-          );
-          if (!pos) return null;
-          return this._camera.raw.position.distanceTo(pos);
-        },
+        () => terrainDistance.get(),
+        () => this._camera._isZoomEnabled(),
       );
       this._pickHelper = new PickHelper(
         this._renderer.domElement,
@@ -1695,6 +1890,8 @@ export default class ThreeView<
             this.size("featureEnter") ||
             this.size("featureLeave")
           ),
+        this._uniforms.tGlobeDepth,
+        this._scenes.globe,
         // {
         //   debug: true,
         // },
@@ -1723,12 +1920,16 @@ export default class ThreeView<
 
     // Warm up workers. Non-blocking: warms one worker, the rest follow
     // in the background off the HTTP cache; tasks dispatched to a still-cold
-    // worker just await WASM inside the task.
-    warmUpWorkerPool().catch((e) =>
-      console.error("Failed to warm up the worker pool:", e),
-    );
+    // worker just await WASM inside the task. Only the view that created the
+    // shared pool warms it.
+    if (workerPool.created) {
+      warmUpWorkerPool().catch((e) =>
+        console.error("Failed to warm up the worker pool:", e),
+      );
+    }
 
     await Promise.all(this.plugins.map((p) => p.init(this, this.viewContext)));
+    if (this._disposed) return;
 
     this._startMainLoop();
 
@@ -1745,8 +1946,16 @@ export default class ThreeView<
     // tolerance, with no pinch and no cancellation. Camera drags never
     // fire it.
     let clickStart: Vector2 | undefined;
+    const canvas = this._renderer.domElement;
+    const listen = <K extends keyof HTMLElementEventMap>(
+      type: K,
+      listener: (event: HTMLElementEventMap[K]) => void,
+    ) =>
+      canvas.addEventListener(type, listener, {
+        signal: this._canvasListeners.signal,
+      });
 
-    this._renderer.domElement.addEventListener("pointerdown", (event) => {
+    listen("pointerdown", (event) => {
       // A second finger turns the gesture into a pinch, not a tap.
       clickStart =
         event.isPrimary && event.button === 0
@@ -1758,28 +1967,28 @@ export default class ThreeView<
       }
     });
 
-    this._renderer.domElement.addEventListener("pointerenter", (event) => {
+    listen("pointerenter", (event) => {
       const mapEvent = this.convertToMapEvent(event);
       if (mapEvent) {
         this.emit("pointerenter", mapEvent);
       }
     });
 
-    this._renderer.domElement.addEventListener("pointerleave", (event) => {
+    listen("pointerleave", (event) => {
       const mapEvent = this.convertToMapEvent(event);
       if (mapEvent) {
         this.emit("pointerleave", mapEvent);
       }
     });
 
-    this._renderer.domElement.addEventListener("pointermove", (event) => {
+    listen("pointermove", (event) => {
       const mapEvent = this.convertToMapEvent(event);
       if (mapEvent) {
         this.emit("pointermove", mapEvent);
       }
     });
 
-    this._renderer.domElement.addEventListener("pointerup", (event) => {
+    listen("pointerup", (event) => {
       const mapEvent = this.convertToMapEvent(event);
       if (mapEvent) {
         this.emit("pointerup", mapEvent);
@@ -1803,7 +2012,7 @@ export default class ThreeView<
       }
     });
 
-    this._renderer.domElement.addEventListener("pointercancel", (event) => {
+    listen("pointercancel", (event) => {
       clickStart = undefined;
       this.emit("pointercancel", event);
     });
@@ -1814,8 +2023,20 @@ export default class ThreeView<
    * Call this when the view is no longer needed.
    */
   dispose() {
+    if (!this._disposed) {
+      try {
+        this.emit("disposed");
+      } catch (error) {
+        console.error("A disposed listener threw:", error);
+      }
+    }
     this._disposed = true;
     this._initialized = false;
+    // Released first so a throw below, or an init() still in flight, cannot
+    // keep the shared worker pool alive. The last view to release it
+    // terminates it.
+    this._releaseWorkerPool?.();
+    this._releaseWorkerPool = undefined;
     // Settle pending flyTo promises so callers never hang on a disposed view.
     for (const resolve of this._pendingFlights.values()) {
       resolve(false);
@@ -1829,7 +2050,8 @@ export default class ThreeView<
     this._attribution?.dispose();
     this._attribution = undefined;
     if (!isWorker()) {
-      window.removeEventListener("resize", this._handleResize);
+      this._resizeObserver?.disconnect();
+      this._resizeObserver = undefined;
       this.pixelRatioMatchedMedia?.removeEventListener(
         "change",
         this._handleResize,
@@ -1840,6 +2062,7 @@ export default class ThreeView<
       this._eventDisposer();
       this._eventDisposer = undefined;
     }
+    this._canvasListeners.abort();
 
     if (this._pickHelper) {
       this._pickHelper.dispose();
@@ -1850,19 +2073,28 @@ export default class ThreeView<
       this._terrainPicker.dispose();
     }
 
-    this._fontManager.dispose();
-    this._atmosphere._dispose();
-
-    this.skyEnvMap?.delete();
-    this.mrtPass?.delete();
-    this.transparentPass?.delete();
-    this.finalPass?.delete();
-
-    // Abort all pending requests
-    for (const controller of this._abortControllers.values()) {
-      controller.abort();
+    // Abort all in-flight jobs (fetches, worker tasks, mesh builds).
+    this._dispatcher.dispose();
+    // Live meshes are the view's to dispose. Their removal releases into the
+    // font manager, declutter and tile compositor, so it runs before those.
+    if (this.eventContext) {
+      disposeAllObjects(this.eventContext);
     }
-    this._abortControllers.clear();
+
+    // Delete every descriptor, so each disposes what it created. Newest
+    // first: the built-in passes (MRT, final) are added before the effects
+    // that read their buffers.
+    for (const handle of [...this.layersManager.getHandles()].reverse()) {
+      try {
+        handle.delete();
+      } catch (error) {
+        console.error("Failed to delete a descriptor on dispose:", error);
+      }
+    }
+
+    this._fontManager.dispose();
+    this._uniforms.water.dispose();
+    this._atmosphere._dispose();
 
     // Dispose loaded textures (closes any ImageBitmap backing so the decoded
     // pixels are freed, not just the GL texture).
@@ -1875,6 +2107,9 @@ export default class ThreeView<
     // Cleanup hillshade context (temp DEMs, generator, etc.)
     this._hillshadeContext.dispose();
 
+    // Elevation heatmap colorMap atlas texture and stored colorMaps
+    this._colorMapAtlas.dispose();
+
     // Drop declutter participants so the manager doesn't retain removed
     // meshes' GPU/font resources past this view's lifetime.
     this._declutter.dispose();
@@ -1882,7 +2117,6 @@ export default class ThreeView<
     // Clear caches and maps
     this._meshes.clear();
     this._inMemoryBufferStore.clear();
-    this._workerPoolPromises.clear();
     this._tileMapByHandle.clear();
     this._textureFragmentIndex.clear();
     this._tileMeshToFragmentIds.clear();
@@ -1893,6 +2127,8 @@ export default class ThreeView<
     // Release per-tile composite atlases, cached shader materials, placeholder
     // textures, and the fullscreen quad geometry owned by the compositor.
     this._tileTextureCompositor.dispose();
+    // Unset while init() is still awaiting the WASM modules.
+    this.viewContext?._dispose();
 
     // Clean up WASM core
     this._core?.free();
@@ -1911,12 +2147,11 @@ export default class ThreeView<
       this._renderer.dispose();
     }
 
-    // Remove auto-created DOM container so a new ThreeView can append its own
-    this._ownedRootElement?.remove();
-    this._ownedRootElement = undefined;
-
-    // Reset worker pool so a new ThreeView can reinitialize it
-    terminateWorkerPool();
+    // Remove the auto-created DOM so a new ThreeView can append its own
+    this._ownedElement?.remove();
+    this._ownedElement = undefined;
+    this._restoreContainer?.();
+    this._restoreContainer = undefined;
   }
 
   /**
@@ -2023,20 +2258,143 @@ export default class ThreeView<
     }
     this._uniforms.inverseProjectionMatrix.value =
       this._camera.raw.projectionMatrixInverse;
+    this._uniforms.water.setSkyEnvMap(this._uniforms.tSkyEnvMap.value ?? null);
 
     // Vertical fov in radians (raw.fov is kept in sync with the engine).
     this._uniforms.fov.value = fovY;
     this._uniforms.screenHeightPx.value = viewport?.height ?? 0;
   }
 
+  /**
+   * Syncs a layer's elevation heatmap colorMap / colorStops into the atlas.
+   * Tiles are not marked here: Rust keeps hashes of both arrays in the layer's
+   * elevation heatmap config, so a change fails the per-tile material
+   * comparison and re-composites exactly the tiles drawing this layer (see
+   * `withExplicitColorRampClears` in layer.ts for how an explicit clear
+   * reaches Rust). Called from `addLayer` and on the layer's "updated" and
+   * "deleted" events. Atlas rows may
+   * shift on add/remove, but composites resolve rows when they run and bake
+   * final colors, so other layers' tiles stay valid.
+   *
+   * Mirrors Rust's partial-update merge: `colorMap` and `colorStops` each keep
+   * their current value when an update omits them (or omits `elevationHeatmap`
+   * entirely). An explicit `undefined` clears that one: no `colorMap` means the
+   * default grayscale, no `colorStops` means evenly spaced colors. Deleting the
+   * layer (`l === undefined`) clears both.
+   */
+  private _syncColorMap(layerId: string, l: LayerDescription | undefined) {
+    // Elevation heatmap layers sample the shared colorMap atlas: reserve its
+    // texture unit for tiles created from now on (once).
+    if (
+      l?.type === "raster" &&
+      l.elevationHeatmap &&
+      !this._defaultTextureOptions.additionalTexturesInUse?.colorMapTexture
+    ) {
+      this._defaultTextureOptions.additionalTexturesInUse = {
+        ...this._defaultTextureOptions.additionalTexturesInUse,
+        colorMapTexture: true,
+      };
+    }
+    let colorMap: Float32Array | undefined;
+    let colorStops: Float32Array | undefined;
+    if (l !== undefined) {
+      const elevationHeatmap =
+        l.type === "raster" ? l.elevationHeatmap : undefined;
+      const hasColorMap = !!elevationHeatmap && "colorMap" in elevationHeatmap;
+      const hasColorStops =
+        !!elevationHeatmap && "colorStops" in elevationHeatmap;
+      if (!hasColorMap && !hasColorStops) return; // keep the current ramp
+      const current = this._colorMapAtlas.get(layerId);
+      // Plain number arrays (JS callers, JSON-defined layers) are accepted
+      // too, as Rust accepts them.
+      // An empty array is how withExplicitColorRampClears forwards an
+      // explicit clear.
+      const asArray = (v: unknown) => {
+        const array =
+          v instanceof Float32Array
+            ? v
+            : Array.isArray(v)
+              ? Float32Array.from(v as number[])
+              : undefined;
+        return array?.length ? array : undefined;
+      };
+      colorMap = hasColorMap
+        ? asArray(elevationHeatmap.colorMap)
+        : current?.colorMap;
+      colorStops = hasColorStops
+        ? asArray(elevationHeatmap.colorStops)
+        : current?.colorStops;
+    }
+    // The atlas texture is rebuilt lazily by the next tile composite.
+    this._colorMapAtlas.setColorMap(layerId, colorMap, colorStops);
+  }
+
+  /**
+   * Report the worker pool's state to the engine's worker-task admission:
+   *
+   * - The cap: two tasks per pool slot that takes tasks, so the pool's queue
+   *   stays shallow and a waiting task is at most one pool pass away. Slots
+   *   reserved for a thread outside the pool (`reserveWorkerCore`) take
+   *   none, which leaves their cores idle.
+   * - The pool tasks outside its delegated tasks (image decodes, Draco,
+   *   descriptor and plugin tasks, tasks cancelled while running), which take
+   *   from the same cap, so a burst of them does not queue the next terrain
+   *   mesh behind it. Each in-flight delegated job holds one pool task.
+   *   Other views on the shared pool count as external load too, but only
+   *   up to the cap minus this view's even share, so one view cannot take
+   *   every slot while another has tasks waiting.
+   * - Whether to pause intake (and model feature adds and image fetches,
+   *   which also run on the pool) while every pool worker is over its heap
+   *   budget, so the draining workers reach a task boundary and recycle
+   *   instead of receiving more work; it resumes once a recycled worker is
+   *   back.
+   */
+  private _syncWorkerPool() {
+    const maxTasks =
+      (this._workerPoolSize - workerPoolReservedSlots()) *
+      WORKER_TASKS_PER_WORKER;
+    if (maxTasks !== this._maxWorkerTasks) {
+      this._maxWorkerTasks = maxTasks;
+      this._core?.setMaxWorkerTasks(maxTasks);
+    }
+
+    let external = Math.max(
+      0,
+      workerPoolLoad() - (this._workerTaskJobs?.inFlight() ?? 0),
+    );
+    const holders = workerPoolHolders();
+    if (holders > 1) {
+      const fairShare = Math.floor(maxTasks / holders);
+      external = Math.min(external, maxTasks - fairShare);
+    }
+    if (external !== this._workerExternalLoad) {
+      this._workerExternalLoad = external;
+      this._core?.setWorkerExternalLoad(external);
+    }
+
+    const paused = !canWorkerPoolAcceptTasks();
+    if (paused === this._workerIntakePaused) return;
+    this._workerIntakePaused = paused;
+    this._core?.setWorkerIntakePaused(paused);
+  }
+
   /** Returns true if the scene was updated and needs to be rendered. */
   private _update(updatedAt: number): boolean {
     this.emit("preUpdate", updatedAt);
 
+    this._syncWorkerPool();
+    const timing = this._profiling ? this._frameTiming : undefined;
+    let t = timing ? performance.now() : 0;
     this._core?.update(updatedAt);
+    if (timing) {
+      const now = performance.now();
+      timing.updateMs = now - t;
+      timing.eventsMs = 0;
+      t = now;
+    }
 
     const events = this._core?.readEvents();
-    if ((!events && !this._eventManager.needsUpdate()) || !this._core) {
+    if (!events || !this._core) {
       return false;
     }
 
@@ -2045,6 +2403,7 @@ export default class ThreeView<
     processEvent(this.eventContext, events);
 
     events?.free();
+    if (timing) timing.eventsMs = performance.now() - t;
 
     // Evict JS-side `InMemoryBufferStore` entries whose WASM `External` handles
     // Rust freed this frame (tile destroy, DataRequester removal, ...), keeping
@@ -2093,15 +2452,19 @@ export default class ThreeView<
   }
 
   private _render(updatedAt: number) {
-    // Read the vector/raster resolution revisions once per frame so each terrain
-    // tile's `onBeforeRender` can gate its slot re-fetch against them without its
-    // own FFI calls.
-    this._vectorRevision = this._core?.vectorRevision() ?? this._vectorRevision;
+    // Read the raster resolution revision once per frame so each terrain tile's
+    // `onBeforeRender` can gate its slot re-fetch against it without its own FFI
+    // call.
     this._rasterRevision = this._core?.rasterRevision() ?? this._rasterRevision;
 
     this._uniforms.time.value = updatedAt;
+    this._uniforms.water.update(
+      this._camera.raw.position,
+      this._camera.raw.matrixWorldInverse,
+      updatedAt,
+    );
 
-    this._atmosphere._update();
+    this._atmosphere._update(this._uniforms.terrainExaggeration.value);
 
     // WebGPU path: sync sky/sun/shadow frustum, then refresh the shadow
     // map for this frame (autoUpdate is off, like the WebGL path).
@@ -2123,6 +2486,7 @@ export default class ThreeView<
         size.x / pixelRatio,
         size.y / pixelRatio,
         updatedAt,
+        this._uniforms.horizonMinHeight.value,
       );
       if (result === "throttled") {
         this._scheduleDeclutterFrame(
@@ -2132,6 +2496,10 @@ export default class ThreeView<
         // Keep frames coming at fade cadence until every label reaches its
         // placement target.
         this._scheduleDeclutterFrame(16);
+      } else if (this._declutterRetry !== undefined) {
+        // This frame's pass consumed what asked for the pending frame.
+        clearTimeout(this._declutterRetry);
+        this._declutterRetry = undefined;
       }
     }
 
@@ -2139,6 +2507,10 @@ export default class ThreeView<
 
     this.renderPassOrchestrator.render();
     this._pickHelper?.renderDebugCanvas();
+
+    for (const tile of this._tileMapByHandle.values()) {
+      tile.releaseDrapeGpuMemoryUnlessDrawn();
+    }
 
     this.shadowMapViewers.render(this._renderer);
 
@@ -2217,7 +2589,31 @@ export default class ThreeView<
     );
     this.layersManager.add(layer);
 
+    this._syncColorMap(layerId, l);
+    // `layer.update()` and `updateLayerById()` both emit "updated".
+    layer.on("updated", (desc) => this._syncColorMap(layerId, desc));
+    layer.on("deleted", () => {
+      this._syncColorMap(layerId, undefined);
+      this.emit("layerRemoved", layer);
+    });
+    this.emit("layerAdded", layer, l);
+
     return layer;
+  }
+
+  /** The resource layers currently added, in insertion order. */
+  get layers(): Iterable<Layer> {
+    return this.layersManager.getResourceLayers();
+  }
+
+  /**
+   * The registered description of a source, as the engine holds it, or
+   * `undefined` for an unknown id.
+   */
+  getSourceDescription(source: SourceRef): SourceDescription | undefined {
+    const sourceId = source instanceof Source ? source.id : source;
+    return this._core?.getSourceDescription(sourceId) as
+      SourceDescription | undefined;
   }
 
   /**
@@ -2232,7 +2628,9 @@ export default class ThreeView<
     invariant(s.type);
     const sourceId = this._core.addSource(s);
 
-    return new Source(sourceId, s.type, this._core);
+    const source = new Source(sourceId, s.type, this._core);
+    this.emit("sourceAdded", source, s);
+    return source;
   }
 
   /**
@@ -2262,6 +2660,16 @@ export default class ThreeView<
     });
   }
 
+  /** Subscribes a descriptor's hook to a view event until its handle is deleted. */
+  private _hookUntilDeleted<E extends "preRender" | "resize">(
+    handle: BaseHandle,
+    event: E,
+    listener: ViewEvents[E],
+  ): void {
+    this.on(event, listener);
+    handle.on("deleted", () => this.off(event, listener));
+  }
+
   /**
    * Adds a 3D mesh to the scene.
    * The mesh kind is determined by the nested key (e.g., `{ box: { width: 200 } }`).
@@ -2280,6 +2688,18 @@ export default class ThreeView<
     // Create mesh descriptor instance
     const meshDesc = this.registries.mesh.create(meshType, config);
 
+    try {
+      this._assertGBufferCapacity(
+        meshDesc.getRequiredBuffers(),
+        `"${meshType}" mesh`,
+      );
+    } catch (error) {
+      meshDesc.onDestroy();
+      throw error;
+    }
+
+    const l = new MeshHandle(meshDesc);
+
     // Initialize the mesh; hooks are wired once the instance exists.
     this._trackAsyncCreate("mesh", meshDesc, meshDesc.onCreate(), () => {
       // If deleted while an async creation was loading, nothing to wire.
@@ -2287,11 +2707,11 @@ export default class ThreeView<
 
       // Set up update listener
       if (meshDesc.update) {
-        this.on("preRender", meshDesc.update.bind(meshDesc));
+        this._hookUntilDeleted(l, "preRender", meshDesc.update.bind(meshDesc));
       }
 
       if (meshDesc.onResize) {
-        this.on("resize", meshDesc.onResize.bind(meshDesc));
+        this._hookUntilDeleted(l, "resize", meshDesc.onResize.bind(meshDesc));
 
         const canvasSize = this._getCanvasSize();
         if (canvasSize) {
@@ -2301,16 +2721,30 @@ export default class ThreeView<
 
       // Trigger re-render
       meshDesc.on("needsUpdate", this.forceUpdate);
+      l.on("deleted", () => meshDesc.off("needsUpdate", this.forceUpdate));
 
       this.forceUpdate();
     });
-
-    const l = new MeshHandle(meshDesc);
 
     l.on("deleted", this.forceUpdate);
 
     // Store the mesh descriptor
     this.layersManager.add(l);
+
+    // Mesh materials sample G-buffers only at render time, so syncing after
+    // `onCreate()` is enough.
+    if (meshDesc.getRequiredBuffers().length > 0) {
+      this._syncGBuffers();
+    }
+    // Registered after `layersManager.add`, so the deleted mesh is already
+    // out of the union when this runs.
+    l.on("deleted", () => {
+      // `dispose()` deletes every descriptor; nothing is left to re-derive for.
+      if (this._disposed) return;
+      if (meshDesc.getRequiredBuffers().length > 0) {
+        this._syncGBuffers();
+      }
+    });
 
     // Return handle for imperative access
     return l as MeshHandle<L>;
@@ -2334,6 +2768,8 @@ export default class ThreeView<
     // Create light descriptor instance
     const lightDesc = this.registries.light.create(lightType, config);
 
+    const l = new LightHandle(lightDesc);
+
     // Initialize the light; hooks are wired once the instance exists.
     this._trackAsyncCreate("light", lightDesc, lightDesc.onCreate(), () => {
       // Deleted while an async creation was loading — nothing to wire.
@@ -2341,16 +2777,19 @@ export default class ThreeView<
 
       // Set up update listener if the descriptor has an update method
       if (lightDesc.update) {
-        this.on("preRender", lightDesc.update.bind(lightDesc));
+        this._hookUntilDeleted(
+          l,
+          "preRender",
+          lightDesc.update.bind(lightDesc),
+        );
       }
 
       // Trigger re-render
       lightDesc.on("needsUpdate", this.forceUpdate);
+      l.on("deleted", () => lightDesc.off("needsUpdate", this.forceUpdate));
 
       this.forceUpdate();
     });
-
-    const l = new LightHandle(lightDesc);
 
     l.on("deleted", this.forceUpdate);
 
@@ -2378,13 +2817,20 @@ export default class ThreeView<
       throw new UnknownTypeError("effect", config);
     }
 
-    // Reject the effect while nothing is created yet if its required
-    // G-buffers would exceed the device's MRT attachment limit
-    // (gl.MAX_DRAW_BUFFERS – spec minimum 4, nearly all devices expose 8).
-    this._assertGBufferCapacity(effectType);
-
-    // Create effect descriptor instance
+    // Requirements can depend on the config, so the descriptor exists before
+    // the capacity check and is destroyed on rejection.
     const effectDesc = this.registries.effect.create(effectType, config);
+
+    // gl.MAX_DRAW_BUFFERS: spec minimum 4, nearly all devices expose 8.
+    try {
+      this._assertGBufferCapacity(
+        effectDesc.getRequiredBuffers(),
+        `"${effectDesc.getKey()}" effect`,
+      );
+    } catch (error) {
+      effectDesc.onDestroy();
+      throw error;
+    }
 
     const l = new EffectHandle(effectDesc);
 
@@ -2397,6 +2843,8 @@ export default class ThreeView<
     // so tune effects via `update()` rather than re-adding them.
     this._syncGBuffers();
     l.on("deleted", () => {
+      // `dispose()` deletes every descriptor; nothing is left to re-derive for.
+      if (this._disposed) return;
       this._syncGBuffers();
       this.forceUpdate();
     });
@@ -2408,11 +2856,16 @@ export default class ThreeView<
 
       // Set up update listener if the descriptor has an update method
       if (effectDesc.update) {
-        this.on("preRender", effectDesc.update.bind(effectDesc));
+        this._hookUntilDeleted(
+          l,
+          "preRender",
+          effectDesc.update.bind(effectDesc),
+        );
       }
 
       // Trigger re-render
       effectDesc.on("needsUpdate", this.forceUpdate);
+      l.on("deleted", () => effectDesc.off("needsUpdate", this.forceUpdate));
 
       this.forceUpdate();
     });
@@ -2423,59 +2876,89 @@ export default class ThreeView<
 
   /**
    * Re-derives the G-buffer configuration from the union of the active
-   * effects' `requiredBuffers` and applies it to the MRT pass when changed.
+   * effects' and meshes' `getRequiredBuffers()` and applies it to the MRT pass
+   * when changed.
    */
   private _syncGBuffers = (): void => {
-    const requirements: (readonly GBufferName[])[] = [];
+    // Set first: the mesh requirements below go through `getPassKey()`.
+    let mrtPassRequired = false;
     for (const handle of this.layersManager.getEffectDescs()) {
-      const EffectClass = handle.ref.constructor as {
-        requiredBuffers?: readonly GBufferName[];
-      };
-      if (EffectClass.requiredBuffers) {
-        requirements.push(EffectClass.requiredBuffers);
+      if (handle.ref.getConstructor().requiresMrtPass) {
+        mrtPassRequired = true;
+        break;
       }
     }
-    // Draped meshes are not effects, so they cannot declare this themselves:
-    // they read the terrain normal through the globe-normal copy.
-    if (this._scenes.draped.children.length > 0) {
-      requirements.push(["globeNormal"]);
+    this.viewContext._mrtPassRequired = mrtPassRequired;
+    const buffers = unionGBufferRequirements(this._gbufferRequirements());
+    // `addEffect`/`addMesh` reject an over-limit descriptor up front. A
+    // requirement that grows after creation is reported instead and the
+    // previous configuration kept, since the GL level would give an
+    // incomplete framebuffer. A later re-derivation that fits applies.
+    const attachmentCount = countGBufferAttachments(buffers);
+    const maxDrawBuffers = this._maxDrawBuffers();
+    if (attachmentCount > maxDrawBuffers) {
+      console.error(
+        `The required G-buffers demand ${attachmentCount} MRT attachments, ` +
+          `exceeding this device's MAX_DRAW_BUFFERS (${maxDrawBuffers}). ` +
+          "Keeping the previous G-buffers.",
+      );
+      // Re-applied anyway: meshes re-evaluate their pass on the event, and
+      // `requiresMrtPass` may have changed.
+      this.viewContext._setGBufferOptions(this._buffers);
+      return;
     }
-    this._buffers = unionGBufferRequirements(requirements);
+    this._buffers = buffers;
     this.viewContext._setGBufferOptions(this._buffers);
   };
 
+  // Lazy, so the capacity check's already-allocated shortcut walks no layer.
+  private *_gbufferRequirements(): Generator<readonly GBufferName[]> {
+    for (const handle of this.layersManager.getHandles()) {
+      const desc = handle.ref;
+      if (desc instanceof EffectDesc) {
+        yield desc.getRequiredBuffers();
+      } else if (desc instanceof MeshDesc) {
+        yield desc.getRequiredBuffers();
+      }
+    }
+  }
+
   /**
-   * Throws when enabling `effectType`'s required G-buffers would push the
-   * attachment count (color + normal + optional buffers) past the device's
+   * Throws when enabling a descriptor's required G-buffers would push the
+   * attachment count (color + enabled optional buffers) past the device's
    * `MAX_DRAW_BUFFERS` limit.
    */
-  private _assertGBufferCapacity(effectType: string): void {
+  private _assertGBufferCapacity(
+    required: readonly GBufferName[],
+    label: string,
+  ): void {
     // The WebGPU backend has no MRT G-buffer to size.
     if (this.renderPassOrchestrator.backend === "webgpu") {
       return;
     }
-    const required = this.registries.effect.getRequiredBuffers(effectType);
     if (required.length === 0) return;
-    const prospective = unionGBufferRequirements([
-      (Object.keys(this._buffers) as GBufferName[]).filter(
-        (name) => this._buffers[name],
-      ),
+    const maxDrawBuffers = this._maxDrawBuffers();
+    const attachmentCount = exceededGBufferCapacity(
+      this._gbufferRequirements(),
       required,
-    ]);
-    const attachmentCount =
-      2 + GBUFFER_ATTACHMENT_NAMES.filter((name) => prospective[name]).length;
-    // Navara requires WebGL2 (MRT), so the context is always WebGL2.
-    const gl = this.viewContext
-      .getRenderer()
-      .getContext() as WebGL2RenderingContext;
-    const maxDrawBuffers = gl.getParameter(gl.MAX_DRAW_BUFFERS) as number;
-    if (attachmentCount > maxDrawBuffers) {
+      this._buffers,
+      maxDrawBuffers,
+    );
+    if (attachmentCount !== undefined) {
       throw new Error(
-        `The "${effectType}" effect requires G-buffers [${required.join(", ")}], ` +
+        `The ${label} requires G-buffers [${required.join(", ")}], ` +
           `but the resulting ${attachmentCount} MRT attachments exceed this ` +
           `device's MAX_DRAW_BUFFERS (${maxDrawBuffers}).`,
       );
     }
+  }
+
+  private _maxDrawBuffers(): number {
+    // Navara requires WebGL2 (MRT), so the context is always WebGL2.
+    const gl = this.viewContext
+      .getRenderer()
+      .getContext() as WebGL2RenderingContext;
+    return gl.getParameter(gl.MAX_DRAW_BUFFERS) as number;
   }
 
   /**
@@ -2493,6 +2976,7 @@ export default class ThreeView<
   /**
    * Updates an existing resource layer's configuration by its ID.
    * Only works for resource layers added via `addLayer()`.
+   * Same as calling `update()` on the layer.
    * @param id - The unique identifier of the layer to update
    * @param l - New layer configuration
    */
@@ -2710,28 +3194,28 @@ export default class ThreeView<
   }
 
   /**
-   * Sets the camera position and orientation instantly.
-   * @param camPos - Camera position with lng (degrees), lat (degrees), height (meters), and optional pitch, heading, roll (degrees)
+   * The camera as of the last frame: `lng` / `lat` (degrees), `height`
+   * (meters above the ellipsoid), `heading` / `pitch` / `roll` (degrees) and
+   * `fov` (vertical field of view, degrees). A plain JSON-safe object that
+   * `setCamera()` takes back as is, for saving and restoring a view.
+   * A `setCamera()` shows here only after the next frame.
+   * @returns `undefined` until the engine camera exists: during plugin
+   *   `init()` and until the first frame after `init()` resolves.
    */
-  setCamera(camPos: CameraPosition) {
-    function checkFinite(value: number | undefined): value is number {
-      return Number.isFinite(value) && value != null;
-    }
+  getCamera(): CameraState | undefined {
+    return readCameraState(this._core);
+  }
 
-    const lng = camPos.lng;
-    const lat = camPos.lat;
-    const position =
-      checkFinite(lng) && checkFinite(lat)
-        ? new Float64Array([lng, lat, camPos.height ?? 0])
-        : null;
-
-    this._core?.changeCamera(
-      position,
-      camPos.pitch,
-      camPos.heading,
-      camPos.roll,
-      camPos.distance,
-    );
+  /**
+   * Sets the camera position and orientation without animation. The engine
+   * applies it on the next frame, so `getCamera()` returns the old camera
+   * until then.
+   * @param camPos - Camera position with lng (degrees), lat (degrees), height (meters), and optional pitch, heading, roll (degrees).
+   *   `fov` (vertical field of view, degrees, 1–179) also sets the field of view, so the result of `getCamera()` can be passed as is.
+   *   A `fov`-only call changes only the field of view: it does not stop a flight.
+   */
+  setCamera(camPos: CameraPosition & Partial<Pick<CameraState, "fov">>) {
+    applyCameraState(this._core, camPos);
   }
 
   /**
@@ -2878,6 +3362,51 @@ export default class ThreeView<
   }
 
   /**
+   * Compute camera viewing distance required to achieve a target zoom level.
+   *
+   * This is the inverse of the camera's `zoom` property calculation. Given a
+   * Web Mercator zoom level and latitude, returns the camera viewing distance
+   * (camera-to-target distance) in meters that would produce that zoom level.
+   *
+   * Uses the current viewport height and camera FOV from the engine state,
+   * unless overridden by the fovRad parameter.
+   *
+   * @param zoomLevel - Target Web Mercator zoom level (typically 0-22)
+   * @param latDeg - Latitude in degrees (affects scale due to Web Mercator projection)
+   * @param tileSizePx - Tile size for zoom calculation. Defaults to 256 for backward compatibility.
+   *                     Use 512 for MapLibre-compatible calculations.
+   * @param fovRad - Optional FOV override in radians. If not provided, uses camera's current FOV.
+   * @returns Camera viewing distance to target in meters, or undefined if engine not initialized
+   */
+  zoomLevelToCameraDistance(
+    zoomLevel: number,
+    latDeg: number,
+    tileSizePx?: number,
+    fovRad?: number,
+  ): number | undefined {
+    return this._core?.zoomLevelToCameraDistance(
+      zoomLevel,
+      latDeg,
+      tileSizePx,
+      fovRad,
+    );
+  }
+
+  /**
+   * Get the current Web Mercator zoom level.
+   *
+   * This is the same calculation as `camera.zoom`, but allows specifying a custom
+   * tile size for compatibility with different mapping systems.
+   *
+   * @param tileSizePx - Tile size for zoom calculation. Defaults to 256 (standard Web Mercator).
+   *                     Use 512 for MapLibre-compatible calculations.
+   * @returns Current zoom level, or undefined if camera not initialized
+   */
+  getZoomLevel(tileSizePx?: number): number | undefined {
+    return this._core?.getZoomLevel(tileSizePx);
+  }
+
+  /**
    * Samples terrain heights at the most detailed zoom level the terrain
    * source provides, fetching the needed tiles over the network — unlike
    * {@link sampleTerrainHeight}, which reads only tiles already resident for
@@ -2888,7 +3417,8 @@ export default class ThreeView<
    * `source` is a registered `quantized-mesh` / `raster-dem` source: the
    * {@link Source} handle returned by `addSource`, or its id. The stored
    * config (including engine defaults and partial-update merges) is what gets
-   * sampled.
+   * sampled. Heights include the vertical exaggeration of the terrain layer
+   * rendering `source`, and are unexaggerated when no terrain layer renders it.
    *
    * @param source - A registered terrain source (handle or id)
    * @param positions - Geodetic positions (lat/lng in degrees)
@@ -2912,8 +3442,103 @@ export default class ThreeView<
         `sampleTerrainMostDetailed: source "${sourceId}" is not a registered quantized-mesh or raster-dem source`,
       );
     }
-    return sampleTerrainMostDetailed(description, positions, options);
+    const sampled = await sampleTerrainMostDetailed(
+      description,
+      positions,
+      options,
+    );
+    const [scale, relativeHeight] =
+      this._core.getTerrainExaggerationForSource(sourceId);
+    return sampled.map((p) =>
+      p.height === undefined
+        ? p
+        : {
+            ...p,
+            height: exaggerateTerrainHeight(p.height, scale, relativeHeight),
+          },
+    );
   }
+
+  /**
+   * Min and max height, relative to the ellipsoid, of the ground rendered
+   * over `extent`: the loaded terrain tiles, or `0` before any has loaded,
+   * with the terrain layer's vertical exaggeration applied.
+   *
+   * {@link observeTerrainHeightRange} reports the range as tiles load.
+   *
+   * @param extent - Geographic bounds in degrees
+   * @returns The range in metres, or `undefined` before the engine has a
+   *   terrain quadtree
+   */
+  sampleTerrainHeightRange(
+    extent: GeographicExtent,
+  ): { min: number; max: number } | undefined {
+    const range = this._core?.sampleTerrainHeightRange(
+      new ExtentRadianF32(
+        degreeToRadian(extent.west),
+        degreeToRadian(extent.south),
+        degreeToRadian(extent.east),
+        degreeToRadian(extent.north),
+      ),
+    );
+    return range ? { min: range[0], max: range[1] } : undefined;
+  }
+
+  /**
+   * Observes {@link sampleTerrainHeightRange} over `extent`. The callback
+   * fires once the range is first computed, then whenever a terrain tile
+   * overlapping `extent` loads or the terrain exaggeration changes, and the
+   * range changes with it.
+   *
+   * @param extent - Geographic bounds in degrees, `west <= east`
+   * @param cb - Callback receiving the range in metres
+   * @returns Cleanup function to stop observing
+   */
+  observeTerrainHeightRange(
+    extent: GeographicExtent,
+    cb: (range: { min: number; max: number }) => void,
+  ): () => void {
+    if (!this._core) {
+      return () => {};
+    }
+
+    const entityBits = this._core.registerTerrainHeightRangeEvent(
+      new ExtentRadianF32(
+        degreeToRadian(extent.west),
+        degreeToRadian(extent.south),
+        degreeToRadian(extent.east),
+        degreeToRadian(extent.north),
+      ),
+    );
+
+    if (this._terrainHeightRangeObservers.size === 0) {
+      this.on(
+        "_terrain_height_range_received",
+        this._dispatchTerrainHeightRange,
+      );
+    }
+    this._terrainHeightRangeObservers.set(entityBits, cb);
+
+    return () => {
+      if (!this._terrainHeightRangeObservers.delete(entityBits)) return;
+      this._core?.unregisterTerrainHeightRangeEvent(entityBits);
+      if (this._terrainHeightRangeObservers.size === 0) {
+        this.off(
+          "_terrain_height_range_received",
+          this._dispatchTerrainHeightRange,
+        );
+      }
+    };
+  }
+
+  private _dispatchTerrainHeightRange = (
+    ev: TerrainHeightRangeUpdatedEvent,
+  ): void => {
+    this._terrainHeightRangeObservers.get(ev.bits)?.({
+      min: ev.min,
+      max: ev.max,
+    });
+  };
 
   /**
    * Observes terrain height changes at a position. Callback is invoked each time terrain data updates.
@@ -2970,7 +3595,24 @@ export default class ThreeView<
     const idleThreshold = this._options.idleThreshold ?? 100;
     const loop: XRFrameRequestCallback = (time) => {
       if (this._disposed) return;
+      // `info.autoReset` is off, so the counters hold this tick's totals
+      // (nested drape bakes and the pick debug canvas included) for `frame`
+      // listeners and the debug stats overlay.
+      this._renderer.info.reset();
+      this._profiling = (this.size("frame") ?? 0) > 0;
+      const timing = this._profiling ? this._frameTiming : undefined;
+      const t0 = timing ? performance.now() : 0;
       this._stats?.begin();
+
+      if (this._resizePending) {
+        this._resizePending = false;
+        this._handleResize();
+      }
+
+      // Before this frame's render: the GPU has usually finished the previous
+      // frame by now, so the pick's synchronous readback waits for the pick
+      // alone.
+      this._pickHelper?.pickHover();
 
       this._forceFeatureUpdates(time);
 
@@ -2978,31 +3620,64 @@ export default class ThreeView<
       // Batch texture writes accumulated during event processing above are
       // turned into partial GPU uploads here, before the render consumes them.
       flushBatchTextureUpdates(this._renderer);
-      if (updated || this._renderFlag.forceUpdate || this._renderFlag.animation)
+      const rendered =
+        updated || this._renderFlag.forceUpdate || this._renderFlag.animation;
+      if (rendered) {
+        const t = timing ? performance.now() : 0;
         this._render(time);
+        if (timing) timing.renderMs = performance.now() - t;
+      } else if (timing) {
+        timing.renderMs = 0;
+      }
       this._renderFlag.forceUpdate = false;
+
+      // In-flight jobs keep the view busy even when the engine emits
+      // nothing while it waits on them, unless they have stalled.
+      const jobsInFlight = this._dispatcher.inFlight();
+      if (jobsInFlight !== this._jobsInFlight) {
+        this._jobsInFlight = jobsInFlight;
+        this._jobsProgressedAt = time;
+      }
+      if (jobsInFlight > 0 && time - this._jobsProgressedAt < STALLED_JOBS_MS) {
+        this._jobsBusyAt = time;
+      }
 
       if (updated) {
         this._isIdle = false;
       } else if (
         !this._isIdle &&
         this.eventContext.updatedAt > 0 &&
-        time - this.eventContext.updatedAt >= idleThreshold
+        time - Math.max(this.eventContext.updatedAt, this._jobsBusyAt) >=
+          idleThreshold
       ) {
         this._isIdle = true;
         this.emit("idle");
       }
 
       this._stats?.end();
+      this._frameTick++;
+      if (timing) {
+        timing.time = time;
+        timing.tick = this._frameTick;
+        timing.rendered = rendered;
+        timing.totalMs = performance.now() - t0;
+        this.emit("frame", timing);
+      }
     };
     this._renderer.setAnimationLoop(loop);
   }
 
-  private _getCanvasSize(): { width: number; height: number } | undefined {
-    const element =
+  /** The element whose size the view fills. */
+  private _getSizeElement(): HTMLElement {
+    return (
       this._options.container ??
       this._renderer.domElement?.parentElement ??
-      this._renderer.domElement;
+      this._renderer.domElement
+    );
+  }
+
+  private _getCanvasSize(): { width: number; height: number } | undefined {
+    const element = this._getSizeElement();
     if (!element) return;
 
     const width = element.offsetWidth;
@@ -3026,6 +3701,14 @@ export default class ThreeView<
           override: this._options.pixelRatio,
           mobileOptimization: this._options.mobileOptimization,
         });
+    const size = this._renderer.getSize(new Vector2());
+    if (
+      size.x === width &&
+      size.y === height &&
+      this._renderer.getPixelRatio() === pixelRatio
+    ) {
+      return;
+    }
     this.resize(width, height, pixelRatio);
   };
 
@@ -3206,4 +3889,19 @@ export default class ThreeView<
 
 function newId() {
   return Math.random().toString(36).slice(2);
+}
+
+let engineReady: Promise<unknown> | undefined;
+
+/**
+ * wasm-bindgen's init only short-circuits once a call has finished, so views
+ * initializing concurrently must share one promise or the later instantiation
+ * replaces the module the earlier view's `Core` lives in.
+ */
+function initEngine() {
+  engineReady ??= initCore().catch((e: unknown) => {
+    engineReady = undefined;
+    throw e;
+  });
+  return engineReady;
 }

@@ -387,7 +387,9 @@ view.addLayer({ type: "raster", source: osm });
 
 ### dispose()
 
-Releases all resources and stops the rendering loop. Call this method when the view is no longer needed.
+Releases all resources and stops the rendering loop. Call this method when the view is no longer needed. The worker pool shared with other views on the page stays alive until the last view is disposed (see [Multiple Views](../threeview-class#multiple-views)).
+
+It is safe to call while `init()` is pending; that `init()` then resolves without starting the view. A disposed view cannot be initialized again.
 
 **Syntax:**
 
@@ -404,7 +406,7 @@ view.dispose();
 
 ### resize()
 
-Changes the renderer size and updates the camera aspect ratio. Automatically called on window resize unless `disableAutoResize` is `true`.
+Changes the renderer size and updates the camera aspect ratio. Automatically called when the container changes size unless `disableAutoResize` is `true`.
 
 **Syntax:**
 
@@ -428,19 +430,67 @@ view.resize(1920, 1080, 2);
 view.resize(undefined, undefined, window.devicePixelRatio);
 ```
 
-### setCamera()
+### getCamera()
 
-Sets the camera position and orientation immediately. Moves the camera directly without animation.
+Returns the camera as of the last frame, as a plain object: position, orientation and field of view. The object is JSON-safe, and `setCamera()` takes it back as is, so it can save and restore a view.
 
 **Syntax:**
 
 ```tsx
-setCamera(camPos: CameraPosition): void
+getCamera(): CameraState | undefined
+```
+
+**Returns:**
+
+```tsx
+type CameraState = {
+  lng: number;
+  lat: number;
+  height: number;
+  heading: number;
+  pitch: number;
+  roll: number;
+  fov: number;
+};
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `lng` | `number` | Longitude (degrees) |
+| `lat` | `number` | Latitude (degrees) |
+| `height` | `number` | Height above the ellipsoid (meters) |
+| `heading` | `number` | Heading angle (degrees, 0 = North, clockwise) |
+| `pitch` | `number` | Pitch angle (degrees, negative = looking down) |
+| `roll` | `number` | Roll angle (degrees) |
+| `fov` | `number` | Vertical field of view (degrees) |
+
+Returns `undefined` until the engine camera exists: during a plugin's `init()`, and until the first frame after `view.init()` resolves.
+
+**Example:**
+
+```tsx
+// Save the view, for example to localStorage.
+const camera = view.getCamera();
+if (camera) localStorage.setItem("camera", JSON.stringify(camera));
+
+// Restore it later.
+const saved = localStorage.getItem("camera");
+if (saved) view.setCamera(JSON.parse(saved));
+```
+
+### setCamera()
+
+Sets the camera position and orientation without animation. The engine applies it on the next frame, so [`getCamera()`](#getcamera) returns the old camera until then.
+
+**Syntax:**
+
+```tsx
+setCamera(camPos: CameraPosition & { fov?: number }): void
 ```
 
 **Parameters:**
 
-- `camPos`: Camera position and orientation
+- `camPos`: Camera position and orientation, and optionally the field of view. The result of [`getCamera()`](#getcamera) can be passed as is.
 
 ```tsx
 type CameraPosition = {
@@ -463,6 +513,7 @@ type CameraPosition = {
 | `heading` | `number` | Heading angle (degrees) |
 | `roll` | `number` | Roll angle (degrees) |
 | `distance` | `number` | Distance from the target point along the camera forward direction (meters). When specified, the camera is placed so that its forward ray reaches the `lng`/`lat`/`height` target from this distance. If omitted, `height` is used as the camera's own altitude above the surface normal. |
+| `fov` | `number` | Vertical field of view (degrees, 1–179), the same as setting [`camera.fov`](../camera/#fov). Values outside this range (and `NaN`) are ignored. If omitted, the field of view does not change. A call with only `fov` changes only the field of view: it does not stop a flight. |
 
 **Example:**
 
@@ -731,7 +782,7 @@ view.cameraFreeLook(false);
 
 ### sampleTerrainHeight()
 
-Synchronously gets the terrain height at a specified geodetic position. Returns `undefined` if terrain data has not yet been loaded.
+Synchronously gets the terrain height at a specified geodetic position. Returns `undefined` if terrain data has not yet been loaded. When [`exaggeration`](../../../three/material/terrain-material/#exaggeration) is set, the returned heights are exaggerated to match the rendered surface.
 
 This reads only tiles already resident for rendering, so while the camera is far away it returns the height of a coarse LOD tile which can be tens of meters off the true ground height. When you need an accurate height regardless of the camera (for example to place an object on the ground), use [`sampleTerrainMostDetailed()`](#sampleterrainmostdetailed) instead.
 
@@ -769,7 +820,7 @@ if (height !== undefined) {
 
 ### sampleTerrainMostDetailed()
 
-Asynchronously samples terrain heights at the most detailed zoom level the terrain source provides, fetching the needed tiles over the network. Unlike `sampleTerrainHeight()`, which reads only tiles already resident for rendering, and therefore returns coarse heights (or `undefined`) while the camera is far away, this resolves accurate ground heights regardless of what the camera has streamed in. Use it to place objects on the ground before flying there.
+Asynchronously samples terrain heights at the most detailed zoom level the terrain source provides, fetching the needed tiles over the network. Unlike `sampleTerrainHeight()`, which reads only tiles already resident for rendering, and therefore returns coarse heights (or `undefined`) while the camera is far away, this resolves accurate ground heights regardless of what the camera has streamed in. Use it to place objects on the ground before flying there. When the terrain layer rendering `source` sets [`exaggeration`](../../../three/material/terrain-material/#exaggeration), the returned heights are exaggerated to match the rendered surface.
 
 Positions are grouped by tile and each unique tile is fetched once. Sampling starts at the source's `maxZoom` and falls back to parent tiles on 404 until data is found, so sources whose real coverage is shallower than the configured `maxZoom` still resolve. A `401`/`403` response rejects the whole call (a token problem should not silently degrade into coarse heights), while server errors are retried and then yield `height: undefined` for the affected positions.
 
@@ -822,7 +873,7 @@ if (ground.height !== undefined) {
 
 ### observeTerrainHeightAt()
 
-Monitors terrain height changes at a specific position. The callback is invoked whenever the terrain data is updated.
+Monitors terrain height changes at a specific position. The callback is invoked once the height is first sampled, which happens right after registration when the terrain there is already loaded, and then whenever a terrain tile containing the position loads or the terrain exaggeration changes, and the height changes with it. When [`exaggeration`](../../../three/material/terrain-material/#exaggeration) is set, the returned heights are exaggerated to match the rendered surface.
 
 **Syntax:**
 
@@ -851,6 +902,81 @@ const lng = 139.7671;
 const cleanup = view.observeTerrainHeightAt({ lat, lng }, (height) => {
   console.log(`Terrain height updated: ${height}m`);
 });
+
+// Stop monitoring later
+cleanup();
+```
+
+### sampleTerrainHeightRange()
+
+Synchronously gets the minimum and maximum height of the ground over a geographic extent. Like `sampleTerrainHeight()`, it reads only the terrain tiles already loaded for rendering, and it reports `0` for an area no terrain tile has loaded yet. Use it to size something that must enclose the ground, for example a volume reaching from below to above the terrain. When [`exaggeration`](../../../three/material/terrain-material/#exaggeration) is set, the range is exaggerated to match the rendered surface, and so is the `0` of an area not loaded yet.
+
+**Syntax:**
+
+```tsx
+sampleTerrainHeightRange(
+  extent: GeographicExtent,
+): { min: number; max: number } | undefined
+```
+
+**Parameters:**
+
+- `extent`: Geographic bounds
+  - `west`: Western longitude (degrees)
+  - `south`: Southern latitude (degrees)
+  - `east`: Eastern longitude (degrees)
+  - `north`: Northern latitude (degrees)
+
+**Returns:**
+
+The minimum and maximum height (meters, relative to the ellipsoid), or `undefined` before the engine has set up its terrain
+
+**Example:**
+
+```tsx
+const range = view.sampleTerrainHeightRange({
+  west: 138.7,
+  south: 35.3,
+  east: 138.8,
+  north: 35.4,
+});
+
+if (range) {
+  console.log(`Ground spans ${range.min}m to ${range.max}m`);
+}
+```
+
+### observeTerrainHeightRange()
+
+Monitors the result of [`sampleTerrainHeightRange()`](#sampleterrainheightrange) over an extent. The callback is invoked once the range is first computed, and then whenever a terrain tile overlapping the extent loads or the terrain exaggeration changes, and the range changes with it.
+
+**Syntax:**
+
+```tsx
+observeTerrainHeightRange(
+  extent: GeographicExtent,
+  cb: (range: { min: number; max: number }) => void,
+): () => void
+```
+
+**Parameters:**
+
+- `extent`: Geographic bounds in degrees, as in `sampleTerrainHeightRange()`. `west` must not be greater than `east`, so an extent crossing the antimeridian is not supported.
+- `cb`: Callback receiving the minimum and maximum height (meters, relative to the ellipsoid)
+
+**Returns:**
+
+A cleanup function to stop monitoring
+
+**Example:**
+
+```tsx
+const cleanup = view.observeTerrainHeightRange(
+  { west: 138.7, south: 35.3, east: 138.8, north: 35.4 },
+  ({ min, max }) => {
+    console.log(`Ground spans ${min}m to ${max}m`);
+  },
+);
 
 // Stop monitoring later
 cleanup();

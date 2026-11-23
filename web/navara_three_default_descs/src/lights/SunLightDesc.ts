@@ -1,5 +1,5 @@
 import type ThreeView from "@navaramap/three";
-import { Color } from "@navaramap/three";
+import { Color, getDefaultSunShadow } from "@navaramap/three";
 import {
   LightDesc,
   type LightConfig,
@@ -39,9 +39,11 @@ export class SunLightDesc extends LightDesc<
     const color = options.color ? options.color.raw : undefined;
 
     const sunLight = new SunLight(this.view.camera.raw, {
+      ...getDefaultSunShadow({ isMobile: this.view.isMobileOptimized() }),
       ...options,
       ...(color ? { color } : {}),
     } as SunLightOptions);
+    sunLight.raw.ellipsoid = this.view.atmosphere.ellipsoid;
 
     // Set up atmosphere integration. The transmittance texture is only
     // needed to compute the sun color from the atmosphere, so skip the
@@ -114,6 +116,9 @@ export class SunLightDesc extends LightDesc<
       }
       if (updates.sun.shadowNormalBias !== undefined) {
         this._instance.shadowNormalBias = updates.sun.shadowNormalBias;
+      }
+      if (updates.sun.shadowRadius !== undefined) {
+        this._instance.shadowRadius = updates.sun.shadowRadius;
       }
       if (updates.sun.debugCSMHelper !== undefined) {
         this._instance.debugCSMHelper = updates.sun.debugCSMHelper;

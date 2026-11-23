@@ -1,4 +1,5 @@
 import { EventHandler, Observed, type XYZ } from "@navaramap/core";
+import { exaggerateTerrainHeight } from "@navaramap/engine";
 import {
   getECIToECEFRotationMatrix,
   getMoonDirectionECEF,
@@ -16,22 +17,11 @@ import {
   type PrecomputedTextures,
 } from "@takram/three-atmosphere";
 import {
+  Ellipsoid,
   EXR3DTextureLoader,
   EXRTextureLoader,
-  Float16Array,
-  isFloatLinearSupported,
-  reinterpretType,
 } from "@takram/three-geospatial";
-import {
-  FloatType,
-  HalfFloatType,
-  LinearFilter,
-  Matrix4,
-  Vector3,
-  type DataTextureImageData,
-  type Texture,
-  type WebGLRenderer,
-} from "three";
+import { LinearFilter, Matrix4, Vector3, type Texture } from "three";
 
 import { type ThreeViewCamera } from "./camera";
 import { ATMOSPHERE_TEXTURE_URLS, STBN_URL } from "./constants";
@@ -42,6 +32,10 @@ import {
   shiftDateToElevation,
   shiftDateToHourAngle,
 } from "./solar";
+import {
+  IDENTITY_TERRAIN_EXAGGERATION,
+  type TerrainExaggeration,
+} from "./terrain/exaggeration";
 
 /**
  * Events emitted by the {@link Atmosphere} class.
@@ -91,6 +85,14 @@ const ALL_ATMOSPHERE_TEXTURE_NAMES = Object.keys(
   ATMOSPHERE_TEXTURE_KEYS,
 ) as AtmosphereTextureName[];
 
+type TextureImageData = { data: ArrayBufferView | null };
+
+/** Textures whose CPU data is dropped once uploaded to the GPU. */
+const CPU_RELEASED_TEXTURE_NAMES: readonly AtmosphereTextureName[] = [
+  "scattering",
+  "higherOrderScattering",
+];
+
 /**
  * The textures guaranteed to be present in an {@link Atmosphere.onTexturesReady}
  * callback for a given needs declaration.
@@ -139,11 +141,6 @@ export const DEFAULT_ATMOSPHERE_OPTIONS: Required<
  */
 export class Atmosphere extends EventHandler<AtmosphereEvents> {
   /**
-   * @private
-   */
-  private renderer: WebGLRenderer;
-
-  /**
    * Current sun direction in ECEF coordinates.
    */
   sunDirection = new Vector3();
@@ -159,9 +156,30 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
   private rotationMatrix = new Matrix4();
 
   /**
+   * Ellipsoid the atmosphere takes as its ground: WGS84 with every radius
+   * moved by the height the terrain exaggeration renders sea level at, so
+   * terrain sunk below WGS84 stays above the ground. Its radii change in
+   * place; consumers that copy them (into uniforms) must reassign it.
+   */
+  readonly ellipsoid = new Ellipsoid(
+    Ellipsoid.WGS84.radii.x,
+    Ellipsoid.WGS84.radii.y,
+    Ellipsoid.WGS84.radii.z,
+  );
+
+  /**
+   * @private
+   */
+  private terrainExaggeration: TerrainExaggeration =
+    IDENTITY_TERRAIN_EXAGGERATION;
+
+  /**
    * Precomputed atmosphere textures used for rendering. Each texture is
    * loaded lazily when a consumer declares a need for it via
    * {@link onTexturesReady}, so the object may hold any subset at a time.
+   * The two 3D textures (`scatteringTexture`, `higherOrderScatteringTexture`)
+   * drop their CPU data once uploaded to the GPU: they cannot be read on the
+   * CPU, used with another renderer, or restored after a WebGL context loss.
    */
   textures: Partial<PrecomputedTextures> = {};
 
@@ -195,18 +213,12 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
 
   /**
    * Creates a new Atmosphere instance.
-   * @param renderer - The WebGL renderer used for texture type detection.
    * @param options - Configuration options for the atmosphere.
    * @param camera - Camera reference used by {@link setDateAt}.
    */
-  constructor(
-    renderer: WebGLRenderer,
-    options: AtmosphereOptions = {},
-    camera?: ThreeViewCamera,
-  ) {
+  constructor(options: AtmosphereOptions = {}, camera?: ThreeViewCamera) {
     super();
 
-    this.renderer = renderer;
     this.options = { ...DEFAULT_ATMOSPHERE_OPTIONS, ...options };
     this._camera = camera;
 
@@ -245,30 +257,22 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
   private loadTexture(name: AtmosphereTextureName): Promise<void> {
     let promise = this.texturePromises.get(name);
     if (promise == null) {
-      const assetsUrl = this.options.atmosphereAssetsUrl;
-      const file = ATMOSPHERE_TEXTURE_FILES[name];
-      const url =
-        assetsUrl == null
-          ? ATMOSPHERE_TEXTURE_URLS[file]
-          : `${assetsUrl.replace(/\/+$/, "")}/${file}`;
-      promise = this.fetchTexture(name, url)
+      promise = this.fetchTexture(name)
         .then((texture) => {
-          const type = isFloatLinearSupported(this.renderer)
-            ? FloatType
-            : HalfFloatType;
-          texture.type = type;
-          // EXR data is parsed to Uint16Array, which must be converted to
-          // Float32Array when FloatType is used.
-          if (type === FloatType) {
-            reinterpretType<DataTextureImageData>(texture.image);
-            if (texture.image.data != null) {
-              texture.image.data = new Float32Array(
-                new Float16Array(texture.image.data.buffer),
-              );
-            }
+          // Disposed while loading.
+          if (this.texturePromises.get(name) !== promise) {
+            texture.dispose();
+            return;
           }
           texture.minFilter = LinearFilter;
           texture.magFilter = LinearFilter;
+          if (CPU_RELEASED_TEXTURE_NAMES.includes(name)) {
+            // Only the 2D textures are sampled on the CPU (sun light color,
+            // sky light probe).
+            texture.onUpdate = () => {
+              (texture.image as TextureImageData).data = null;
+            };
+          }
           Object.assign(this.textures, {
             [ATMOSPHERE_TEXTURE_KEYS[name]]: texture,
           });
@@ -285,10 +289,18 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
     return promise;
   }
 
-  private fetchTexture(
-    name: AtmosphereTextureName,
-    url: string,
-  ): Promise<Texture> {
+  /**
+   * Loads a texture file. The EXR loaders decode to half floats
+   * (`HalfFloatType`, `Uint16Array`).
+   * @private
+   */
+  private fetchTexture(name: AtmosphereTextureName): Promise<Texture> {
+    const assetsUrl = this.options.atmosphereAssetsUrl;
+    const file = ATMOSPHERE_TEXTURE_FILES[name];
+    const url =
+      assetsUrl == null
+        ? ATMOSPHERE_TEXTURE_URLS[file]
+        : `${assetsUrl.replace(/\/+$/, "")}/${file}`;
     switch (name) {
       case "transmittance":
         return new EXRTextureLoader({
@@ -333,6 +345,7 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
    * guaranteed to be present.
    * @param needs - The textures the caller needs, e.g.
    * `{ transmittance: true }`. Omit to load all of them.
+   * @returns A function that cancels the callback if it has not run yet.
    *
    * @example
    * atmosphere.onTexturesReady(
@@ -345,7 +358,7 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
   >(
     callback: (textures: LoadedAtmosphereTextures<N>) => void,
     needs?: N,
-  ): void {
+  ): () => void {
     const names =
       needs == null
         ? ALL_ATMOSPHERE_TEXTURE_NAMES
@@ -365,14 +378,15 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
     };
     if (isReady()) {
       invoke();
-    } else {
-      const listener = () => {
-        if (!isReady()) return;
-        this.off("textureLoaded", listener);
-        invoke();
-      };
-      this.on("textureLoaded", listener);
+      return () => {};
     }
+    const listener = () => {
+      if (!isReady()) return;
+      this.off("textureLoaded", listener);
+      invoke();
+    };
+    this.on("textureLoaded", listener);
+    return () => this.off("textureLoaded", listener);
   }
 
   /**
@@ -400,10 +414,23 @@ export class Atmosphere extends EventHandler<AtmosphereEvents> {
   }
 
   /**
-   * Updates sun/moon directions and rotation matrix if needed.
+   * Updates sun/moon directions and rotation matrix if needed, and moves
+   * {@link ellipsoid} to the sea level `terrainExaggeration` renders.
    * @private
    */
-  _update() {
+  _update(terrainExaggeration: TerrainExaggeration) {
+    if (terrainExaggeration !== this.terrainExaggeration) {
+      this.terrainExaggeration = terrainExaggeration;
+      const [scale, relativeHeight] = terrainExaggeration;
+      const seaLevel = exaggerateTerrainHeight(0, scale, relativeHeight);
+      const wgs84 = Ellipsoid.WGS84.radii;
+      this.ellipsoid.radii.set(
+        wgs84.x + seaLevel,
+        wgs84.y + seaLevel,
+        wgs84.z + seaLevel,
+      );
+    }
+
     if (this.needsUpdate) {
       getSunDirectionECEF(this.date, this.sunDirection);
       getMoonDirectionECEF(this.date, this.moonDirection);

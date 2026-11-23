@@ -16,6 +16,7 @@ import type { NormalBufferAttributes } from "three";
 import type { BatchedAttributeName } from "../batchTexture";
 import { Color } from "../Color";
 import type { FeatureHandler } from "../event/context";
+import type { LineCap } from "../lineDash";
 import {
   InstancedMesh,
   isFeatureMesh,
@@ -25,9 +26,11 @@ import {
   type ModelBatchedAttributeName,
   InstancedSpriteMesh,
   BatchedSdfTextMesh,
+  PolylineMesh,
   type GeometryType,
   VALID_GEOMETRY_TYPES,
 } from "../mesh";
+import type { Anchor, TextAlign, VariableAnchor } from "../type";
 
 type AvailableMaterialProperty = ExtractProperties<
   PointMaterial &
@@ -53,8 +56,17 @@ export type EvaluatableMaterialProperty = {
   text: AvailableMaterialProperty["text"];
   /** Line width expression from layer configuration (for polylines). */
   width: AvailableMaterialProperty["width"];
+  /** Dash pattern of this line: alternating dash and gap lengths in line
+   *  widths. An empty array draws it solid. Overrides the material's
+   *  `dashArray`. */
+  dashArray: number[];
+  /** Shape of the ends of this line's dashes. Overrides the material's `cap`. */
+  cap: LineCap;
   /** Point/text size expression from layer configuration (for points/text). */
   size: AvailableMaterialProperty["size"];
+  /** Extra space between characters in ems (for text). Overrides the
+   *  material's `letterSpacing` for this feature. */
+  letterSpacing: AvailableMaterialProperty["letterSpacing"];
   /** Opacity expression from layer configuration (for polygons/points/text where supported). */
   opacity: AvailableMaterialProperty["opacity"];
   /** Per-feature declutter placement priority (for points/billboards/text);
@@ -62,6 +74,45 @@ export type EvaluatableMaterialProperty = {
   declutterPriority: AvailableMaterialProperty["declutterPriority"];
   /** Image URL for billboards; packed into a shared per-mesh texture atlas. */
   image: string;
+  /** Whether this label/sprite lies in the screen plane (`"upright"`) or on
+   *  the globe surface (`"flat"`). Overrides the material's
+   *  `textFacing`/`billboardFacing`/`pointFacing` for this feature. */
+  facing: "upright" | "flat";
+  /** Whether this label/sprite turns with the camera rather than with the
+   *  map. Overrides the material's `rotateWithCamera` for this feature. */
+  rotateWithCamera: boolean;
+  /** Whether this label places each glyph on its own along its line (for
+   *  text). Overrides the material's `spreadGlyphs` for this feature. */
+  spreadGlyphs: boolean;
+  /** In-plane rotation of this label/sprite about its anchor, in degrees,
+   *  clockwise seen from the front; along a line, of each glyph about its own
+   *  centre. Overrides the material's `rotation`. */
+  rotation: number;
+  /** Part of this label/sprite placed at its anchor point. Overrides the
+   *  material's `anchor`. */
+  anchor: Anchor;
+  /** Shift of this label/sprite from its anchor point, x right and y down:
+   *  in ems for text, in the unit of `size` for points and billboards.
+   *  Overrides the material's `offset`. */
+  offset: { x: number; y: number };
+  /** Placements the declutter pass picks from for this label (for text), in
+   *  order. Overrides the material's `variableAnchors`. */
+  variableAnchors: VariableAnchor[];
+  /** Line justification of this label (for text). Overrides the material's
+   *  `textAlign`. */
+  textAlign: TextAlign;
+  /** Outline color of this label (for text). Overrides the material's
+   *  `outlineColor`. */
+  outlineColor: AvailableMaterialProperty["outlineColor"];
+  /** Outline opacity of this label (for text). Overrides the material's
+   *  `outlineOpacity`. */
+  outlineOpacity: AvailableMaterialProperty["outlineOpacity"];
+  /** Outline thickness of this label in 1/64 em (for text). Overrides the
+   *  material's `outlineWidth`. */
+  outlineWidth: AvailableMaterialProperty["outlineWidth"];
+  /** Width over which this label's outline fades out, in 1/64 em (for
+   *  text). Overrides the material's `outlineBlur`. */
+  outlineBlur: AvailableMaterialProperty["outlineBlur"];
   /** Emissive color expression (for polygons/3D Tiles models/points/billboards/text). */
   emissive: AvailableMaterialProperty["emissiveColor"];
   /** Emissive intensity expression (for polygons/3D Tiles models/points/billboards/text). */
@@ -77,10 +128,25 @@ type EvaluatedMaterialProperty = {
   height: number;
   text: string;
   width: number;
+  dashArray: number[];
+  cap: LineCap;
   size: number;
+  letterSpacing: number;
   opacity: number;
   declutterPriority: number;
   image: string | null;
+  facing: "upright" | "flat";
+  rotateWithCamera: boolean;
+  spreadGlyphs: boolean;
+  rotation: number;
+  anchor: Anchor;
+  offset: { x: number; y: number };
+  variableAnchors: VariableAnchor[];
+  textAlign: TextAlign;
+  outlineColor: Color;
+  outlineOpacity: number;
+  outlineWidth: number;
+  outlineBlur: number;
   emissive: Color;
   emissiveIntensity: number;
 };
@@ -406,6 +472,9 @@ export class FeatureEvaluator {
    *   the glyph fill glows — outline and background stay dark.
    * - `emissiveIntensity` - Emissive intensity multiplier (for batched
    *   polygons/3D Tiles models/points/billboards/text)
+   * - `outlineColor`, `outlineOpacity`, `outlineWidth`, `outlineBlur` - The
+   *   label's outline (for text); width and blur in 1/64 em, like the
+   *   material's
    *
    * Note: Evaluated styles override the layer's default styles.
    *
@@ -450,11 +519,19 @@ export class FeatureEvaluator {
       const evaluated = f(info);
       this.applyEvaluatedValues(batchIndex, evaluated);
     };
+    const evaluateAll = () => {
+      if (options?.filters) {
+        this.readFilteredFeatureProperties(options.filters, evaluate);
+      } else {
+        this.readFeatureProperties(evaluate);
+      }
+    };
 
-    if (options?.filters) {
-      this.readFilteredFeatureProperties(options.filters, evaluate);
+    // Labels lay out once, after every value that shapes their layout is in.
+    if (this.obj instanceof BatchedSdfTextMesh) {
+      this.obj.deferLayout(evaluateAll);
     } else {
-      this.readFeatureProperties(evaluate);
+      evaluateAll();
     }
   }
 
@@ -489,6 +566,28 @@ export class FeatureEvaluator {
           evaluated.declutterPriority,
         );
       }
+      if (evaluated.facing != null) {
+        obj.setFeatureFacingByBatchIndex(batchIndex, evaluated.facing);
+      }
+      if (evaluated.rotateWithCamera != null) {
+        obj.setFeatureRotateWithCameraByBatchIndex(
+          batchIndex,
+          evaluated.rotateWithCamera,
+        );
+      }
+      if (evaluated.rotation != null) {
+        obj.setFeatureRotationByBatchIndex(batchIndex, evaluated.rotation);
+      }
+      if (evaluated.anchor != null) {
+        obj.setFeatureAnchorByBatchIndex(batchIndex, evaluated.anchor);
+      }
+      if (evaluated.offset != null) {
+        obj.setFeatureOffsetByBatchIndex(
+          batchIndex,
+          evaluated.offset.x,
+          evaluated.offset.y,
+        );
+      }
       if (evaluated.emissive != null) {
         obj.setFeatureEmissiveByBatchIndex(batchIndex, evaluated.emissive.raw);
       }
@@ -517,6 +616,46 @@ export class FeatureEvaluator {
       if (evaluated.height != null) {
         obj.setFeatureHeightByBatchIndex(batchIndex, evaluated.height);
       }
+      // Before `text`: glyph pieces, spacing and placement are baked into the
+      // layout, so a newly-texted label is laid out with them already set.
+      // A label with text re-lays out once, at the end of `evaluate`.
+      if (evaluated.spreadGlyphs != null && obj instanceof BatchedSdfTextMesh) {
+        obj.setFeatureSpreadGlyphsByBatchIndex(
+          batchIndex,
+          evaluated.spreadGlyphs,
+        );
+      }
+      if (
+        evaluated.letterSpacing != null &&
+        obj instanceof BatchedSdfTextMesh
+      ) {
+        obj.setFeatureLetterSpacingByBatchIndex(
+          batchIndex,
+          evaluated.letterSpacing,
+        );
+      }
+      if (evaluated.anchor != null && obj instanceof BatchedSdfTextMesh) {
+        obj.setFeatureAnchorByBatchIndex(batchIndex, evaluated.anchor);
+      }
+      if (
+        evaluated.variableAnchors != null &&
+        obj instanceof BatchedSdfTextMesh
+      ) {
+        obj.setFeatureVariableAnchorsByBatchIndex(
+          batchIndex,
+          evaluated.variableAnchors,
+        );
+      }
+      if (evaluated.textAlign != null && obj instanceof BatchedSdfTextMesh) {
+        obj.setFeatureTextAlignByBatchIndex(batchIndex, evaluated.textAlign);
+      }
+      if (evaluated.offset != null && obj instanceof BatchedSdfTextMesh) {
+        obj.setFeatureOffsetByBatchIndex(
+          batchIndex,
+          evaluated.offset.x,
+          evaluated.offset.y,
+        );
+      }
       if (evaluated.text != null && obj instanceof BatchedSdfTextMesh) {
         obj.setTextByBatchIndex(batchIndex, evaluated.text);
       }
@@ -526,6 +665,21 @@ export class FeatureEvaluator {
       if (evaluated.opacity != null && obj instanceof BatchedSdfTextMesh) {
         obj.setFeatureOpacityByBatchIndex(batchIndex, evaluated.opacity);
       }
+      if (evaluated.facing != null && obj instanceof BatchedSdfTextMesh) {
+        obj.setFeatureFacingByBatchIndex(batchIndex, evaluated.facing);
+      }
+      if (
+        evaluated.rotateWithCamera != null &&
+        obj instanceof BatchedSdfTextMesh
+      ) {
+        obj.setFeatureRotateWithCameraByBatchIndex(
+          batchIndex,
+          evaluated.rotateWithCamera,
+        );
+      }
+      if (evaluated.rotation != null && obj instanceof BatchedSdfTextMesh) {
+        obj.setFeatureRotationByBatchIndex(batchIndex, evaluated.rotation);
+      }
       if (
         evaluated.declutterPriority != null &&
         obj instanceof BatchedSdfTextMesh
@@ -534,6 +688,20 @@ export class FeatureEvaluator {
           batchIndex,
           evaluated.declutterPriority,
         );
+      }
+      if (
+        obj instanceof BatchedSdfTextMesh &&
+        (evaluated.outlineColor != null ||
+          evaluated.outlineOpacity != null ||
+          evaluated.outlineWidth != null ||
+          evaluated.outlineBlur != null)
+      ) {
+        obj.setFeatureOutlineByBatchIndex(batchIndex, {
+          color: evaluated.outlineColor?.toHex(),
+          opacity: evaluated.outlineOpacity ?? undefined,
+          width: evaluated.outlineWidth ?? undefined,
+          blur: evaluated.outlineBlur ?? undefined,
+        });
       }
       if (evaluated.emissive != null && obj instanceof BatchedSdfTextMesh) {
         obj.setFeatureEmissiveByBatchIndex(batchIndex, evaluated.emissive.raw);
@@ -648,6 +816,16 @@ export class FeatureEvaluator {
     }
     if (evaluated.width != null) {
       updateBatchAttribute("lineWidth", evaluated.width);
+    }
+    if (
+      mesh instanceof PolylineMesh &&
+      (evaluated.dashArray != null || evaluated.cap != null)
+    ) {
+      mesh._setFeatureLineDash(
+        batchIndex,
+        evaluated.dashArray ?? undefined,
+        evaluated.cap ?? undefined,
+      );
     }
     if (evaluated.opacity != null) {
       updateBatchAttribute("opacity", evaluated.opacity);

@@ -64,20 +64,24 @@ describe("pntsEnhancer/state", () => {
 
     it("falls back to currentState for missing props", () => {
       const currentState: PntsState = {
+        ...DEFAULT_PNTS_STATE,
         height: 150,
         geodeticNormal: { x: 0.1, y: 0.2, z: 0.3 },
-        divideColor: false,
+        srgbVertexColor: true,
       };
       const result = updateState({}, currentState);
       expect(result.height).toBe(150);
       expect(result.geodeticNormal).toEqual({ x: 0.1, y: 0.2, z: 0.3 });
+      // Layer updates never pass it, so it must survive a recompile.
+      expect(result.srgbVertexColor).toBe(true);
     });
 
     it("overrides only specified props", () => {
       const currentState: PntsState = {
+        ...DEFAULT_PNTS_STATE,
         height: 150,
         geodeticNormal: { x: 0.1, y: 0.2, z: 0.3 },
-        divideColor: false,
+        srgbVertexColor: false,
       };
       const result = updateState({ height: 300 }, currentState);
       expect(result.height).toBe(300);

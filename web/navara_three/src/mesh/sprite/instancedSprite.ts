@@ -2,6 +2,7 @@ import {
   PointMesh as NavaraPointMesh,
   BillboardMesh as NavaraBillboardMesh,
 } from "@navaramap/engine";
+import { lineAnchorPlace } from "@navaramap/engine-api";
 import { degreeToRadian } from "@navaramap/three-api";
 import {
   InstancedBufferAttribute,
@@ -14,6 +15,7 @@ import {
   Color,
   DataTexture,
   type Material,
+  MathUtils,
   PerspectiveCamera,
   Vector2,
   Vector3,
@@ -22,23 +24,39 @@ import invariant from "tiny-invariant";
 
 import {
   attachBatchedMaterial,
+  hasBatchScalarSlot,
   readBatchScalar,
   readBatchShowOpacity,
   registerBatchedMaterial,
   SPRITE_BATCH_SUPPORT,
+  unpackOrientation,
   updateBatchAttribute,
+  type BatchAttributeDefaults,
   type BatchedAttributeName,
   type BatchTextureSupport,
 } from "../../batchTexture";
 import {
   DECLUTTER_FADE_MS,
-  type DeclutterCandidate,
-  type DeclutterParticipant,
+  resolveDeclutterSettings,
+} from "../../declutter/participant";
+import type {
+  DeclutterCandidate,
+  DeclutterParticipant,
 } from "../../declutter/types";
 import type { EventContext } from "../../event/context";
+import {
+  anchorCode,
+  isAnchor,
+  resolveTranslate,
+  spriteCenter,
+  spriteCenterFromCode,
+} from "../../material/anchor";
 import { createInstancedSpriteMaterialEnhancer } from "../../material/enhancer";
+import type { InstancedSpriteBaseState } from "../../material/enhancer/instancedSprite/instancedSpriteBaseEnhancer/types";
+import { resolveOrientation } from "../../material/orientation";
 import type { CustomObject3DEventMap } from "../../object3DEvent";
 import { getWebGPU } from "../../utils";
+import type { Anchor, Overlap } from "../../type";
 import { buildBatchIndexMap } from "../batchIndexMap";
 import { GEOMETRY_TYPES, type GeometryType } from "../constants";
 import { PickableMesh } from "../pickableMesh";
@@ -60,6 +78,9 @@ export type InstancedSpriteOptions = {
   renderOrder?: number;
   ctx: EventContext;
   geometryType: SpriteGeometryType;
+  /** Declutter pair group shared with the layer's labels in this tile; set
+   *  for billboards only (see `declutterPairGroup`). */
+  pairGroup?: number;
 };
 
 type PositionsInfo = {
@@ -74,7 +95,126 @@ type PositionsInfo = {
   batchIDSize: number;
   nPositions: number;
   RTE: boolean;
+  /** Per-anchor tangent bearing in degrees clockwise from north, present only
+   *  when the engine placed these anchors along a line. */
+  bearings: Float32Array<ArrayBufferLike> | null;
+  /** Per-anchor `(min, max]` ground metres per screen pixel it is shown over,
+   *  two floats each. Present exactly when `bearings` is. */
+  scaleBands: Float32Array<ArrayBufferLike> | null;
 };
+
+/** `f64` values per anchor in `lineAnchorPlace`'s input and output. Must match
+ *  `LINE_ANCHOR_STRIDE` / `LINE_ANCHOR_RESULT_STRIDE` in
+ *  `crates/navara_wasm_api/src/line_label.rs`. */
+const LINE_ANCHOR_STRIDE = 15;
+const LINE_ANCHOR_RESULT_STRIDE = 5;
+
+type SpriteMaterial = (NavaraPointMesh | NavaraBillboardMesh)["material"];
+
+/** Scratch for `_quadBox`: read straight back into each candidate. */
+const _tmpQuadBox = new Float64Array(4);
+
+/** Which of the quad's placement inputs have a batch slot, so `_quadBox`
+ *  reads the texture only for them. Checked once per pass. */
+type PlacementSlots = { anchor: boolean; offset: boolean };
+
+/** The box `lineAnchorPlace` resolved for an along-line anchor, in the same
+ *  scratch as `_quadBox`. */
+function placedQuadBox(placed: Float64Array, offset: number): Float64Array {
+  _tmpQuadBox[0] = placed[offset + 1];
+  _tmpQuadBox[1] = placed[offset + 2];
+  _tmpQuadBox[2] = placed[offset + 3];
+  _tmpQuadBox[3] = placed[offset + 4];
+  return _tmpQuadBox;
+}
+
+/** A sprite material's orientation options, with their defaults resolved. */
+type SpriteOrientation = {
+  /** Degrees, as the material gives it. */
+  rotation: number;
+  facing: "upright" | "flat";
+  follow: boolean;
+};
+
+/** Where a sprite material puts the quad relative to its anchor point. */
+type SpritePlacement = {
+  anchor: Anchor;
+  /** x right, y down, in the unit of the size. */
+  offset: [number, number];
+};
+
+function spritePlacement(material: SpriteMaterial): SpritePlacement {
+  // The engine sends an anchor name it parsed, so it is always an `Anchor`.
+  const anchor = (material.anchor ?? "center") as Anchor;
+  const offset = material.offset;
+  return { anchor, offset: [offset?.x ?? 0, offset?.y ?? 0] };
+}
+
+function spriteOrientation(material: SpriteMaterial): SpriteOrientation {
+  const { flatFacing, rotateWithCamera } = resolveOrientation(
+    "billboardFacing" in material
+      ? material.billboardFacing
+      : material.pointFacing,
+    material.rotateWithCamera,
+    material.placement,
+  );
+  return {
+    rotation: material.rotation ?? 0,
+    facing: flatFacing ? "flat" : "upright",
+    follow: rotateWithCamera,
+  };
+}
+
+/**
+ * Grid resolution of the sprite quad while any feature can be flat.
+ *
+ * A flat sprite is wrapped onto the globe per vertex (`nvr_quadOffset` in
+ * `quad_orientation.glsl`), and a plain two-triangle quad has only its four
+ * corners to bend: it stays one flat plane, a tangent plane lowered onto the
+ * surface, and a large sprite at globe scale visibly fails to follow the
+ * curvature. A grid bends across its whole area. Upright sprites keep the
+ * plain quad, since a planar grid would only cost vertices.
+ */
+const FLAT_QUAD_SEGMENTS = 4;
+
+/**
+ * Set the per-vertex attributes of a unit quad (`[-0.5, 0.5]²`, uv `[0, 1]²`)
+ * split into `segments × segments` cells. Every cell is triangulated along the
+ * same diagonal as the one-cell quad, so a planar grid draws the same pixels.
+ * The shaders read only `position.xy` and `uv`, so the grid resolution is
+ * invisible to them.
+ */
+function setQuadGrid(geometry: BufferGeometry, segments: number): void {
+  const side = segments + 1;
+  const positions = new Float32Array(side * side * 3);
+  const uvs = new Float32Array(side * side * 2);
+  for (let j = 0; j < side; j++) {
+    for (let i = 0; i < side; i++) {
+      const v = j * side + i;
+      const u = i / segments;
+      const w = j / segments;
+      positions[v * 3] = u - 0.5;
+      positions[v * 3 + 1] = w - 0.5;
+      uvs[v * 2] = u;
+      uvs[v * 2 + 1] = w;
+    }
+  }
+  const index = new Uint16Array(segments * segments * 6);
+  let k = 0;
+  for (let j = 0; j < segments; j++) {
+    for (let i = 0; i < segments; i++) {
+      const bl = j * side + i;
+      const br = bl + 1;
+      const tl = bl + side;
+      const tr = tl + 1;
+      index.set([bl, br, tr, bl, tr, tl], k);
+      k += 6;
+    }
+  }
+  geometry.setAttribute("position", new BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new BufferAttribute(uvs, 2));
+  geometry.setIndex(new BufferAttribute(index, 1));
+}
 
 /** Reusable Vector2 to avoid per-frame allocations in onBeforeRender. */
 const _tmpSize = new Vector2();
@@ -138,7 +278,7 @@ export class InstancedSpriteMesh
   /**
    * Feature (batch) index → this feature's instance ids. A feature owns
    * multiple instances for MultiPoint geometry and for points derived from
-   * line/polygon vertices via `geometryTypes`, so per-feature styling must
+   * line/polygon geometry via `geometryTypes`, so per-feature styling must
    * fan out to all of them. `null` means instances and features are 1:1.
    */
   private _batchIndexToInstances: Map<number, number[]> | null = null;
@@ -149,6 +289,14 @@ export class InstancedSpriteMesh
   private _instanceBatchIndex: Float32Array | null = null;
   /** Feature count — the batch data texture's column count. */
   private _batchLength = 0;
+  /**
+   * The material's current orientation/rotation: change detection for the
+   * write-through, and the backfill for a freshly allocated batch slot.
+   */
+  private _orientation?: SpriteOrientation;
+  private _placement?: SpritePlacement;
+  /** Current grid resolution of the sprite quad (see {@link FLAT_QUAD_SEGMENTS}). */
+  private _quadSegments = 1;
   /** Instance count of the current geometry; bounds the identity fallback. */
   private _instanceCount = 0;
   private _atlas?: BillboardAtlas;
@@ -186,8 +334,14 @@ export class InstancedSpriteMesh
   private _anchors: Float64Array | null = null;
   /** Whether this mesh's instances participate in screen-space decluttering. */
   private _declutter = false;
-  /** Layer-level placement priority from the material. */
+  /** Layer-level placement rank and priority from the material. */
+  private _declutterRank = 0;
   private _declutterPriority = 0;
+  private _overlap: Overlap = "never";
+  private _ignorePlacement = false;
+  private _declutterPadding: readonly number[] = [];
+  private _standalone = true;
+  private _pairGroup: number;
   /** Per-instance priorities set through the evaluator (NaN = no override,
    *  fall back to the layer value). Lazily allocated on first use. */
   private _declutterPriorityOverrides: Float32Array | null = null;
@@ -196,12 +350,30 @@ export class InstancedSpriteMesh
   private _declutterTargets: Float32Array | null = null;
   /** True while any instance's hide factor may differ from its target. */
   private _declutterAnimating = false;
+  /** Along-line anchors' scale bands, kept from the geometry that brought
+   *  them: a terrain-height update re-sends positions without them. */
+  private _scaleBands: Float32Array<ArrayBufferLike> | null = null;
+  /** Along-line anchors' line bearings in radians, kept like the bands. */
+  private _bearings: Float32Array | null = null;
+  /** The last `lineAnchorPlace` result: per instance whether its level is on
+   *  screen, then the box its turned quad covers, which the declutter pass
+   *  uses in place of the unrotated one. */
+  private _linePlacement: Float64Array | null = null;
+  /** The material's `spacing` the bands were built for. */
+  private _spacingPx = 250;
+  /** Per instance, whether the last placement pass found its level off
+   *  screen. Such instances fade out and take no declutter space. */
+  private _outOfBand: Uint8Array | null = null;
+  /** Reused `lineAnchorPlace` input. */
+  private _bandInput = new Float64Array(0);
+  private _bandViewMatrix = new Float64Array(16);
 
   constructor(options: InstancedSpriteOptions) {
     super();
     this.renderOrder = options.renderOrder ?? this.renderOrder;
     this.ctx = options.ctx;
     this._geometryType = options.geometryType;
+    this._pairGroup = options.pairGroup ?? 0;
     this.ctx.declutter?.register(this);
     // `processObjectRemoved` dispatches this for every removed mesh; it is the
     // reliable teardown signal (this class's dispose() is not called there).
@@ -211,9 +383,12 @@ export class InstancedSpriteMesh
   }
 
   setActive(active: boolean) {
+    const activating = active && !this._active;
     this._active = active;
     this.updateVisibility();
-    this.ctx.declutter?.markDirty();
+    // Along-line anchors stay hidden until placed, and a hidden batch is never
+    // placed, so the swap must not wait out the throttle.
+    this.ctx.declutter?.markDirty(activating && this._scaleBands !== null);
   }
 
   /**
@@ -241,6 +416,110 @@ export class InstancedSpriteMesh
 
   // --- DeclutterParticipant ---
 
+  /**
+   * Show each along-line anchor only while its level is the one on screen, so
+   * `spacing` holds in screen pixels at every depth of the view. A sprite
+   * longer along its line than about three quarters of `spacing` asks for a
+   * sparser level, as MapLibre stretches `symbol-spacing` for an icon. Also
+   * resolves the box each turned quad covers on screen, for
+   * `collectDeclutterCandidates`. Runs at the placement pass's cadence,
+   * before candidates are collected, whether or not this mesh declutters.
+   */
+  placeLineLabels(camera: PerspectiveCamera, heightPx: number): void {
+    const bands = this._scaleBands;
+    const bearings = this._bearings;
+    const anchors = this._anchors;
+    const outOfBand = this._outOfBand;
+    const material = this.material as ShaderMaterial;
+    const enhancer = this._enhancedMaterial;
+    if (
+      !this.visible ||
+      !bands ||
+      !bearings ||
+      !anchors ||
+      !outOfBand ||
+      !enhancer
+    ) {
+      return;
+    }
+
+    const count = Math.min(this._instanceCount, anchors.length / 3);
+    if (this._bandInput.length < count * LINE_ANCHOR_STRIDE) {
+      this._bandInput = new Float64Array(count * LINE_ANCHOR_STRIDE);
+    }
+    const input = this._bandInput;
+    const batchIndices = this._instanceBatchIndex;
+    const state = enhancer.states();
+    const slots = this._placementSlots();
+    // The quad's box, as in `collectDeclutterCandidates`.
+    const uvRect = state.billboard
+      ? (this.geometry?.getAttribute("instanceUvRect") as
+          InstancedBufferAttribute | undefined)
+      : undefined;
+    for (let i = 0; i < count; i++) {
+      const o = i * LINE_ANCHOR_STRIDE;
+      const batchIndex = batchIndices ? batchIndices[i] : i;
+      const batchSize = readBatchScalar(material, batchIndex, "size");
+      const size =
+        batchSize !== undefined && batchSize >= 0.0 ? batchSize : state.scale;
+      const rectH = uvRect ? uvRect.getW(i) : 0;
+      const aspect = uvRect && rectH > 0 ? uvRect.getZ(i) / rectH : 1.0;
+      input[o] = anchors[i * 3];
+      input[o + 1] = anchors[i * 3 + 1];
+      input[o + 2] = anchors[i * 3 + 2];
+      input[o + 3] =
+        readBatchScalar(material, batchIndex, "height") ?? state.addHeight;
+      input[o + 4] = bands[i * 2];
+      input[o + 5] = bands[i * 2 + 1];
+      input[o + 6] = state.sizeInMeters ? 1 : 0;
+      const box = this._quadBox(
+        material,
+        state,
+        slots,
+        batchIndex,
+        aspect,
+        size,
+        rectH,
+      );
+      input[o + 7] = box[0];
+      input[o + 8] = box[1];
+      input[o + 9] = box[2];
+      input[o + 10] = box[3];
+      // Mirror of instancedSprite.vert.glsl: the batch texture's rotation and
+      // orientation, falling back to the material's, plus the bearing when
+      // the quad follows its line.
+      const rotation =
+        readBatchScalar(material, batchIndex, "rotation") ?? state.rotation;
+      input[o + 11] = state.instanceBearing ? rotation + bearings[i] : rotation;
+      input[o + 12] = bearings[i];
+      const packed = readBatchScalar(material, batchIndex, "orientation");
+      const orientation =
+        packed === undefined ? state : unpackOrientation(packed);
+      input[o + 13] = orientation.flatFacing ? 1 : 0;
+      input[o + 14] = orientation.rotateWithCamera ? 1 : 0;
+    }
+
+    camera.updateMatrixWorld();
+    this._bandViewMatrix.set(camera.matrixWorldInverse.elements);
+    const placed = lineAnchorPlace(
+      input.subarray(0, count * LINE_ANCHOR_STRIDE),
+      this._bandViewMatrix,
+      heightPx,
+      MathUtils.degToRad(camera.fov),
+      this._spacingPx,
+    );
+    this._linePlacement = placed;
+
+    for (let i = 0; i < count; i++) {
+      const out = placed[i * LINE_ANCHOR_RESULT_STRIDE] === 0 ? 1 : 0;
+      if (outOfBand[i] === out) continue;
+      outOfBand[i] = out;
+      // Coming back in band, a decluttered instance waits for the pass to
+      // grant it space like any fresh candidate.
+      if (out || !this._declutter) this.setDeclutterHiddenByInstance(i, !!out);
+    }
+  }
+
   collectDeclutterCandidates(out: DeclutterCandidate[]): void {
     if (!this.visible || !this._declutter || !this._anchors) return;
     const enhancer = this._enhancedMaterial;
@@ -248,8 +527,6 @@ export class InstancedSpriteMesh
     const material = this.material as ShaderMaterial;
 
     const state = enhancer.states();
-    const cx = Math.min(Math.max(state.center[0], -0.5), 0.5);
-    const cy = Math.min(Math.max(state.center[1], -0.5), 0.5);
     // Mirror of instancedSprite.vert.glsl — aspect is per-instance
     // (from the atlas rect), not a material-level uniform; there is no
     // material-wide "aspect" state to read.
@@ -261,9 +538,14 @@ export class InstancedSpriteMesh
     const batchIndices = this._instanceBatchIndex;
     const overrides = this._declutterPriorityOverrides;
     const targets = this._declutterTargets;
+    const outOfBand = this._outOfBand;
+    const placed = this._linePlacement;
+    const bearings = state.instanceBearing ? this._bearings : null;
+    const slots = this._placementSlots();
     const count = Math.min(this._instanceCount, anchors.length / 3);
 
     for (let i = 0; i < count; i++) {
+      if (outOfBand?.[i]) continue;
       // Style values mirror the shader: read the batch data texture, falling
       // back to the material-level state where a slot was never allocated.
       const batchIndex = batchIndices ? batchIndices[i] : i;
@@ -285,21 +567,57 @@ export class InstancedSpriteMesh
       if (uvRect && (rectW <= 0.0 || rectH <= 0.0)) continue;
       const aspect = uvRect ? rectW / rectH : 1.0;
 
-      // Mirror of instancedSprite.vert.glsl:122-125 — the quad spans
-      // (position.xy - center) * vec2(aspect, 1) * size around the anchor.
+      // Mirror of instancedSprite.vert.glsl — the quad spans
+      // `_quadBox` around the anchor, turned as `placeLineLabels` resolved for an along-line anchor, and by
+      // the kernel from the feature's own orientation (plus the line bearing
+      // the shader adds) otherwise.
+      const p = i * LINE_ANCHOR_RESULT_STRIDE;
+      const packed = placed
+        ? undefined
+        : readBatchScalar(material, batchIndex, "orientation");
+      const orientation =
+        packed === undefined ? state : unpackOrientation(packed);
+      const rotation = placed
+        ? 0
+        : (readBatchScalar(material, batchIndex, "rotation") ??
+            state.rotation) + (bearings ? bearings[i] : 0);
+      const box = placed
+        ? placedQuadBox(placed, p)
+        : this._quadBox(
+            material,
+            state,
+            slots,
+            batchIndex,
+            aspect,
+            size,
+            rectH,
+          );
       out.push({
         anchorX: anchors[i * 3],
         anchorY: anchors[i * 3 + 1],
         anchorZ: anchors[i * 3 + 2],
         addHeight,
-        minX: (-0.5 - cx) * aspect * size,
-        maxX: (0.5 - cx) * aspect * size,
-        minY: (-0.5 - cy) * size,
-        maxY: (0.5 - cy) * size,
+        minX: box[0],
+        maxX: box[1],
+        minY: box[2],
+        maxY: box[3],
         sizeInMeters: state.sizeInMeters,
+        rank: this._declutterRank,
         // NaN-safe: an unset override falls back to the layer priority.
         priority: Number.isNaN(override) ? this._declutterPriority : override,
         isShown: targets ? targets[i] === 0 : true,
+        overlap: this._overlap,
+        ignorePlacement: this._ignorePlacement,
+        padding: this._declutterPadding,
+        pairGroup: this._pairGroup,
+        featureIndex: batchIndex,
+        pairRole: "billboard",
+        standalone: this._standalone,
+        flatFacing: !placed && orientation.flatFacing,
+        rotateWithCamera: placed !== null || orientation.rotateWithCamera,
+        translate: state.translate,
+        translateViewport: state.translateViewport,
+        rotation,
         owner: this,
         handle: i,
       });
@@ -308,6 +626,48 @@ export class InstancedSpriteMesh
 
   applyDeclutter(handle: number, hidden: boolean): void {
     this.setDeclutterHiddenByInstance(handle, hidden);
+  }
+
+  private _placementSlots(): PlacementSlots {
+    const material = this.material as Material;
+    return {
+      anchor: hasBatchScalarSlot(material, "anchor"),
+      offset: hasBatchScalarSlot(material, "offsetX"),
+    };
+  }
+
+  /**
+   * The unrotated quad around its anchor, `[minX, maxX, minY, maxY]` in the
+   * unit of `size`, y up — mirror of instancedSprite.vert.glsl: the batch
+   * texture's anchor and offset, falling back to the material's. `rectH` is
+   * the image's pixel height, which `sizeRelativeToImage` scales by `size`.
+   */
+  private _quadBox(
+    material: ShaderMaterial,
+    state: InstancedSpriteBaseState,
+    slots: PlacementSlots,
+    batchIndex: number,
+    aspect: number,
+    size: number,
+    rectH: number,
+  ): Float64Array {
+    const code = slots.anchor
+      ? readBatchScalar(material, batchIndex, "anchor")
+      : undefined;
+    const [cx, cy] =
+      code === undefined ? state.anchor : spriteCenterFromCode(code);
+    let [ox, oy] = state.offset;
+    if (slots.offset) {
+      ox = readBatchScalar(material, batchIndex, "offsetX") ?? ox;
+      oy = readBatchScalar(material, batchIndex, "offsetY") ?? oy;
+    }
+    const height = state.sizeRelativeToImage ? size * rectH : size;
+    const box = _tmpQuadBox;
+    box[0] = (-0.5 - cx) * aspect * height + ox;
+    box[1] = (0.5 - cx) * aspect * height + ox;
+    box[2] = (-0.5 - cy) * height - oy;
+    box[3] = (0.5 - cy) * height - oy;
+    return box;
   }
 
   stepDeclutterFade(deltaMs: number): boolean {
@@ -342,20 +702,26 @@ export class InstancedSpriteMesh
   }
 
   private _cacheDeclutterState(m: NavaraPointMesh | NavaraBillboardMesh) {
-    const nextDeclutter = m.material.declutter ?? true;
-    if (this._declutter && !nextDeclutter) {
+    const settings = resolveDeclutterSettings(m.material);
+    if (this._declutter && !settings.participates) {
       // Leaving declutter mode: clear hides the pass applied — the mesh stops
       // producing candidates, so nothing else would ever re-show them.
       this._clearDeclutterHidden();
     }
-    this._declutter = nextDeclutter;
-    this._declutterPriority = m.material.declutterPriority ?? 0;
+    this._declutter = settings.participates;
+    this._declutterRank = settings.rank;
+    this._declutterPriority = settings.priority;
+    this._overlap = settings.overlap;
+    this._ignorePlacement = settings.ignorePlacement;
+    this._declutterPadding = settings.padding;
+    this._standalone = settings.standalone;
   }
 
   private _clearDeclutterHidden(): void {
     const targets = this._declutterTargets;
     if (!targets) return;
-    targets.fill(0.0);
+    const outOfBand = this._outOfBand;
+    for (let i = 0; i < targets.length; i++) targets[i] = outOfBand?.[i] ?? 0;
     // Everything fades back in from wherever its hide factor currently is.
     this._declutterAnimating = true;
   }
@@ -404,6 +770,8 @@ export class InstancedSpriteMesh
 
     this._cacheDeclutterState(m);
     this._cacheAnchors(positionsInfo, m.transform);
+    this._orientation = spriteOrientation(m.material);
+    this._placement = spritePlacement(m.material);
 
     // Create Geometry
     this.geometry = this._initGeometry(positionsInfo, m);
@@ -422,6 +790,8 @@ export class InstancedSpriteMesh
     const material = (this._classicMaterial ?? this.material) as ShaderMaterial;
 
     this._cacheDeclutterState(m);
+    const placement = spritePlacement(m.material);
+    const orientation = spriteOrientation(m.material);
 
     if (material.visible !== m.material.show) {
       material.visible = m.material.show ?? true;
@@ -445,11 +815,21 @@ export class InstancedSpriteMesh
     enhancer.update({
       base: {
         scale: m.material.size ?? 100.0,
-        center: [m.material.center?.x ?? 0.0, m.material.center?.y ?? 0.0],
+        anchor: spriteCenter(placement.anchor),
+        offset: placement.offset,
+        ...resolveTranslate(m.material),
+        flatFacing: orientation.facing === "flat",
+        rotateWithCamera: orientation.follow,
+        rotation: m.material.rotation ?? 0,
         sizeInMeters: m.material.sizeInMeters ?? true,
+        sizeRelativeToImage:
+          "sizeRelativeToImage" in m.material
+            ? (m.material.sizeRelativeToImage ?? false)
+            : false,
         offsetDepth: m.material.offsetDepth ?? true,
         transparent: m.material.transparent ?? true,
         depthTest: m.material.depthTest ?? true,
+        backfaceCulling: m.material.backfaceCulling ?? false,
         color: batchColorEnabled ? undefined : (m.material.color ?? 0xffffff),
         opacity: m.material.opacity ?? 1.0,
         addHeight: m.material.height ?? 0.0,
@@ -461,6 +841,13 @@ export class InstancedSpriteMesh
         emissiveIntensity: m.material.emissiveIntensity ?? 0,
       },
     });
+
+    // Orientation/rotation are uniform-driven until some feature gets its own
+    // value. Once a slot exists every feature reads the texture, so a material
+    // change has to be written through or evaluator overrides would outlive
+    // it. Mirrors BatchedSdfTextMesh._applyUpdate.
+    this._writeThroughOrientation(orientation);
+    this._writeThroughPlacement(placement);
 
     // Position updates (per-instance attributes)
     {
@@ -514,36 +901,21 @@ export class InstancedSpriteMesh
   ) {
     invariant(positionsInfo.batchIDs, "Batch IDs not found!");
 
-    // prettier-ignore
-    const vertices = new Float32Array([
-      -0.5, -0.5, 0.0, // v0
-       0.5, -0.5, 0.0, // v1
-       0.5,  0.5, 0.0, // v2
-      -0.5, -0.5, 0.0, // v3
-       0.5,  0.5, 0.0, // v4
-      -0.5,  0.5, 0.0, // v5
-    ]);
-
-    // prettier-ignore
-    const uvs = new Float32Array([
-      0.0, 0.0, // v0
-      1.0, 0.0, // v1
-      1.0, 1.0, // v2
-      0.0, 0.0, // v3
-      1.0, 1.0, // v4
-      0.0, 1.0, // v5
-    ]);
-
     const instanceCount = positionsInfo.nPositions;
+    this._scaleBands = positionsInfo.scaleBands;
+    this._linePlacement = null;
+    this._spacingPx = m.material.spacing ?? 250;
+    // Every level of an along-line pattern arrives at once; until the first
+    // placement pass picks one per anchor, showing them would flash them all.
+    this._outOfBand = positionsInfo.scaleBands
+      ? new Uint8Array(instanceCount).fill(1)
+      : null;
 
     // Create the Instanced Mesh
     // We use InstancedBufferGeometry to inject our custom attributes
     const instancedGeometry = new InstancedBufferGeometry();
-    instancedGeometry.setAttribute(
-      "position",
-      new BufferAttribute(vertices, 3),
-    );
-    instancedGeometry.setAttribute("uv", new BufferAttribute(uvs, 2));
+    this._quadSegments = this._neededQuadSegments();
+    setQuadGrid(instancedGeometry, this._quadSegments);
     instancedGeometry.instanceCount = instanceCount;
 
     this._instanceCount = instanceCount;
@@ -595,7 +967,7 @@ export class InstancedSpriteMesh
     // Declutter hide factors (0 = shown … 1 = hidden). Decluttered instances
     // start hidden and fade in once the placement pass grants them space, so
     // dense tiles don't flash their full clutter before the first pass runs.
-    const initialHide = this._declutter ? 1.0 : 0.0;
+    const initialHide = this._declutter || this._outOfBand ? 1.0 : 0.0;
     const declutterBuffer = new Float32Array(instanceCount).fill(initialHide);
     this._declutterTargets = new Float32Array(instanceCount).fill(initialHide);
     instancedGeometry.setAttribute(
@@ -609,6 +981,24 @@ export class InstancedSpriteMesh
         positionsInfo.batchIDSize,
       ),
     );
+    // Along-line anchors carry their line's tangent. The shader adds it to the
+    // rotation the batch texture resolves, so it must be per instance: one
+    // feature owns many anchors with different bearings, while the batch
+    // texture is keyed per feature.
+    this._bearings = null;
+    if (positionsInfo.bearings) {
+      const radians = new Float32Array(positionsInfo.bearings.length);
+      for (let i = 0; i < radians.length; i++) {
+        radians[i] = positionsInfo.bearings[i] * MathUtils.DEG2RAD;
+      }
+      this._bearings = radians;
+      if (m.material.rotateToLine ?? true) {
+        instancedGeometry.setAttribute(
+          "instanceBearing",
+          new InstancedBufferAttribute(radians, 1),
+        );
+      }
+    }
 
     return instancedGeometry;
   }
@@ -618,6 +1008,9 @@ export class InstancedSpriteMesh
     m: NavaraPointMesh | NavaraBillboardMesh,
   ) {
     const isBillboard = m instanceof NavaraBillboardMesh;
+    const placement = spritePlacement(m.material);
+    const orientation = spriteOrientation(m.material);
+    // Face culling (`side`) is set by the enhancer from `backfaceCulling`.
     const material = new ShaderMaterial();
 
     // Create enhancer
@@ -629,14 +1022,29 @@ export class InstancedSpriteMesh
       base: {
         useRTE: positionsInfo.RTE,
         billboard: isBillboard,
+        // Must agree with `_initGeometry`'s decision to upload the attribute:
+        // the define is what declares it, and an undeclared attribute reads 0.
+        instanceBearing: Boolean(
+          positionsInfo.bearings && (m.material.rotateToLine ?? true),
+        ),
         scale: m.material.size ?? 100.0,
-        center: [m.material.center?.x ?? 0.0, m.material.center?.y ?? 0.0],
+        anchor: spriteCenter(placement.anchor),
+        offset: placement.offset,
+        ...resolveTranslate(m.material),
+        flatFacing: orientation.facing === "flat",
+        rotateWithCamera: orientation.follow,
+        rotation: m.material.rotation ?? 0,
         sizeInMeters: m.material.sizeInMeters ?? true,
+        sizeRelativeToImage:
+          "sizeRelativeToImage" in m.material
+            ? (m.material.sizeRelativeToImage ?? false)
+            : false,
         offsetDepth: m.material.offsetDepth ?? true,
         alphaTest: isBillboard ? (m.material.alphaTest ?? 0.0) : 0.0,
         pickable: false,
         transparent: m.material.transparent ?? true,
         depthTest: m.material.depthTest ?? true,
+        backfaceCulling: m.material.backfaceCulling ?? false,
         color: m.material.color ?? 0xffffff,
         opacity: m.material.opacity ?? 1.0,
         addHeight: m.material.height ?? 0.0,
@@ -653,6 +1061,7 @@ export class InstancedSpriteMesh
     // Initialize uniforms early so they're available before onBeforeCompile
     const mutates = enhancer.mutates();
     mutates.updateUniforms(material.uniforms, enhancer.states());
+    material.uniforms.nvrHorizonMinHeight = this.ctx.uniforms.horizonMinHeight;
 
     // Register for per-feature styling before either material path: the WebGPU
     // node graph bakes the batch texture's layout rows in as constants, so the
@@ -1145,6 +1554,11 @@ export class InstancedSpriteMesh
     const batchIDs = buf.removeF32(batchIdsData.data);
     const batchIDSize = batchIdsData.size;
 
+    // Only present for along-line placement, where the engine resampled the
+    // line and knows each anchor's tangent and scale band.
+    const bearings = g.bearings ? buf.removeF32(g.bearings.data) : null;
+    const scaleBands = g.scale_bands ? buf.removeF32(g.scale_bands.data) : null;
+
     const positionData = g.position;
     const position = positionData
       ? buf.removeF32(positionData.data)
@@ -1161,6 +1575,8 @@ export class InstancedSpriteMesh
         positionSize,
         nPositions,
         RTE: false,
+        bearings,
+        scaleBands,
       };
     }
 
@@ -1190,6 +1606,8 @@ export class InstancedSpriteMesh
         positionSize: positionHighSize,
         nPositions,
         RTE: true,
+        bearings,
+        scaleBands,
       };
     }
 
@@ -1341,12 +1759,14 @@ export class InstancedSpriteMesh
     batchIndex: number,
     attribute: BatchedAttributeName,
     value: number | number[] | boolean,
+    defaults?: Partial<BatchAttributeDefaults>,
   ): boolean {
     const written = updateBatchAttribute(
       this.material as ShaderMaterial,
       batchIndex,
       attribute,
       value,
+      defaults,
     );
     if (written) {
       // WebGPU first-write gates (eager allocation stamped the defines
@@ -1461,6 +1881,182 @@ export class InstancedSpriteMesh
   }
 
   /**
+   * Orientation and in-plane rotation for one feature, overriding the
+   * material's. `rotation` is in degrees, clockwise seen from the front; it is
+   * converted to the radians the shader wants here, matching the material path.
+   */
+  setFeatureFacingByBatchIndex(batchIndex: number, facing: "upright" | "flat") {
+    // Orientation turns the quad, so it moves the box the declutter pass
+    // reserves and, along a line, the level the anchor asks for.
+    if (
+      this._updateBatchAttribute(
+        batchIndex,
+        "flatFacing",
+        facing === "flat",
+        this._batchDefaults(),
+      )
+    ) {
+      this.ctx.declutter?.markDirty();
+    }
+    // The first per-feature facing allocates the orientation slot, from which
+    // point any feature may be flat.
+    this._syncQuadGrid();
+  }
+
+  setFeatureRotateWithCameraByBatchIndex(batchIndex: number, follow: boolean) {
+    if (
+      this._updateBatchAttribute(
+        batchIndex,
+        "rotateWithCamera",
+        follow,
+        this._batchDefaults(),
+      )
+    ) {
+      this.ctx.declutter?.markDirty();
+    }
+  }
+
+  setFeatureRotationByBatchIndex(batchIndex: number, degrees: number) {
+    if (
+      this._updateBatchAttribute(
+        batchIndex,
+        "rotation",
+        degrees * MathUtils.DEG2RAD,
+        this._batchDefaults(),
+      )
+    ) {
+      this.ctx.declutter?.markDirty();
+    }
+  }
+
+  /** Part of the quad placed at the anchor point, for one feature. */
+  setFeatureAnchorByBatchIndex(batchIndex: number, anchor: Anchor) {
+    if (!isAnchor(anchor)) return;
+    if (
+      this._updateBatchAttribute(
+        batchIndex,
+        "anchor",
+        anchorCode(anchor),
+        this._batchDefaults(),
+      )
+    ) {
+      this.ctx.declutter?.markDirty();
+    }
+  }
+
+  /** Shift from the anchor point for one feature, x right and y down, in the
+   *  unit of the size. */
+  setFeatureOffsetByBatchIndex(batchIndex: number, x: number, y: number) {
+    if (
+      this._updateBatchAttribute(
+        batchIndex,
+        "offset",
+        [x, y],
+        this._batchDefaults(),
+      )
+    ) {
+      this.ctx.declutter?.markDirty();
+    }
+  }
+
+  /**
+   * Grid resolution the quad needs: the curved grid while any feature can be
+   * flat (the material says so, or the evaluator has given some feature its
+   * own facing), the plain quad otherwise.
+   */
+  private _neededQuadSegments(): number {
+    const anyFlat =
+      this._orientation?.facing === "flat" ||
+      hasBatchScalarSlot(this.material as Material, "orientation");
+    return anyFlat ? FLAT_QUAD_SEGMENTS : 1;
+  }
+
+  /** Swap the quad's vertex attributes when the needed resolution changed. */
+  private _syncQuadGrid(): void {
+    const segments = this._neededQuadSegments();
+    if (segments === this._quadSegments || !this.geometry) return;
+    this._quadSegments = segments;
+    setQuadGrid(this.geometry, segments);
+  }
+
+  /** The material's uniform-backed values, backfilled into a new batch slot. */
+  private _batchDefaults(): BatchAttributeDefaults | undefined {
+    if (!this._orientation || !this._placement) return undefined;
+    const { rotation, facing, follow } = this._orientation;
+    return {
+      rotation: rotation * MathUtils.DEG2RAD,
+      flatFacing: facing === "flat",
+      rotateWithCamera: follow,
+      anchor: anchorCode(this._placement.anchor),
+      offset: this._placement.offset,
+    };
+  }
+
+  /**
+   * Push the material's anchor/offset onto every feature when the material
+   * value changed and a slot exists — the same guards, for the same reasons,
+   * as {@link _writeThroughOrientation}.
+   */
+  private _writeThroughPlacement(next: SpritePlacement): void {
+    const prev = this._placement;
+    this._placement = next;
+    if (!prev) return;
+
+    const mat = this.material as Material;
+    const anchorChanged =
+      next.anchor !== prev.anchor && hasBatchScalarSlot(mat, "anchor");
+    const offsetChanged =
+      (next.offset[0] !== prev.offset[0] ||
+        next.offset[1] !== prev.offset[1]) &&
+      hasBatchScalarSlot(mat, "offsetX");
+    if (!anchorChanged && !offsetChanged) return;
+
+    for (let i = 0; i < this._batchLength; i++) {
+      if (anchorChanged) this.setFeatureAnchorByBatchIndex(i, next.anchor);
+      if (offsetChanged) {
+        this.setFeatureOffsetByBatchIndex(i, next.offset[0], next.offset[1]);
+      }
+    }
+  }
+
+  /**
+   * Push the material's orientation/rotation onto every feature when the
+   * material value actually **changed**, and only once a slot exists.
+   *
+   * Both guards matter. Without a slot the shader's uniform is still
+   * governing, so writing would allocate a row the layer never needed.
+   * Without the change check, the engine re-sending an unchanged material —
+   * which it does for geometry and activation updates too — would stomp
+   * evaluator overrides on every terrain tick. Mirrors the style/size writes
+   * in `BatchedSdfTextMesh._applyUpdate`.
+   */
+  private _writeThroughOrientation(next: SpriteOrientation): void {
+    const prev = this._orientation;
+    this._orientation = next;
+    // A material switched to (or away from) flat changes the quad it needs.
+    this._syncQuadGrid();
+    if (!prev) return;
+
+    const mat = this.material as Material;
+    const rotationChanged =
+      next.rotation !== prev.rotation && hasBatchScalarSlot(mat, "rotation");
+    const orientationChanged =
+      (next.facing !== prev.facing || next.follow !== prev.follow) &&
+      hasBatchScalarSlot(mat, "orientation");
+    if (!rotationChanged && !orientationChanged) return;
+
+    for (let i = 0; i < this._batchLength; i++) {
+      if (rotationChanged) {
+        this.setFeatureRotationByBatchIndex(i, next.rotation);
+      }
+      if (orientationChanged) {
+        this.setFeatureFacingByBatchIndex(i, next.facing);
+        this.setFeatureRotateWithCameraByBatchIndex(i, next.follow);
+      }
+    }
+  }
+
+  /**
    * Give one feature its own image, packed into this mesh's texture atlas.
    * Loads are deduplicated by URL, so styling many features with few distinct
    * images fetches each image once. On load failure the feature keeps its
@@ -1555,6 +2151,11 @@ export class InstancedSpriteMesh
     this._anchors = null;
     this._declutterTargets = null;
     this._declutterPriorityOverrides = null;
+    this._scaleBands = null;
+    this._bearings = null;
+    this._linePlacement = null;
+    this._outOfBand = null;
+    this._bandInput = new Float64Array(0);
     this._imageOverrides.clear();
     this._requestedImageUrls.clear();
   }

@@ -32,6 +32,8 @@ function convertGlyphs(glyphs: WasmShapedGlyph[]) {
       xOffset: g.x_offset,
       yOffset: g.y_offset,
       charClass: g.char_class,
+      continuesCluster: g.continues_cluster,
+      direction: g.direction,
     };
     g.free();
     return out;
@@ -66,6 +68,7 @@ function convertShapeResult(sr: WasmShapeTextResult | undefined) {
     ascender: sr.ascender,
     descender: sr.descender,
     lineGap: sr.line_gap,
+    allowsLetterSpacing: sr.allows_letter_spacing,
   };
   sr.free();
   return result;

@@ -1,14 +1,18 @@
 import {
   COLOR_GLYPH_PX_SIZE,
   GlyphCharClass,
+  GlyphDirection,
   SDF_PX_SIZE,
   type GlyphMetrics,
   type ShapedGlyph,
   type ShapeTextResult,
 } from "@navaramap/font";
 
+import { ANCHOR_ALIGN } from "../../material/anchor";
+import type { Anchor } from "../../type";
+
 /**
- * Pure text-layout helpers: line breaking, paragraph direction, and turning a
+ * Pure text-layout helpers: line breaking and turning a
  * shaping result into positioned glyph quads in em space.
  *
  * Nothing here touches three.js or WASM, which is what makes the layout rules
@@ -23,63 +27,99 @@ export const ALIGN_FACTORS: Record<string, number> = {
   right: 1,
 };
 
-/** Line width in font units: advances summed, trailing whitespace ignored so
- *  it never affects alignment or the block width. */
-export function lineWidthFu(line: ShapedGlyph[]): number {
+/** The alignment factor for `textAlign`, resolving `"auto"` to the
+ *  horizontal side of the label's anchor. */
+export function resolveTextAlign(
+  textAlign: string | undefined,
+  anchor: Anchor,
+): number {
+  return textAlign === "auto"
+    ? ANCHOR_ALIGN[anchor][0]
+    : (ALIGN_FACTORS[textAlign ?? "center"] ?? 0.5);
+}
+
+/**
+ * Where the label's glyphs move, in ems, so its `anchor` point lands on the
+ * anchor position and `offset` (x right, y down) then shifts it. The layout's
+ * origin is the left edge and first baseline, y up.
+ */
+export function anchorShiftEm(
+  anchor: Anchor,
+  offsetX: number,
+  offsetY: number,
+  widthEm: number,
+  topEm: number,
+  bottomEm: number,
+): [number, number] {
+  const [h, v] = ANCHOR_ALIGN[anchor];
+  return [-h * widthEm + offsetX, -(topEm - v * (topEm - bottomEm)) - offsetY];
+}
+
+/**
+ * Letter spacing (font units) between two adjacent glyphs of a line: only at
+ * shaping-cluster boundaries, so marks stay on their base, and never before a
+ * line's first glyph (`prev` undefined) — trailing spacing can't arise either.
+ *
+ * `continuesCluster` refers to the shaper's (visual) order; when walking a
+ * reversed run (RTL wrapped in logical order) the flag that separates the
+ * pair sits on `prev` instead of `next`.
+ */
+function spacingBetween(
+  prev: ShapedGlyph | undefined,
+  next: ShapedGlyph,
+  spacingFu: number,
+  reversed = false,
+): number {
+  if (!prev || spacingFu === 0) return 0;
+  return (reversed ? prev : next).continuesCluster ? 0 : spacingFu;
+}
+
+/** Line width in font units: advances (plus letter spacing between clusters)
+ *  summed, trailing whitespace ignored so it never affects alignment or the
+ *  block width. */
+export function lineWidthFu(line: ShapedGlyph[], spacingFu = 0): number {
   let end = line.length;
   while (end > 0 && line[end - 1].charClass === GlyphCharClass.Whitespace) {
     end--;
   }
   let width = 0;
-  for (let i = 0; i < end; i++) width += line[i].xAdvance;
-  return width;
-}
-
-/** Strong RTL code points (Hebrew through Arabic Extended, presentation
- *  forms, and the supplementary-plane RTL blocks). Used for first-strong
- *  paragraph direction detection, mirroring the shaper's own direction guess.
- */
-const STRONG_RTL_RE =
-  /[\u0591-\u08FF\uFB1D-\uFDFD\uFE70-\uFEFC\u{10800}-\u{10FFF}\u{1E800}-\u{1EFFF}]/u;
-
-/** Paragraph direction from the first strong directional character (UAX #9
- *  P2/P3 approximation): the first letter decides, RTL ranges win over other
- *  letters. */
-export function isRtlText(text: string): boolean {
-  for (const ch of text) {
-    if (STRONG_RTL_RE.test(ch)) return true;
-    if (/\p{L}/u.test(ch)) return false;
+  for (let i = 0; i < end; i++) {
+    width += spacingBetween(line[i - 1], line[i], spacingFu) + line[i].xAdvance;
   }
-  return false;
+  return width;
 }
 
 /**
  * Split a shaped glyph run into lines: hard breaks at newline markers, greedy
  * soft breaks at the last whitespace/ideographic glyph when a line would
  * exceed `maxWidthFu` (font units; 0 disables wrapping). A word longer than
- * the wrap width overflows rather than breaking mid-word.
+ * the wrap width overflows rather than breaking mid-word. `spacingFu` is the
+ * letter spacing between clusters, counted toward the wrap width.
  *
- * When `rtl` is set, glyphs are assumed to arrive in visual order (leftmost
- * first — how the shaper emits RTL runs), i.e. reversed logical order. Each
- * hard-break segment is wrapped in logical order so the greedy fill starts at
- * the sentence start and lines stack top-to-bottom in reading order, then
- * every line is flipped back to visual order for rendering. Mixed-direction
- * lines may still break sub-optimally — same trade other map renderers make.
+ * A hard-break segment whose first non-neutral glyph was shaped right-to-left
+ * (see `GlyphDirection`) arrives in visual order (leftmost first), i.e.
+ * reversed logical order. It is wrapped in logical order so the greedy fill starts at the sentence start and lines
+ * stack top-to-bottom in reading order, then every line is flipped back to
+ * visual order for rendering. Mixed-direction lines may still break
+ * sub-optimally — same trade other map renderers make.
  */
 export function breakLines(
   glyphs: ShapedGlyph[],
   maxWidthFu: number,
-  rtl = false,
+  spacingFu = 0,
 ): ShapedGlyph[][] {
   const lines: ShapedGlyph[][] = [];
 
   const pushSegment = (segment: ShapedGlyph[]) => {
-    if (!rtl) {
-      lines.push(...wrapSegment(segment, maxWidthFu));
+    const strong = segment.find(
+      (g) => (g.direction ?? GlyphDirection.Neutral) !== GlyphDirection.Neutral,
+    );
+    if (strong?.direction !== GlyphDirection.Rtl) {
+      lines.push(...wrapSegment(segment, maxWidthFu, spacingFu, false));
       return;
     }
     segment.reverse();
-    for (const line of wrapSegment(segment, maxWidthFu)) {
+    for (const line of wrapSegment(segment, maxWidthFu, spacingFu, true)) {
       lines.push(line.reverse());
     }
   };
@@ -97,10 +137,13 @@ export function breakLines(
   return lines;
 }
 
-/** Greedy soft-wrap of a single hard-break-free segment in logical order. */
+/** Greedy soft-wrap of a single hard-break-free segment in logical order.
+ *  `reversed` marks a run flipped out of the shaper's visual order (RTL). */
 function wrapSegment(
   glyphs: ShapedGlyph[],
   maxWidthFu: number,
+  spacingFu: number,
+  reversed: boolean,
 ): ShapedGlyph[][] {
   const lines: ShapedGlyph[][] = [];
   let line: ShapedGlyph[] = [];
@@ -115,7 +158,10 @@ function wrapSegment(
       g.charClass !== GlyphCharClass.Whitespace &&
       line.length > 0 &&
       breakIdx >= 0 &&
-      width + g.xAdvance > maxWidthFu
+      width +
+        spacingBetween(line[line.length - 1], g, spacingFu, reversed) +
+        g.xAdvance >
+        maxWidthFu
     ) {
       const head = line.slice(0, breakIdx + 1);
       while (
@@ -133,12 +179,18 @@ function wrapSegment(
       line = start === -1 ? [] : tail.slice(start);
 
       width = 0;
-      for (const rest of line) width += rest.xAdvance;
+      for (let i = 0; i < line.length; i++) {
+        width +=
+          spacingBetween(line[i - 1], line[i], spacingFu, reversed) +
+          line[i].xAdvance;
+      }
       breakIdx = -1;
     }
 
+    width +=
+      spacingBetween(line[line.length - 1], g, spacingFu, reversed) +
+      g.xAdvance;
     line.push(g);
-    width += g.xAdvance;
     if (
       g.charClass === GlyphCharClass.Whitespace ||
       g.charClass === GlyphCharClass.Ideographic
@@ -165,6 +217,17 @@ export type GlyphQuad = {
   uvB: number;
   /** Sample the COLRv1 colour atlas rather than the SDF atlas. */
   isColor: boolean;
+  /**
+   * Centre, along x in em, of the rigid piece this glyph belongs to — the same
+   * value for every glyph in the piece. A piece is a word, or the glyph alone
+   * with `spreadGlyphs`.
+   *
+   * Line placement puts each piece on the curve rigidly and lays its glyphs
+   * out along that piece's tangent. Word pieces keep a word's letters square
+   * to each other on a tight bend, where per-glyph tangents splay them apart.
+   * Unused when the label is placed at a point.
+   */
+  wordCenterEmX: number;
 };
 
 /** A laid-out label: its glyph quads plus the block metrics the shader and the
@@ -174,31 +237,77 @@ export type LabelLayout = {
   /** Unique atlas glyphs referenced, for retain/release against the atlas. */
   glyphKeys: bigint[];
   widthEm: number;
-  heightEm: number;
+  /** The box `anchor` aligns to, from the first line's baseline: one line
+   *  height per line, each centered on the font's midline (the middle of its
+   *  ascender and descender), as MapLibre stacks its line boxes. */
+  topEm: number;
+  bottomEm: number;
   /** Y bounds of the actual rendered glyph bboxes, for the background quad. */
   minYEm: number;
   maxYEm: number;
+  /** X bounds of the rendered glyph bboxes, from the layout's left edge. A
+   *  glyph's ink can overhang its advance, so these can fall outside
+   *  `[0, widthEm]`; line placement measures the drawn text by them. */
+  minXEm: number;
+  maxXEm: number;
+  /** Half the width of the widest piece (see `GlyphQuad.wordCenterEmX`): how
+   *  far line placement's rigid pieces can run along their own tangent from
+   *  where they sit on the curve. */
+  maxWordHalfEm: number;
+  /** Half the width of the widest glyph quad: how far a glyph spun about its
+   *  own centre by `rotation` can reach from it along a line. */
+  maxGlyphHalfEm: number;
 };
 
 export type LayoutOptions = {
-  /** The source string — only used to detect paragraph direction. */
-  text: string;
   /** Wrap width in ems (multiples of font size); 0 disables soft wrapping. */
   maxWidth: number;
-  /** Multiplier on the font's natural line height. */
-  lineHeight: number;
+  /** Baseline-to-baseline distance in ems; the font's natural line height
+   *  when undefined. */
+  lineHeight: number | undefined;
   /** 0 left, 0.5 center, 1 right. */
   textAlign: number;
+  /** Make every glyph its own rigid piece along a line instead of its word. */
+  spreadGlyphs: boolean;
+  /** Extra space between characters in ems; ignored when the shaping result
+   *  disallows it (`allowsLetterSpacing`). Defaults to 0. */
+  letterSpacing?: number;
 };
 
 const EMPTY_LAYOUT: LabelLayout = {
   quads: [],
   glyphKeys: [],
   widthEm: 0,
-  heightEm: 0,
+  topEm: 0,
+  bottomEm: 0,
   minYEm: 0,
   maxYEm: 1,
+  minXEm: 0,
+  maxXEm: 0,
+  maxWordHalfEm: 0,
+  maxGlyphHalfEm: 0,
 };
+
+/**
+ * Give every quad from `start` to the end of `quads` the centre of the word
+ * they form, measured across the glyphs' own bounding boxes.
+ *
+ * Taken from the drawn extent rather than the advance width so the word sits on
+ * the curve where it looks centred, not where its trailing side bearing would
+ * put it. Returns half that extent.
+ */
+function assignWordCenter(quads: GlyphQuad[], start: number): number {
+  if (quads.length <= start) return 0;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  for (let i = start; i < quads.length; i++) {
+    minX = Math.min(minX, quads[i].offsetEmX);
+    maxX = Math.max(maxX, quads[i].offsetEmX + quads[i].sizeEmX);
+  }
+  const center = (minX + maxX) * 0.5;
+  for (let i = start; i < quads.length; i++) quads[i].wordCenterEmX = center;
+  return (maxX - minX) * 0.5;
+}
 
 /**
  * Turn a shaping result into positioned glyph quads.
@@ -229,29 +338,55 @@ export function buildLabelLayout(
   // predate line metrics; fall back to one em.
   const naturalLineHeight = ascender - descender + lineGap;
   const lineHeightFu =
-    (naturalLineHeight > 0 ? naturalLineHeight : unitsPerEm) *
-    options.lineHeight;
+    options.lineHeight !== undefined
+      ? options.lineHeight * unitsPerEm
+      : naturalLineHeight > 0
+        ? naturalLineHeight
+        : unitsPerEm;
 
-  // `maxWidth` is in ems so the wrap width tracks the font size in both
-  // sizeInMeters modes; font units are ems × unitsPerEm.
-  const lines = breakLines(
-    glyphs,
-    options.maxWidth * unitsPerEm,
-    isRtlText(options.text),
-  );
-  const widths = lines.map(lineWidthFu);
+  // `maxWidth` and `letterSpacing` are in ems so they track the font size in
+  // both sizeInMeters modes; font units are ems × unitsPerEm.
+  const spacingFu = shapeResult.allowsLetterSpacing
+    ? (options.letterSpacing ?? 0) * unitsPerEm
+    : 0;
+  const lines = breakLines(glyphs, options.maxWidth * unitsPerEm, spacingFu);
+  const widths = lines.map((line) => lineWidthFu(line, spacingFu));
   const blockWidthFu = Math.max(...widths);
 
   const quads: GlyphQuad[] = [];
   const glyphKeys = new Set<bigint>();
   let minYEm = Infinity;
   let maxYEm = -Infinity;
+  let minXEm = Infinity;
+  let maxXEm = -Infinity;
+  let maxWordHalfEm = 0;
+  let maxGlyphHalfEm = 0;
 
   for (let li = 0; li < lines.length; li++) {
     let cursorX = (blockWidthFu - widths[li]) * options.textAlign;
     let cursorY = -li * lineHeightFu;
+    // Start of the word being laid out, as an index into `quads`. Only the
+    // shaper's whitespace closes a word (as does the end of a line): drawing
+    // nothing is not enough, since a join control (ZWJ/ZWNJ) or a glyph missing
+    // from the atlas has no quad yet sits inside its word, and splitting there
+    // would turn one joined word into independently rotated pieces. Drawing
+    // something is not enough to continue one either: a space with ink (U+1680
+    // OGHAM SPACE MARK) still separates words, and is a piece of its own.
+    let wordStart = quads.length;
+    const closePiece = () => {
+      maxWordHalfEm = Math.max(
+        maxWordHalfEm,
+        assignWordCenter(quads, wordStart),
+      );
+      wordStart = quads.length;
+    };
 
-    for (const glyph of lines[li]) {
+    const line = lines[li];
+    for (let gi = 0; gi < line.length; gi++) {
+      const glyph = line[gi];
+      const isSpace = glyph.charClass === GlyphCharClass.Whitespace;
+      if (isSpace) closePiece();
+      cursorX += spacingBetween(line[gi - 1], glyph, spacingFu);
       const m = metricsMap.get(glyph.compositeKey);
       if (m && m.atlasW > 0 && m.atlasH > 0) {
         glyphKeys.add(glyph.compositeKey);
@@ -261,26 +396,34 @@ export function buildLabelLayout(
           ((cursorX + glyph.xOffset) * fuToPx + m.bearingX) / px;
         const offsetEmY =
           ((cursorY + glyph.yOffset) * fuToPx + m.bearingY) / px;
+        const sizeEmX = m.atlasW / px;
         const sizeEmY = m.atlasH / px;
 
         minYEm = Math.min(minYEm, offsetEmY);
         maxYEm = Math.max(maxYEm, offsetEmY + sizeEmY);
+        minXEm = Math.min(minXEm, offsetEmX);
+        maxXEm = Math.max(maxXEm, offsetEmX + sizeEmX);
+        maxGlyphHalfEm = Math.max(maxGlyphHalfEm, sizeEmX * 0.5);
 
         quads.push({
           offsetEmX,
           offsetEmY,
-          sizeEmX: m.atlasW / px,
+          sizeEmX,
           sizeEmY,
           uvL: m.atlasX,
           uvT: m.atlasY,
           uvR: m.atlasX + m.atlasW,
           uvB: m.atlasY + m.atlasH,
           isColor: m.isColor,
+          // Filled in once the piece is complete.
+          wordCenterEmX: 0,
         });
+        if (options.spreadGlyphs || isSpace) closePiece();
       }
       cursorX += glyph.xAdvance;
       cursorY += glyph.yAdvance;
     }
+    closePiece();
   }
 
   if (quads.length === 0) {
@@ -289,16 +432,19 @@ export function buildLabelLayout(
     return { ...EMPTY_LAYOUT, glyphKeys: [...glyphKeys] };
   }
 
-  // The block is as wide as its widest line and grows downward by one line
-  // height per extra line (a single line stays exactly one em tall).
+  const midEm = (ascender + descender) / 2 / unitsPerEm;
+  const lineEm = lineHeightFu / unitsPerEm;
   return {
     quads,
     glyphKeys: [...glyphKeys],
     widthEm: (blockWidthFu * fontUnitToSdfPx) / SDF_PX_SIZE,
-    heightEm:
-      (SDF_PX_SIZE + (lines.length - 1) * lineHeightFu * fontUnitToSdfPx) /
-      SDF_PX_SIZE,
+    topEm: midEm + lineEm / 2,
+    bottomEm: midEm - lineEm / 2 - (lines.length - 1) * lineEm,
     minYEm,
     maxYEm,
+    minXEm,
+    maxXEm,
+    maxWordHalfEm,
+    maxGlyphHalfEm,
   };
 }

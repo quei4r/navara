@@ -311,7 +311,9 @@ view.addLayer({ type: "raster", source: osm });
 
 ### dispose()
 
-すべてのリソースを解放し、レンダリングループを停止します。ビューが不要になったときにこのメソッドを呼び出してください。
+すべてのリソースを解放し、レンダリングループを停止します。ビューが不要になったときにこのメソッドを呼び出してください。ページ上の他のビューと共有している worker プールは、最後のビューを破棄するまで残ります（[複数ビュー](../threeview-class#複数ビュー)を参照）。
+
+`init()` の完了前に呼んでも問題なく、その場合 `init()` はビューを開始せずに完了します。破棄したビューは再初期化できません。
 
 **Syntax:**
 
@@ -328,7 +330,7 @@ view.dispose();
 
 ### resize()
 
-レンダラーのサイズを変更し、カメラのアスペクト比を更新します。`disableAutoResize` が `true` でない限り、ウィンドウリサイズ時に自動的に呼び出されます。
+レンダラーのサイズを変更し、カメラのアスペクト比を更新します。`disableAutoResize` が `true` でない限り、コンテナのサイズが変わったときに自動的に呼び出されます。
 
 **Syntax:**
 
@@ -352,19 +354,67 @@ view.resize(1920, 1080, 2);
 view.resize(undefined, undefined, window.devicePixelRatio);
 ```
 
-### setCamera()
+### getCamera()
 
-カメラの位置と向きを即座に設定します。アニメーションなしで直接カメラを移動します。
+直前のフレームのカメラを、位置・向き・視野角を持つプレーンなオブジェクトとして返します。このオブジェクトは JSON にそのまま変換でき、`setCamera()` にそのまま渡せるため、ビューの保存と復元に使えます。
 
 **Syntax:**
 
 ```tsx
-setCamera(camPos: CameraPosition): void
+getCamera(): CameraState | undefined
+```
+
+**Returns:**
+
+```tsx
+type CameraState = {
+  lng: number;
+  lat: number;
+  height: number;
+  heading: number;
+  pitch: number;
+  roll: number;
+  fov: number;
+};
+```
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `lng` | `number` | 経度（度） |
+| `lat` | `number` | 緯度（度） |
+| `height` | `number` | 楕円体からの高さ（メートル） |
+| `heading` | `number` | ヘディング角（度、0 = 北、時計回り） |
+| `pitch` | `number` | ピッチ角（度、負の値 = 下向き） |
+| `roll` | `number` | ロール角（度） |
+| `fov` | `number` | 垂直方向の視野角（度） |
+
+エンジンのカメラができるまでは `undefined` を返します。プラグインの `init()` の間と、`view.init()` が解決してから最初のフレームまでがこれにあたります。
+
+**Example:**
+
+```tsx
+// ビューを保存します（たとえば localStorage に）。
+const camera = view.getCamera();
+if (camera) localStorage.setItem("camera", JSON.stringify(camera));
+
+// あとで復元します。
+const saved = localStorage.getItem("camera");
+if (saved) view.setCamera(JSON.parse(saved));
+```
+
+### setCamera()
+
+カメラの位置と向きをアニメーションなしで設定します。エンジンは次のフレームで反映するため、それまでは [`getCamera()`](#getcamera) は前のカメラを返します。
+
+**Syntax:**
+
+```tsx
+setCamera(camPos: CameraPosition & { fov?: number }): void
 ```
 
 **Parameters:**
 
-- `camPos`: カメラ位置と向き
+- `camPos`: カメラの位置と向き、および任意で視野角。[`getCamera()`](#getcamera) の結果をそのまま渡せます。
 
 ```tsx
 type CameraPosition = {
@@ -387,6 +437,7 @@ type CameraPosition = {
 | `heading` | `number` | ヘディング角（度） |
 | `roll` | `number` | ロール角（度） |
 | `distance` | `number` | カメラの前方方向に沿ったターゲット地点からの距離（メートル）。指定した場合、カメラの前方レイが `lng`/`lat`/`height` のターゲット点をこの距離で通過するように配置されます。省略した場合は `height` がカメラ自身の高度（地表法線方向）として使用されます。 |
+| `fov` | `number` | 垂直方向の視野角（度、1〜179）。[`camera.fov`](../camera/#fov) を設定するのと同じです。範囲外の値（および `NaN`）は無視されます。省略した場合、視野角は変わりません。`fov` だけを渡した場合は視野角だけが変わり、飛行は止まりません。 |
 
 **Example:**
 
@@ -654,7 +705,7 @@ view.cameraFreeLook(false);
 
 ### sampleTerrainHeight()
 
-指定した測地位置での地形の高さを同期的に取得します。地形データがまだ読み込まれていない場合は `undefined` を返します。
+指定した測地位置での地形の高さを同期的に取得します。地形データがまだ読み込まれていない場合は `undefined` を返します。[`exaggeration`](../../../three/material/terrain-material/#exaggeration) を設定している場合は、描画される地表に合わせて拡大後の高さを返します。
 
 このメソッドはレンダリング用に常駐しているタイルしか読まないため、カメラが遠くにある間は粗い LOD タイルの高さ (真の地表高から数十メートルずれうる値) を返します。カメラの状態に関係なく正確な高さが必要な場合（例: オブジェクトの地表への設置）は、代わりに [`sampleTerrainMostDetailed()`](#sampleterrainmostdetailed) を使ってください。
 
@@ -692,7 +743,7 @@ if (height !== undefined) {
 
 ### sampleTerrainMostDetailed()
 
-地形ソースが提供する最も詳細なズームレベルで地形の高さを非同期にサンプリングします。必要なタイルはネットワークから取得されます。`sampleTerrainHeight()` はレンダリング用に常駐しているタイルしか読まないため、カメラが遠くにあると粗い高さ（または `undefined`）を返しますが、この API はカメラのストリーミング状態に関係なく正確な地表の高さを解決します。その場所へ移動する前にオブジェクトを地面に設置する用途に使ってください。
+地形ソースが提供する最も詳細なズームレベルで地形の高さを非同期にサンプリングします。必要なタイルはネットワークから取得されます。`sampleTerrainHeight()` はレンダリング用に常駐しているタイルしか読まないため、カメラが遠くにあると粗い高さ（または `undefined`）を返しますが、この API はカメラのストリーミング状態に関係なく正確な地表の高さを解決します。その場所へ移動する前にオブジェクトを地面に設置する用途に使ってください。`source` を描画している地形レイヤーが [`exaggeration`](../../../three/material/terrain-material/#exaggeration) を設定している場合は、描画される地表に合わせて拡大後の高さを返します。
 
 位置はタイルごとにグループ化され、同じタイルは一度だけ取得されます。サンプリングはソースの `maxZoom` から始まり、404 の場合はデータが見つかるまで親タイルへフォールバックするので、実際のカバレッジが設定した `maxZoom` より浅いソースでも解決できます。`401`/`403` はトークンの問題が暗黙的に粗い高さとして返さないよう呼び出し全体を reject し、サーバーエラーはリトライ後、該当位置の `height` を `undefined` にします。
 
@@ -745,7 +796,7 @@ if (ground.height !== undefined) {
 
 ### observeTerrainHeightAt()
 
-特定の位置での地形高さの変更を監視します。地形データが更新されるたびにコールバックが呼び出されます。
+特定の位置での地形高さの変更を監視します。コールバックは高さが最初にサンプリングされたときに呼ばれ、その位置の地形が読み込み済みなら登録直後に呼ばれます。その後は、位置を含む地形タイルが読み込まれたときや地形の誇張率が変わったときに、高さが変わればそのたびに呼ばれます。[`exaggeration`](../../../three/material/terrain-material/#exaggeration) を設定している場合は、描画される地表に合わせて拡大後の高さを返します。
 
 **Syntax:**
 
@@ -774,6 +825,81 @@ const lng = 139.7671;
 const cleanup = view.observeTerrainHeightAt({ lat, lng }, (height) => {
   console.log(`地形の高さが更新されました: ${height}m`);
 });
+
+// 後で監視を停止
+cleanup();
+```
+
+### sampleTerrainHeightRange()
+
+地理的な範囲内の地面の最低・最高の高さを同期的に取得します。`sampleTerrainHeight()` と同じくレンダリング用に読み込み済みの地形タイルだけを読み、地形タイルがまだ読み込まれていない範囲は `0` として扱います。地面を包み込む必要があるもの、たとえば地形の下から上まで届くボリュームの大きさを決めるときに使います。[`exaggeration`](../../../three/material/terrain-material/#exaggeration) を設定している場合は、まだ読み込まれていない範囲の `0` も含めて、描画される地表に合わせて拡大後の範囲を返します。
+
+**Syntax:**
+
+```tsx
+sampleTerrainHeightRange(
+  extent: GeographicExtent,
+): { min: number; max: number } | undefined
+```
+
+**Parameters:**
+
+- `extent`: 地理的な範囲
+  - `west`: 西端の経度（度）
+  - `south`: 南端の緯度（度）
+  - `east`: 東端の経度（度）
+  - `north`: 北端の緯度（度）
+
+**Returns:**
+
+最低・最高の高さ（メートル、楕円体基準）。エンジンが地形をまだセットアップしていない場合は `undefined`
+
+**Example:**
+
+```tsx
+const range = view.sampleTerrainHeightRange({
+  west: 138.7,
+  south: 35.3,
+  east: 138.8,
+  north: 35.4,
+});
+
+if (range) {
+  console.log(`地面の高さ: ${range.min}m から ${range.max}m`);
+}
+```
+
+### observeTerrainHeightRange()
+
+範囲内の [`sampleTerrainHeightRange()`](#sampleterrainheightrange) の結果を監視します。コールバックは範囲が最初に計算されたときに呼ばれ、その後は範囲に重なる地形タイルが読み込まれたときや地形の誇張率が変わったときに、値が変わればそのたびに呼ばれます。
+
+**Syntax:**
+
+```tsx
+observeTerrainHeightRange(
+  extent: GeographicExtent,
+  cb: (range: { min: number; max: number }) => void,
+): () => void
+```
+
+**Parameters:**
+
+- `extent`: `sampleTerrainHeightRange()` と同じ、度単位の地理的な範囲。`west` は `east` 以下である必要があり、日付変更線をまたぐ範囲には対応していません。
+- `cb`: 最低・最高の高さ（メートル、楕円体基準）を受け取るコールバック
+
+**Returns:**
+
+監視を停止するクリーンアップ関数
+
+**Example:**
+
+```tsx
+const cleanup = view.observeTerrainHeightRange(
+  { west: 138.7, south: 35.3, east: 138.8, north: 35.4 },
+  ({ min, max }) => {
+    console.log(`地面の高さ: ${min}m から ${max}m`);
+  },
+);
 
 // 後で監視を停止
 cleanup();

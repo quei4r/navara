@@ -1,5 +1,7 @@
 import type { PerspectiveCamera } from "three";
 
+import type { Overlap } from "../type";
+
 /**
  * One label/sprite competing for screen space in a declutter pass.
  *
@@ -24,8 +26,54 @@ export type DeclutterCandidate = {
   maxY: number;
   /** Unit of the local box, mirroring the material's `sizeInMeters`. */
   sizeInMeters: boolean;
+  /** Compared before `priority`: a higher rank places first. */
+  rank: number;
   /** Placement priority: higher wins an overlap. */
   priority: number;
+  /** Which earlier candidates this one may overlap (MapLibre's `*-overlap`). */
+  overlap: Overlap;
+  /** Leave the box out of the collision grid, so later candidates may overlap
+   *  it (MapLibre's `*-ignore-placement`). */
+  ignorePlacement: boolean;
+  /** Screen pixels added around the box once projected, as
+   *  `[top, right, bottom, left]` (MapLibre's `*-padding`). */
+  padding: readonly number[];
+  /**
+   * Pairs a label with the billboard of the same feature at the nearest
+   * anchor, as MapLibre places a symbol's text and icon together: the layer
+   * and tile both belong to ({@link declutterPairGroup}), `0` for never
+   * paired. `featureIndex` is the feature's index in the group and `pairRole`
+   * which of the two this is.
+   */
+  pairGroup: number;
+  featureIndex: number;
+  pairRole: "label" | "billboard";
+  /** Whether it may show while its paired partner is hidden. */
+  standalone: boolean;
+  /**
+   * How the quad is turned, as the vertex shader lays it out (`rotation` in
+   * radians, clockwise from the front); the kernel turns the box to match.
+   * A box already as drawn (turned by line placement) is screen-aligned:
+   * not flat facing, rotating with the camera, rotation `0`.
+   */
+  flatFacing: boolean;
+  rotateWithCamera: boolean;
+  rotation: number;
+  /** Screen pixels the drawn quad is moved by after projection, x right and
+   *  y down, and whether that stays on the screen axes or turns with the
+   *  camera heading — the material's resolved `translate` (see
+   *  `resolveTranslate`). */
+  translate: readonly [number, number];
+  translateViewport: boolean;
+  /**
+   * A label with variable anchors is one candidate per placement it may
+   * take, contiguous and the one in use first; the pass shows at most one.
+   * `variants` is the group's size on its first candidate and `0` on the
+   * rest, `variant` the participant's tag for each, handed back to
+   * `applyDeclutter`. Omitted, a group of one tagged `0`.
+   */
+  variants?: number;
+  variant?: number;
   /** Whether the label is currently shown (its fade target is "visible").
    *  Feeds placement hysteresis: shown labels win equal-priority ties and
    *  tolerate marginal overlaps, so slow camera drift doesn't make near-tied
@@ -45,8 +93,20 @@ export type DeclutterCandidate = {
   contentKey?: string;
 };
 
-/** Duration of the show/hide fade applied to placement results (ms). */
-export const DECLUTTER_FADE_MS = 300;
+/** The declutter fields a participant mirrors from its material. */
+export type DeclutterSettings = {
+  /** Whether the material's labels take part in the pass at all. A
+   *  standalone `always` label that ignores placement can neither lose nor
+   *  block, so it stays out like a `declutter: false` one — unless it has
+   *  variable anchors, and with them a free one to pick. */
+  participates: boolean;
+  rank: number;
+  priority: number;
+  overlap: Overlap;
+  ignorePlacement: boolean;
+  padding: readonly number[];
+  standalone: boolean;
+};
 
 /** A mesh that contributes label candidates to the shared declutter pass. */
 export type DeclutterParticipant = {
@@ -56,11 +116,12 @@ export type DeclutterParticipant = {
    */
   collectDeclutterCandidates: (out: DeclutterCandidate[]) => void;
   /**
-   * Apply a placement result as the label's fade *target*. Must be cheap and
-   * idempotent — the pass calls it for every candidate on every run, most
-   * often with an unchanged value.
+   * Apply a placement result as the label's fade *target*, and the
+   * `variant` it is placed with (see {@link DeclutterCandidate.variants}).
+   * Must be cheap and idempotent — the pass calls it for every label on
+   * every run, most often with an unchanged value.
    */
-  applyDeclutter: (handle: number, hidden: boolean) => void;
+  applyDeclutter: (handle: number, hidden: boolean, variant: number) => void;
   /**
    * Advance this participant's hide factors toward their targets by
    * `deltaMs / DECLUTTER_FADE_MS`. Called by the manager every update while
@@ -75,4 +136,16 @@ export type DeclutterParticipant = {
    * promoted labels join a *later* pass once their text is applied.
    */
   prepareDeferredLabels?: (camera: PerspectiveCamera) => void;
+  /**
+   * Optional: re-decide along-line placement for this participant's anchors.
+   * Called at the start of every placement pass, before candidates are
+   * collected.
+   *
+   * Which level of anchors is on screen, the box each one covers, and for text
+   * which way it reads and whether it still fits its line all depend on the
+   * camera, so none can be baked when the tile is parsed. Running before
+   * `collectDeclutterCandidates` means an anchor rejected here never competes
+   * for screen space.
+   */
+  placeLineLabels?: (camera: PerspectiveCamera, heightPx: number) => void;
 };

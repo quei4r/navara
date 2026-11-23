@@ -9,6 +9,7 @@
   "nav": {
     "docs": "Sənədlər",
     "examples": "Nümunələr",
+    "showcases": "Vitrin",
     "github": "GitHub"
   },
   "hero": {
@@ -92,6 +93,7 @@
   "gallery": {
     "eyebrow": "Qalereya",
     "h2": "Tablo kimi görünən GIS.",
+    "viewMore": "Daha çox",
     "tutorial": {
       "label": "Dərsliklər"
     },
@@ -123,8 +125,50 @@
   "footer": {
     "docs": "Sənədlər",
     "github": "GitHub",
+    "showcases": "Vitrin",
     "discord": "Discord",
-    "credit": "Navara · MIT / Apache-2.0"
+    "credit": "Navara · MIT / Apache-2.0",
+    "brandAssets": "Brend materialları"
+  },
+  "brand": {
+    "meta": {
+      "title": "Navara brend materialları",
+      "description": "Navaranın rəsmi loqoları, şriftləri və rəngləri, loqo faylları yükləmək üçün əlçatandır."
+    },
+    "h1": "Brend materialları",
+    "lead": "Navaranın rəsmi brend materialları. Navaranı təqdim edərkən onlardan istifadə edin.",
+    "logos": {
+      "h2": "Loqolar",
+      "horizontal": "Üfüqi loqo",
+      "vertical": "Şaquli loqo",
+      "formats": {
+        "svg": "SVG",
+        "png": "PNG"
+      }
+    },
+    "font": {
+      "h2": "Şrift",
+      "sample": {
+        "latin": "Navara, an open-source 3D map engine",
+        "japanese": "オープンソースの 3D 地図エンジン Navara"
+      }
+    },
+    "colors": {
+      "h2": "Rənglər",
+      "names": {
+        "primary": "Primary Color",
+        "secondary": "Secondary Color",
+        "accent": "Accent Color"
+      }
+    }
+  },
+  "showcases": {
+    "meta": {
+      "title": "Navara vitrini",
+      "description": "Navara ilə yaradılmış xəritələr və vizuallaşdırmalar."
+    },
+    "h1": "Vitrin",
+    "submit": "Layihə təqdim et"
   },
   "imageAlts": {
     "hero": "Əsas təsvir: Navara ilə çəkilmiş qlobus",

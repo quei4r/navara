@@ -1,7 +1,10 @@
 import type { Matrix4, Texture } from "three";
 
+import type { TerrainExaggeration } from "./terrain/exaggeration";
+import type { WaterState } from "./water/waterState";
+
 type Ref<K extends string, T> = Record<K, T | undefined | null>;
-type RefThree<T> = Ref<"value", T>;
+export type RefThree<T> = Ref<"value", T>;
 
 // TODO: Separate as individual library
 export type CommonUniforms = {
@@ -15,6 +18,16 @@ export type CommonUniforms = {
   fov: RefThree<number>;
   screenHeightPx: RefThree<number>;
   time: RefThree<number>;
-  colorMapTexture: RefThree<Texture>;
-  waterTexture: RefThree<Texture>;
+  /**
+   * Wave state shared by every water material. Reading `water.uniforms`
+   * generates the wave texture, so only water materials should.
+   */
+  water: WaterState;
+  /** Shared by every terrain tile material (`uTerrainExaggeration`). */
+  terrainExaggeration: { value: TerrainExaggeration };
+  /**
+   * Height (never positive) the ellipsoid is shrunk by for horizon culling
+   * (`nvrHorizonMinHeight`), shared by every material that horizon-culls.
+   */
+  horizonMinHeight: { value: number };
 };

@@ -23,7 +23,7 @@ export const POLYGON_BATCH_SUPPORT: BatchTextureSupport = {
 export const POLYLINE_BATCH_SUPPORT: BatchTextureSupport = {
   // No extrudedHeight, and no emissive: polyline.frag has no emissive
   // G-buffer output.
-  scalars: ["height", "lineWidth"],
+  scalars: ["height", "lineWidth", "lineDash"],
   vec3s: ["color"],
 };
 
@@ -33,11 +33,19 @@ export const MODEL_BATCH_SUPPORT: BatchTextureSupport = {
 };
 
 export const SPRITE_BATCH_SUPPORT: BatchTextureSupport = {
-  scalars: ["height", "size"],
+  scalars: [
+    "height",
+    "size",
+    "rotation",
+    "orientation",
+    "anchor",
+    "offsetX",
+    "offsetY",
+  ],
   vec3s: ["color", "emissive"],
 };
 
 export const TEXT_BATCH_SUPPORT: BatchTextureSupport = {
-  scalars: ["height", "size"],
-  vec3s: ["color", "emissive"],
+  scalars: ["height", "size", "rotation", "orientation"],
+  vec3s: ["color", "emissive", "outlineColor"],
 };

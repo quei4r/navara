@@ -7,7 +7,7 @@ use bevy_ecs::{
 use navara_component::Deleted;
 use navara_memory::RetainedEntry;
 use navara_mesh::Mesh;
-use navara_tile_component::{TileHandle, TileMeshMarker};
+use navara_tile_component::{MinZoomDescentBudget, TileHandle, TileMeshMarker};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Per-layer parent reference used when sampling a parent tile's data
@@ -56,37 +56,81 @@ pub struct TileCacheManager {
     /// `rendered_tile_caches`.
     pub retained: FxHashMap<TileHandle, RetainedEntry>,
     pub last_rendered_frame: usize,
+    /// Frame of the terrain traversal before the one in `last_rendered_frame`.
+    pub previous_traversal_frame: usize,
     pub is_updated_in_this_frame: bool,
     pub prev_layers_len: usize,
-    /// Set when a source changes (e.g. `updateSource`) to force one re-traversal
-    /// even with a static camera, so terrain tiles pick up the new fetch config
-    /// read live from the source. Cleared once consumed.
+    pub min_zoom_descent: MinZoomDescentBudget,
+    /// Forces one re-traversal even with a static camera. Set when a source
+    /// changes (e.g. `updateSource`), so terrain tiles pick up the new fetch
+    /// config read live from the source. Cleared once consumed.
     pub force_update: bool,
+    /// `FrameManager::updated_at` at which a tile waiting to fetch its own
+    /// DEM is due, so a static camera re-traverses once then. Each traversal
+    /// clears it and the waiting tiles set it again.
+    pub retraverse_at: Option<f64>,
 }
 
 impl TileCacheManager {
+    /// Record that a terrain traversal runs in `frame`.
+    pub fn begin_traversal(&mut self, frame: usize) {
+        self.previous_traversal_frame = self.last_rendered_frame;
+        self.last_rendered_frame = frame;
+    }
+
+    /// Show or hide the tile's mesh in full. Returns whether the mesh came
+    /// on screen in full — from hidden or from fill mode — so a caller can
+    /// react to a tile taking over its region.
     pub fn activate_rendered_tile(
         &self,
         handle: &TileHandle,
         meshes: &mut Query<&mut Mesh, (With<TileMeshMarker>, Without<Deleted>)>,
         active: bool,
-    ) {
-        let t = match self.rendered_tile_caches.get(handle) {
-            Some(t) => t,
-            None => return,
+    ) -> bool {
+        let Some(t) = self.rendered_tile_caches.get(handle) else {
+            return false;
         };
-        let mesh_entity = match t.mesh_entity {
-            Some(m) => m,
-            None => return,
+        let Some(mesh_entity) = t.mesh_entity else {
+            return false;
         };
-        let mesh = match meshes.get(mesh_entity) {
-            Ok(m) => m,
-            Err(_) => return,
+        let Ok(mesh) = meshes.get(mesh_entity) else {
+            return false;
         };
 
-        if mesh.active != active {
-            meshes.get_mut(mesh_entity).unwrap().active = active;
+        if mesh.active == active && mesh.fill_quadrants == 0 {
+            return false;
         }
+        let mut mesh = meshes.get_mut(mesh_entity).unwrap();
+        let shown = active && (!mesh.active || mesh.fill_quadrants != 0);
+        mesh.active = active;
+        mesh.fill_quadrants = 0;
+        shown
+    }
+
+    /// Show the tile's mesh restricted to `quadrants` (a `Mesh::fill_quadrants`
+    /// mask): the parent fills the quadrants of children that are not
+    /// prepared yet while the prepared children stay on screen.
+    pub fn fill_rendered_tile(
+        &self,
+        handle: &TileHandle,
+        meshes: &mut Query<&mut Mesh, (With<TileMeshMarker>, Without<Deleted>)>,
+        quadrants: u8,
+    ) {
+        let Some(t) = self.rendered_tile_caches.get(handle) else {
+            return;
+        };
+        let Some(mesh_entity) = t.mesh_entity else {
+            return;
+        };
+        let Ok(mesh) = meshes.get(mesh_entity) else {
+            return;
+        };
+        if mesh.active && mesh.fill_quadrants == quadrants {
+            return;
+        }
+        let mut mesh = meshes.get_mut(mesh_entity).unwrap();
+        mesh.active = true;
+        mesh.fill_quadrants = quadrants;
     }
 
     pub fn is_rendered_tile_activated(

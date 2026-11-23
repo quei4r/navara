@@ -12,7 +12,8 @@ use wasm_bindgen::prelude::*;
 use worker::WorkerTaskDelegatedEvent;
 
 use navara_wasm_types::{
-    CameraFlightEndedEvent, CameraFrustum, Globe, LLE, RasterTileInternalMaterial, Transform,
+    CameraFlightEndedEvent, CameraFrustum, ElevationDecoder, Globe, LLE,
+    RasterTileInternalMaterial, Transform,
 };
 
 // Fields are private on purpose: exposing them via `getter_with_clone` would
@@ -28,6 +29,7 @@ pub struct Events {
     mesh_removed: Vec<EntityEvent>,
     mesh_added: Vec<MeshAdded>,
     mesh_updated: Vec<MeshChanged>,
+    mesh_geometry_replaced: Vec<MeshGeometryReplaced>,
     data_requested: Vec<DataRequestEvent>,
     data_requester_removed: Vec<DataRequesterRemovedEvent>,
     texture_fragment_requested: Vec<TextureFragmentRequestedEvent>,
@@ -38,14 +40,17 @@ pub struct Events {
     renderable_feature_changed: Vec<RenderableFeatureChangedEvent>,
     renderable_feature_removed: Vec<RenderableFeatureRemovedEvent>,
     update_sample_terrain_height: Vec<TerrainHeightUpdatedEvent>,
+    update_terrain_height_range: Vec<TerrainHeightRangeUpdatedEvent>,
     hillshade_backfilled: Vec<HillshadeBackfilledEvent>,
     hillshade_canceled: Vec<EntityEvent>,
+    terrain_exaggeration_updated: Option<TerrainExaggerationUpdatedEvent>,
+    vector_drape_changed: Vec<TileHandle>,
 }
 
 // Move-out accessors: each hands the stack's ownership to JS (elements are
 // boxed once for their JS wrappers, nothing is cloned). Method names must be
-// `take_<stack key>` — `EventManager.pushEvents` derives the method name from
-// its stack keys.
+// `take_<stack key>` — `JobDispatcher` derives the method name from its stack
+// keys.
 #[wasm_bindgen]
 impl Events {
     pub fn take_camera_transform_updated(&mut self) -> Option<Transform> {
@@ -68,6 +73,9 @@ impl Events {
     }
     pub fn take_mesh_updated(&mut self) -> Vec<MeshChanged> {
         std::mem::take(&mut self.mesh_updated)
+    }
+    pub fn take_mesh_geometry_replaced(&mut self) -> Vec<MeshGeometryReplaced> {
+        std::mem::take(&mut self.mesh_geometry_replaced)
     }
     pub fn take_data_requested(&mut self) -> Vec<DataRequestEvent> {
         std::mem::take(&mut self.data_requested)
@@ -99,11 +107,20 @@ impl Events {
     pub fn take_update_sample_terrain_height(&mut self) -> Vec<TerrainHeightUpdatedEvent> {
         std::mem::take(&mut self.update_sample_terrain_height)
     }
+    pub fn take_update_terrain_height_range(&mut self) -> Vec<TerrainHeightRangeUpdatedEvent> {
+        std::mem::take(&mut self.update_terrain_height_range)
+    }
     pub fn take_hillshade_backfilled(&mut self) -> Vec<HillshadeBackfilledEvent> {
         std::mem::take(&mut self.hillshade_backfilled)
     }
     pub fn take_hillshade_canceled(&mut self) -> Vec<EntityEvent> {
         std::mem::take(&mut self.hillshade_canceled)
+    }
+    pub fn take_terrain_exaggeration_updated(&mut self) -> Option<TerrainExaggerationUpdatedEvent> {
+        self.terrain_exaggeration_updated.take()
+    }
+    pub fn take_vector_drape_changed(&mut self) -> Vec<TileHandle> {
+        std::mem::take(&mut self.vector_drape_changed)
     }
 }
 
@@ -130,6 +147,26 @@ pub struct MeshAdded {
     pub globe: Globe,
 }
 
+/// A live tile mesh whose geometry buffers were rewritten in place (see
+/// `EventStore::mesh_geometry_replaced`): only the geometry changes.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshGeometryReplaced {
+    pub ind: u32,
+    pub r#gen: u32,
+    pub mesh: Mesh,
+}
+
+impl<'a> From<navara_event_store::ComponentEvent<&'a navara_mesh::Mesh>> for MeshGeometryReplaced {
+    fn from(ev: navara_event_store::ComponentEvent<&'a navara_mesh::Mesh>) -> Self {
+        Self {
+            ind: ev.ind,
+            r#gen: ev.r#gen,
+            mesh: ev.comp.into(),
+        }
+    }
+}
+
 #[wasm_bindgen]
 #[derive(Debug, Clone, Serialize)]
 pub struct MeshChanged {
@@ -150,6 +187,8 @@ pub struct Mesh {
     pub uvs: i32,      // handle
     pub indices: i32,  // handle
     pub active: bool,
+    /// Quadrant bitmask to draw (`0` = whole tile); see `navara_mesh::Mesh`.
+    pub fill_quadrants: u8,
     pub render_order: i32,
     pub aabb: navara_wasm_types::Aabb,
     /// Per-vertex normals handle (terrain only).
@@ -162,6 +201,14 @@ pub struct Mesh {
     pub skirt_indices: Option<i32>,
     /// Skirt per-vertex normals handle.
     pub skirt_normals: Option<i32>,
+    /// Per-vertex terrain height handle (meters, unexaggerated). `None` for a
+    /// flat tile, whose vertices all sit at height 0.
+    pub heights: Option<i32>,
+    /// Skirt per-vertex terrain height handle; set whenever `skirt_vertices` is.
+    pub skirt_heights: Option<i32>,
+    /// Range of `heights` (both 0 for a flat tile).
+    pub min_height: f64,
+    pub max_height: f64,
     /// Watermask handle (1 byte uniform or 65536 byte grid).
     pub watermask: Option<i32>,
 }
@@ -173,6 +220,13 @@ pub struct DataRequestEvent {
     pub ind: u32,
     pub r#gen: u32,
     pub bits: u64,
+
+    /// Fetch urgency: 0 is the most urgent (see `Priority::rank`). The web
+    /// side starts every fetch right away and passes this on as the browser's
+    /// fetch priority hint. Requests without an ECS `Priority` (tileset /
+    /// PMTiles bootstrap reads, 3D Tiles content) rank as `Extreme`, matching
+    /// the engine sender that dispatches them ahead of the prioritized ones.
+    pub priority: u8,
 
     pub handle: i32, // handle
     #[wasm_bindgen(getter_with_clone)]
@@ -238,6 +292,14 @@ pub struct TerrainHeightUpdatedEvent {
 
 #[wasm_bindgen]
 #[derive(Debug, Clone, Serialize)]
+pub struct TerrainHeightRangeUpdatedEvent {
+    pub bits: u64,
+    pub min: f64,
+    pub max: f64,
+}
+
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize)]
 pub struct EntityEvent {
     pub ind: u32,
     pub r#gen: u32,
@@ -267,6 +329,11 @@ pub struct HillshadeBackfilledEvent {
     pub target_entity_gen: Option<u32>, // Target entity gen, None when not applicable
 
     pub edge_direction: u8, // 0=Left, 1=Right, 2=Top, 3=Bottom, 255=N/A
+
+    /// DEM decoder of the hillshade layer's source, set with `original_handle`.
+    #[wasm_bindgen(readonly)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elevation_decoder: Option<ElevationDecoder>,
 }
 
 impl From<navara_event::Events<'_>> for Events {
@@ -287,6 +354,11 @@ impl From<navara_event::Events<'_>> for Events {
             mesh_removed: ev.mesh_removed.into_iter().map(|ev| ev.into()).collect(),
             mesh_added: ev.mesh_added.into_iter().map(|ev| ev.into()).collect(),
             mesh_updated: ev.mesh_updated.into_iter().map(|ev| ev.into()).collect(),
+            mesh_geometry_replaced: ev
+                .mesh_geometry_replaced
+                .into_iter()
+                .map(|ev| ev.into())
+                .collect(),
             data_requested: ev.data_requested.into_iter().map(|ev| ev.into()).collect(),
             data_requester_removed: ev
                 .data_requester_removed
@@ -333,6 +405,11 @@ impl From<navara_event::Events<'_>> for Events {
                 .into_iter()
                 .map(|ev| ev.into())
                 .collect(),
+            update_terrain_height_range: ev
+                .update_terrain_height_range
+                .into_iter()
+                .map(|ev| ev.into())
+                .collect(),
             hillshade_backfilled: ev
                 .hillshade_backfilled
                 .into_iter()
@@ -343,8 +420,28 @@ impl From<navara_event::Events<'_>> for Events {
                 .into_iter()
                 .map(|ev| ev.into())
                 .collect(),
+            terrain_exaggeration_updated: ev.terrain_exaggeration_updated.map(|ev| {
+                TerrainExaggerationUpdatedEvent {
+                    scale: ev.scale,
+                    relative_height: ev.relative_height,
+                    horizon_minimum_height: ev.horizon_minimum_height,
+                }
+            }),
+            vector_drape_changed: ev.vector_drape_changed,
         }
     }
+}
+
+/// The terrain exaggeration in effect from this frame on (`h' = (h -
+/// relative_height) * scale + relative_height`), emitted when it changes.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TerrainExaggerationUpdatedEvent {
+    pub scale: f64,
+    pub relative_height: f64,
+    /// Height (never positive) the ellipsoid is shrunk by for horizon culling
+    /// so that terrain sunk below it stays visible.
+    pub horizon_minimum_height: f64,
 }
 
 impl From<navara_event_store::EntityEvent> for EntityEvent {
@@ -374,6 +471,30 @@ impl<'a>
             bits: ev.bits,
             lle: ev.comp.lle.into(),
             height: ev.comp.height,
+        }
+    }
+}
+
+impl<'a>
+    From<
+        navara_event_store::ReconstructableComponentEvent<
+            &'a navara_tile_component::TerrainHeightRangeObserver,
+        >,
+    > for TerrainHeightRangeUpdatedEvent
+{
+    fn from(
+        ev: navara_event_store::ReconstructableComponentEvent<
+            &'a navara_tile_component::TerrainHeightRangeObserver,
+        >,
+    ) -> Self {
+        let (min, max) = ev
+            .comp
+            .range
+            .expect("the range is set before the event is pushed");
+        Self {
+            bits: ev.bits,
+            min,
+            max,
         }
     }
 }
@@ -467,6 +588,7 @@ impl<'a> From<&'a navara_mesh::Mesh> for Mesh {
             uvs: m.uvs,
             indices: m.indices,
             active: m.active,
+            fill_quadrants: m.fill_quadrants,
             render_order: m.render_order,
             aabb: m.aabb.clone().into(),
             normals: m.normals,
@@ -474,6 +596,10 @@ impl<'a> From<&'a navara_mesh::Mesh> for Mesh {
             skirt_uvs: m.skirt_uvs,
             skirt_indices: m.skirt_indices,
             skirt_normals: m.skirt_normals,
+            heights: m.heights,
+            skirt_heights: m.skirt_heights,
+            min_height: m.min_height,
+            max_height: m.max_height,
             watermask: m.watermask,
         }
     }
@@ -481,15 +607,20 @@ impl<'a> From<&'a navara_mesh::Mesh> for Mesh {
 
 impl<'a>
     From<
-        navara_event_store::ReconstructableComponentEvent<&'a navara_data_requester::DataRequester>,
+        navara_event_store::ReconstructableComponentEvent<(
+            &'a navara_data_requester::DataRequester,
+            Option<&'a navara_component::Priority>,
+        )>,
     > for DataRequestEvent
 {
     fn from(
-        ev: navara_event_store::ReconstructableComponentEvent<
+        ev: navara_event_store::ReconstructableComponentEvent<(
             &'a navara_data_requester::DataRequester,
-        >,
+            Option<&'a navara_component::Priority>,
+        )>,
     ) -> Self {
-        let (offset, length) = match ev.comp.byte_range {
+        let (req, priority) = ev.comp;
+        let (offset, length) = match req.byte_range {
             Some((offset, length)) => (Some(offset), Some(length)),
             None => (None, None),
         };
@@ -497,14 +628,15 @@ impl<'a>
             ind: ev.ind,
             r#gen: ev.r#gen,
             bits: ev.bits,
-            handle: ev.comp.handle,
-            extension: ev.comp.extension.to_string(),
-            url: ev.comp.url.clone(),
+            priority: priority.map_or(navara_component::Priority::Extreme.rank(), |p| p.rank()),
+            handle: req.handle,
+            extension: req.extension.to_string(),
+            url: req.url.clone(),
             offset,
             length,
-            request_vertex_normals: ev.comp.request_vertex_normals,
-            request_water_mask: ev.comp.request_water_mask,
-            token: ev.comp.token.clone(),
+            request_vertex_normals: req.request_vertex_normals,
+            request_water_mask: req.request_water_mask,
+            token: req.token.clone(),
         }
     }
 }
@@ -608,6 +740,7 @@ impl<'a>
             target_entity_ind: target_ind,
             target_entity_gen: target_gen,
             edge_direction: ev.comp.edge_direction,
+            elevation_decoder: ev.comp.elevation_decoder.map(Into::into),
         }
     }
 }

@@ -136,17 +136,20 @@ vViewPosition = -mvPosition.xyz;
 vPosition = (modelMatrix * vec4(transformed, 1.0)).xyz;
 `,
       !useRTE,
+    )
+    .replaceWithCondition(
+      "#include <beginnormal_vertex>",
+      // The extrusion direction is the surface's up vector, so the sides and
+      // both caps shade like the top.
+      `
+#include <beginnormal_vertex>
+objectNormal = scaleNormalAndCap.xyz;
+`,
+      state.shadeSidesAsSurface,
     ).source;
 
   // Transform fragment shader
   shader.fragmentShader = createReplacer(shader.fragmentShader)
-    .replace(
-      "#include <common>",
-      `
-#include <common>
-#include <packing>
-`,
-    )
     .replace(
       "uniform vec3 diffuse;",
       `
@@ -222,9 +225,11 @@ if(uClampToGround) {
   outgoingLight = diffuseColor.xyz;
 } else {
   outgoingLight = reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + totalEmissiveRadiance;
+${POLYGON_BASE_SHADER_MARKERS.fragment.OUTGOING_LIGHT_START}
   if(!uIsTexturized) {
     outgoingLight += specular;
   }
+${POLYGON_BASE_SHADER_MARKERS.fragment.OUTGOING_LIGHT_END}
 }
 `,
     )
@@ -243,8 +248,10 @@ if (nvr_uPickable > 0.0 && diffuseColor.a > 0.0) {
       `
 ${POLYGON_BASE_SHADER_MARKERS.fragment.FINAL_NORMAL_START}
 vec3 finalNormal = origNormal;
+float finalReflectivity = reflectivity;
+float finalRoughness = roughnessFactor;
 ${POLYGON_BASE_SHADER_MARKERS.fragment.FINAL_NORMAL_END}
-GBUFFER_WRITE_NORMAL(finalNormal, reflectivity, roughnessFactor)
+GBUFFER_WRITE_NORMAL(finalNormal, finalReflectivity, finalRoughness)
 `,
     ).source;
 };

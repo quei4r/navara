@@ -19,6 +19,22 @@ const getIdFromProperties = (properties: Nullable<Record<string, unknown>>) => {
 
 export type MaterialDesc = Exclude<LayerDescription, { type: "terrain" }>;
 
+const ANCHOR_OPTIONS = Object.fromEntries(
+  [
+    "center",
+    "left",
+    "right",
+    "top",
+    "bottom",
+    "top-left",
+    "top-right",
+    "bottom-left",
+    "bottom-right",
+  ].map((anchor) => [anchor, anchor]),
+);
+
+const EXTRUSION_BASE_OPTIONS = { position: "position", ellipsoid: "ellipsoid" };
+
 const selectedFeatures = new Set<string>();
 const selectedBatchIds = new Set<number>();
 
@@ -170,6 +186,8 @@ export const addCtrlPanel = (
     maxWidth: 10000,
     height: 1,
     extrudedHeight: 1,
+    perPositionHeight: false,
+    extrusionBase: "position",
     clampToGround: false,
     wireframe: false,
     sizeInMeters: true,
@@ -182,7 +200,8 @@ export const addCtrlPanel = (
     borderColor: "#f8e43c",
     borderWidth: 0.0,
     cornerRadius: 0.0,
-    center: { x: 0, y: 0 },
+    anchor: "center",
+    offset: { x: 0, y: 0 },
     padding: { x: 0, y: 0 },
     transparent: false,
 
@@ -194,6 +213,9 @@ export const addCtrlPanel = (
     outlineOpacity: 1.0,
     surfaceShow: true,
     pointSize: 0.3,
+    textFacing: "upright",
+    rotateWithCamera: true,
+    rotation: 0,
     offsetDepth: true,
     depthTest: true,
   };
@@ -240,26 +262,29 @@ export const addCtrlPanel = (
       layerDeleted[paneParams.layer] = 1;
       btnCtrl.title = "Add Layer";
     } else {
-      const oldLayerId = layerIds[paneParams.layer];
-      const layerDef = layerMap.get(oldLayerId);
-      if (layerDef) {
-        const newLayer = view.addLayer(layerDef);
-        if (newLayer.id) {
-          layerInstMap.set(newLayer.id, newLayer);
-          layerMap.set(newLayer.id, layerDef);
-          layerIds[paneParams.layer] = newLayer.id;
-          layerDeleted[paneParams.layer] = 0;
-
-          if (layerDef.type !== "raster") {
-            addFeatureUpdateHandler(layerDef, newLayer);
-          }
-        }
-      }
-
-      layerMap.delete(oldLayerId);
-
+      readdLayer(paneParams.layer);
       btnCtrl.title = "Delete Layer";
     }
+  }
+
+  function readdLayer(index: number) {
+    const oldLayerId = layerIds[index];
+    const layerDef = layerMap.get(oldLayerId);
+    if (layerDef) {
+      const newLayer = view.addLayer(layerDef);
+      if (newLayer.id) {
+        layerInstMap.set(newLayer.id, newLayer);
+        layerMap.set(newLayer.id, layerDef);
+        layerIds[index] = newLayer.id;
+        layerDeleted[index] = 0;
+
+        if (layerDef.type !== "raster") {
+          addFeatureUpdateHandler(layerDef, newLayer);
+        }
+      }
+    }
+
+    layerMap.delete(oldLayerId);
   }
 
   function onLayerChange() {
@@ -346,6 +371,19 @@ export const addCtrlPanel = (
         material.extrudedHeight = paneParams.extrudedHeight;
       }
 
+      // These are read when the layer builds its geometry, so a change needs
+      // a new layer instead of an update.
+      let rebuild = false;
+      if ("perPositionHeight" in material) {
+        rebuild ||= material.perPositionHeight !== paneParams.perPositionHeight;
+        material.perPositionHeight = paneParams.perPositionHeight;
+      }
+
+      if ("extrusionBase" in material) {
+        rebuild ||= material.extrusionBase !== paneParams.extrusionBase;
+        material.extrusionBase = paneParams.extrusionBase;
+      }
+
       if ("clampToGround" in material) {
         material.clampToGround = paneParams.clampToGround;
       }
@@ -396,9 +434,12 @@ export const addCtrlPanel = (
         material.cornerRadius = paneParams.cornerRadius;
       }
 
-      if ("center" in material) {
-        material.center.x = paneParams.center.x;
-        material.center.y = paneParams.center.y;
+      if ("anchor" in material) {
+        material.anchor = paneParams.anchor;
+      }
+
+      if ("offset" in material) {
+        material.offset = { ...paneParams.offset };
       }
 
       if ("padding" in material) {
@@ -446,12 +487,41 @@ export const addCtrlPanel = (
         material.pointSize = paneParams.pointSize;
       }
 
+      if ("textFacing" in material) {
+        material.textFacing = paneParams.textFacing;
+      }
+
+      if ("billboardFacing" in material) {
+        material.billboardFacing = paneParams.textFacing;
+      }
+
+      if ("pointFacing" in material) {
+        material.pointFacing = paneParams.textFacing;
+      }
+
+      if ("rotateWithCamera" in material) {
+        material.rotateWithCamera = paneParams.rotateWithCamera;
+      }
+
+      if ("rotation" in material) {
+        material.rotation = paneParams.rotation;
+      }
+
       if ("offsetDepth" in material) {
         material.offsetDepth = paneParams.offsetDepth;
       }
 
       if ("depthTest" in material) {
         material.depthTest = paneParams.depthTest;
+      }
+
+      if (rebuild) {
+        if (!layerDeleted[paneParams.layer]) {
+          view.deleteLayerById(layerId);
+          layerInstMap.delete(layerId);
+          readdLayer(paneParams.layer);
+        }
+        return;
       }
 
       // Spread the whole layer description so source-based layers keep their
@@ -534,6 +604,18 @@ function createParamCtrl(
     if ("extrudedHeight" in material) {
       paneParams.extrudedHeight = material.extrudedHeight;
       f.addBinding(paneParams, "extrudedHeight").on("change", changeFunc);
+    }
+
+    if ("perPositionHeight" in material) {
+      paneParams.perPositionHeight = material.perPositionHeight;
+      f.addBinding(paneParams, "perPositionHeight").on("change", changeFunc);
+    }
+
+    if ("extrusionBase" in material) {
+      paneParams.extrusionBase = material.extrusionBase ?? "position";
+      f.addBinding(paneParams, "extrusionBase", {
+        options: EXTRUSION_BASE_OPTIONS,
+      }).on("change", changeFunc);
     }
 
     if ("clampToGround" in material) {
@@ -622,10 +704,18 @@ function createParamCtrl(
       );
     }
 
-    if ("center" in material) {
-      paneParams.center.x = material.center.x;
-      paneParams.center.y = material.center.y;
-      f.addBinding(paneParams, "center").on("change", changeFunc);
+    if ("anchor" in material) {
+      paneParams.anchor = material.anchor ?? "center";
+      f.addBinding(paneParams, "anchor", { options: ANCHOR_OPTIONS }).on(
+        "change",
+        changeFunc,
+      );
+    }
+
+    if ("offset" in material) {
+      paneParams.offset.x = material.offset?.x ?? 0;
+      paneParams.offset.y = material.offset?.y ?? 0;
+      f.addBinding(paneParams, "offset").on("change", changeFunc);
     }
 
     if ("padding" in material) {
@@ -692,6 +782,30 @@ function createParamCtrl(
     if ("pointSize" in material) {
       paneParams.pointSize = material.pointSize;
       f.addBinding(paneParams, "pointSize", { min: 0, max: 10 }).on(
+        "change",
+        changeFunc,
+      );
+    }
+
+    const facingKey = ["textFacing", "billboardFacing", "pointFacing"].find(
+      (k) => k in material,
+    );
+    if (facingKey) {
+      paneParams.textFacing = (material as never)[facingKey] ?? "upright";
+      f.addBinding(paneParams, "textFacing", {
+        label: "facing",
+        options: { upright: "upright", flat: "flat" },
+      }).on("change", changeFunc);
+    }
+
+    if ("rotateWithCamera" in material) {
+      paneParams.rotateWithCamera = material.rotateWithCamera ?? true;
+      f.addBinding(paneParams, "rotateWithCamera").on("change", changeFunc);
+    }
+
+    if ("rotation" in material) {
+      paneParams.rotation = material.rotation ?? 0;
+      f.addBinding(paneParams, "rotation", { min: -180, max: 180, step: 1 }).on(
         "change",
         changeFunc,
       );

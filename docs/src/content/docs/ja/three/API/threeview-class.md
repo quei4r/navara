@@ -90,13 +90,27 @@ view.setCamera({
 });
 ```
 
+## 複数ビュー
+
+1 つのページで複数の `ThreeView` インスタンスを同時に動かせます。たとえば 2 つの地図を左右に並べて比較する場合です。ビューごとに別の canvas を渡してください。複数のビューは並行して初期化でき、1 つを破棄しても他のビューは止まりません。
+
+```tsx
+const left = new ThreeView({ canvas: leftCanvas });
+const right = new ThreeView({ canvas: rightCanvas });
+await Promise.all([left.init(), right.init()]);
+```
+
+ページ上のすべてのビューは、バックグラウンド処理用の worker プールを 1 つ共有します。そのため、ビューを増やしても worker が増えるわけではなく、各ビューのタイル処理は同じ CPU コアを分け合います。プールは最初に `init()` を呼んだビューが作成し、そのビューの `workerPoolSize`、`mobileOptimization`、`memoryBudget.maxWorkerHeapBytes` でプールのサイズと worker のヒープ予算が決まります。プールが存在する間は、後から作ったビューに同じオプションを渡してもプールは変わらず、値が異なる場合はコンソールに警告が出ます。最後のビューを破棄するとプールは終了し、次に初期化したビューが新しいプールを作成します。
+
+それ以外のリソースはビューごとに持ちます。WebGL コンテキスト、タイルキャッシュ（`cacheBytes`）、`memoryBudget` の残りの上限、フォント worker です。このためメモリ使用量はビューの数に応じて増え、2 つのビューに表示されるデータはビューごとにダウンロードとデコードが行われます。メモリの少ない端末で複数のビューを表示する場合は、各ビューの `cacheBytes` を小さくしてください。
+
 ## Properties
 
 ### container
 
 **Type:** `HTMLElement | undefined`
 
-**Description:** ビューをレンダリングする HTML コンテナ要素。指定された場合、ThreeView はこのコンテナ内に canvas を追加します。
+**Description:** ビューをレンダリングする HTML コンテナ要素。指定された場合、ThreeView はこのコンテナ内に canvas を追加し、ビューをコンテナのサイズに合わせます。canvas は絶対配置されるため、コンテナ自体にサイズを指定してください。`position: static` のコンテナには、ビューが破棄されるまで `position: relative` が設定されます。`container` と `canvas` のどちらも指定しない場合、ThreeView はビューポートサイズの要素を `document.body` に追加します。
 
 **Example:**
 
@@ -110,7 +124,7 @@ const view = new ThreeView({
 
 **Type:** `HTMLCanvasElement | OffscreenCanvas | undefined`
 
-**Description:** レンダリングに使用する canvas 要素。指定された場合、この canvas を使用します。指定しない場合は新しい canvas が作成されます。
+**Description:** レンダリングに使用する canvas 要素。指定された場合、この canvas を使用します。指定しない場合は新しい canvas が作成されます。ビューは canvas の親要素のサイズに合わせられ、canvas にはそのサイズがピクセル単位で設定されます。このため flex や grid レイアウトでは、親要素が縮小できるように `min-width: 0` と `min-height: 0`（または `overflow: hidden`）を指定してください。
 
 **Example:**
 
@@ -138,7 +152,7 @@ const view = new ThreeView({
 
 **Type:** `boolean | undefined`
 
-**Description:** ウィンドウリサイズイベント時の自動リサイズ処理を無効にするかどうか。`true` の場合、ウィンドウサイズの変更時に自動的にリサイズされません。
+**Description:** 自動リサイズを無効にするかどうか。デフォルトでは、ビューはコンテナ（`container`、または `canvas` の親要素）のサイズに追従します。ウィンドウのリサイズを伴わないサイズ変更にも追従します。`true` の場合は、[`resize()`](../../../three/api/threeview-functions/#resize) を自分で呼び出してください。
 
 **Default:** `false`
 
@@ -441,6 +455,22 @@ const view = new ThreeView({
 });
 ```
 
+### workerPoolSize
+
+**Type:** `number | undefined`
+
+**Description:** タイルのデコードとメッシュ構築を行うバックグラウンドワーカーの数。各ワーカーは JavaScript エンジンのインスタンスと WebAssembly ヒープを個別に持つため、プールを小さくするとメモリ使用量が減りますが、カメラを素早く動かした後のタイル読み込みは遅くなります。値は小数点以下を切り捨てたうえで `1` から `navigator.hardwareConcurrency` の範囲に制限され（値が変わった場合はコンソールに警告が出ます）、`mobileOptimization` 有効時にも適用されます。モバイル端末、またはブラウザが `navigator.deviceMemory` を報告しない場合、`memoryBudget.maxWorkerHeapBytes` のデフォルトはワーカーごとの固定値のため、プールを大きくするとピークメモリが増えます。このオプションは `init()` でのみ読み取られます。ページ上のすべてのビューは 1 つのプールを共有するため、サイズを決めるのは最初に `init()` を呼んだビューだけです（[複数ビュー](#複数ビュー)を参照）。
+
+**Default:** `navigator.hardwareConcurrency`（`mobileOptimization` 有効時は最大 `2`）
+
+**Example:**
+
+```typescript
+const view = new ThreeView({
+  workerPoolSize: 4,
+});
+```
+
 ### memoryBudget
 
 **Type:** `object | undefined`
@@ -477,38 +507,6 @@ const view = new ThreeView({
 :::tip[関連ドキュメント]
 SSE 乗数の範囲は実行時にも [`setSseMultiplierRange()`](../threeview-functions#setssemultiplierrange) で変更できます。
 :::
-
-### waterTexture
-
-**Type:** `{ enabled: boolean; url?: string } | undefined`
-
-**Description:** 共有水テクスチャの設定。有効にすると、水エフェクトを使用するすべてのメッシュで単一の水ノーマルテクスチャが共有されます。これにより、各メッシュが個別にテクスチャを読み込むよりも効率的になります。
-
-**Default:** 省略時は無効です（`{ enabled: true }` を渡した場合にのみ共有水テクスチャが読み込まれます）。
-
-```typescript
-type WaterTextureOptions = {
-  enabled: boolean; // 水テクスチャの共有を有効にするかどうか
-  url?: string; // カスタム水ノーマルテクスチャの URL（省略時はビルトインテクスチャを使用）
-};
-```
-
-**Example:**
-
-```typescript
-// ビルトインテクスチャを使用
-const view = new ThreeView({
-  waterTexture: { enabled: true },
-});
-
-// カスタムテクスチャを使用する場合
-const viewWithCustomWater = new ThreeView({
-  waterTexture: {
-    enabled: true,
-    url: "https://example.com/water-normal.png",
-  },
-});
-```
 
 ### GlobeOptions
 

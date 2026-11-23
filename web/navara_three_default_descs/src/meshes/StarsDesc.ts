@@ -39,6 +39,7 @@ export class StarsDesc extends MeshDesc<StarsConfig, StarsUpdate, Stars> {
     const assetsUrl = this.config.stars?.assetsUrl;
 
     const stars = Stars.fromUrl(assetsUrl, starsOptions);
+    stars.raw.material.ellipsoid = this.view.atmosphere.ellipsoid;
     this._stars = stars;
 
     // The stars shader never samples the irradiance texture.

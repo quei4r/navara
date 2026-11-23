@@ -10,6 +10,10 @@ pub struct WorkerTaskDelegatedEvent {
     pub ind: u32,
     pub r#gen: u32,
     pub bits: u64,
+    /// Dispatch urgency: 0 is the most urgent (see `Priority::rank`). The
+    /// engine already emits a frame's tasks in this order and bounds how many
+    /// are in flight, so the platform starts them as they come.
+    pub priority: u8,
 
     #[wasm_bindgen(getter_with_clone)]
     pub task: DelegatedWorkerTasksParameters,
@@ -37,21 +41,25 @@ pub struct DelegatedWorkerTasksParameters {
 
 impl<'a>
     From<
-        navara_event_store::ReconstructableComponentEvent<
+        navara_event_store::ReconstructableComponentEvent<(
             &'a navara_worker::DelegatedWorkerTasksParameters,
-        >,
+            &'a navara_component::Priority,
+        )>,
     > for WorkerTaskDelegatedEvent
 {
     fn from(
-        ev: navara_event_store::ReconstructableComponentEvent<
+        ev: navara_event_store::ReconstructableComponentEvent<(
             &'a navara_worker::DelegatedWorkerTasksParameters,
-        >,
+            &'a navara_component::Priority,
+        )>,
     ) -> Self {
+        let (task, priority) = ev.comp;
         Self {
             ind: ev.ind,
             r#gen: ev.r#gen,
             bits: ev.bits,
-            task: ev.comp.into(),
+            priority: priority.rank(),
+            task: task.into(),
         }
     }
 }

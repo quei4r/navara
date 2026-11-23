@@ -56,7 +56,7 @@ pub fn construct_polygon_feature(
         );
     }
 
-    hierarchy.align_winding_order();
+    hierarchy.align_winding_order_on_globe();
 
     if hierarchy.expected_winding_order == WindingOrder::Unknown {
         // If all the vertices of a polygon lie on a single line, the winding order becomes WindingOrder::Unknown.
@@ -73,6 +73,7 @@ pub fn construct_polygon_feature(
             height: material.height,
             extruded_height: material.extruded_height.unwrap_or_default(),
             per_position_height: material.per_position_height,
+            extrusion_base: material.extrusion_base,
             use_rte,
             outline: material.outline,
             ..Default::default()

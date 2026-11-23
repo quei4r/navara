@@ -66,10 +66,10 @@ export function eagerAllocateBatchTexture(
   for (const key of support.vec3s ?? ["color"]) {
     // An emissive write allocates the paired intensity slot too
     // (ensureEmissiveSlots), so no separate emissiveIntensity write is needed.
-    updateBatchAttribute(material, 0, key, identityValue(key));
+    updateBatchAttribute(material, 0, key as never, identityValue(key));
   }
   for (const key of support.scalars) {
-    updateBatchAttribute(material, 0, key, identityValue(key));
+    updateBatchAttribute(material, 0, key as never, identityValue(key));
   }
   if (opts.showOpacity) {
     updateBatchAttribute(material, 0, "show", true);

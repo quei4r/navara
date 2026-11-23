@@ -41,10 +41,10 @@ export const GBUFFER_ATTACHMENT_NAMES = [
  */
 export type GBufferOptions = {
   /**
-   * The view-space normal buffer (RG=octahedral normal, B=metalness or
-   * reflectivity, A=roughness *and* the blend factor). Required by every
-   * normal-reading effect (aerial perspective, SSR, fog light) and, via
-   * {@link globeNormal}, by draped meshes.
+   * The view-space normal buffer (RG=octahedral normal, B=reflectance at
+   * normal incidence (F0), A=roughness *and* the blend factor). Required by every
+   * normal-reading effect (aerial perspective, SSR, fog light) and,
+   * via {@link globeNormal}, by draped meshes.
    */
   normal?: boolean;
   /**
@@ -59,8 +59,9 @@ export type GBufferOptions = {
   emissive?: boolean;
   /**
    * The shadow buffer (R=directional/CSM shadow amount, 0=lit,
-   * 1=fully shadowed). No built-in effect requires it – declare it from a
-   * custom effect's `requiredBuffers` to read per-pixel shadowing.
+   * 1=fully shadowed). Required by the aerial perspective's `shadow`
+   * option; a custom effect reads per-pixel shadowing by declaring it in
+   * `requiredBuffers`.
    */
   shadow?: boolean;
   /**
@@ -111,6 +112,41 @@ export function unionGBufferRequirements(
     }
   }
   return resolveGBufferOptions(enabled);
+}
+
+/**
+ * MRT draw buffers a configuration takes: color, which always exists, plus
+ * each enabled attachment. Depth and `globeNormal` take no slot.
+ */
+export function countGBufferAttachments(
+  buffers: ResolvedGBufferOptions,
+): number {
+  return 1 + GBUFFER_ATTACHMENT_NAMES.filter((name) => buffers[name]).length;
+}
+
+/**
+ * The attachment count that adding a descriptor needing `required` leads to
+ * when it exceeds `maxDrawBuffers`, else `undefined`. Counted from every
+ * current requirement rather than the allocated buffers: after a rejected
+ * growth they differ, and the next re-derivation would drop `required` too.
+ * Buffers that are already allocated always fit.
+ */
+export function exceededGBufferCapacity(
+  requirements: Iterable<readonly GBufferName[]>,
+  required: readonly GBufferName[],
+  allocated: ResolvedGBufferOptions,
+  maxDrawBuffers: number,
+): number | undefined {
+  const needed = unionGBufferRequirements([required]);
+  // `globeNormal` included: allocated `normal` alone does not copy it.
+  const names = Object.keys(needed) as GBufferName[];
+  if (names.every((name) => !needed[name] || allocated[name])) {
+    return undefined;
+  }
+  const count = countGBufferAttachments(
+    unionGBufferRequirements([...requirements, required]),
+  );
+  return count > maxDrawBuffers ? count : undefined;
 }
 
 /**
@@ -208,12 +244,22 @@ export function computeGBufferDefines(
   return defines;
 }
 
+/**
+ * Default `roughness` of materials without a PBR roughness of their own
+ * (polygons, tile slots). They shade with Phong at shininess 50; inverting
+ * `roughnessToSpecularPower` (`shininess = 2 / roughness^4 - 2`) gives
+ * `sqrt(sqrt(2 / 52))`.
+ */
+export const GBUFFER_PHONG_ROUGHNESS = Math.sqrt(Math.sqrt(2 / 52));
+
 // Write snippets. Exported rather than inlined at the injection sites because
 // enhancers and the tile mesh locate the injected code by exact string match,
 // so both sides must share one constant.
 
 /**
  * `normalBuffer` write for physically-based materials (standard/physical).
+ * B is the material's metalness as is, so readers take it as the F0 directly:
+ * 0 does not reflect and 1 is a mirror.
  * `modelBaseEnhancer` matches/replaces this exact string.
  */
 export const GBUFFER_NORMAL_WRITE_PHYSICAL =
@@ -221,10 +267,12 @@ export const GBUFFER_NORMAL_WRITE_PHYSICAL =
 
 /**
  * `normalBuffer` write for non-physical materials (basic/lambert/phong).
- * `polygonBaseEnhancer` matches/replaces this exact string.
+ * These have no reflectance at normal incidence — three's `reflectivity` is an
+ * env-map mix weight defaulting to 1 — so B is 0; `polygonBaseEnhancer` and
+ * the tile mesh match/replace this exact string to write their own.
  */
 export const GBUFFER_NORMAL_WRITE_BASIC =
-  "GBUFFER_WRITE_NORMAL(normal, reflectivity, roughnessFactor)";
+  "GBUFFER_WRITE_NORMAL(normal, 0.0, roughnessFactor)";
 
 /**
  * Selective-effect writes for built-in `ShaderLib` materials. The tile mesh

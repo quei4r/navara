@@ -108,11 +108,9 @@ export class VectorDrapeResolver implements DrapeResolver {
   private renderTargets: WebGLRenderTarget[] = [];
   // Signature of the last baked slot set; a change drives a re-bake + re-bind.
   private prevSignature = "";
-  // The vector resolution revision at which `vectorSlots` was last fetched.
-  // Re-fetching is skipped while the global revision is unchanged (the resolve
-  // result can only change when a traverse runs or a scene becomes ready).
-  // `-1` forces a fetch on the first frame.
-  private lastRevision = -1;
+  // Whether Rust handed this tile new sources since `vectorSlots` was read.
+  // Starts set so a new tile reads them on its first render.
+  private sourcesChanged = true;
   private warnedExceededTextures = false;
   // Whether the next bakes render pick-id colors. Pick bakes bypass the MSAA
   // path: the resolve averages id-encoded colors along feature edges into
@@ -127,15 +125,23 @@ export class VectorDrapeResolver implements DrapeResolver {
     this.prevSignature = "";
   }
 
+  /** Re-read the handed slots on the next render: Rust handed this tile new
+   * sources. */
+  markSourcesChanged(): void {
+    this.sourcesChanged = true;
+  }
+
   update(): void {
-    // Re-fetch the Rust-resolved slots only when the global vector resolution
-    // revision changed; otherwise reuse the cached slots. This skips a per-tile
-    // WASM-boundary resolve every frame, the dominant steady-state cost when
-    // many terrain tiles are visible.
-    const revision = this.host.tileHandler.vectorRevision();
-    if (revision !== this.lastRevision) {
-      this.lastRevision = revision;
+    // Re-read the handed slots only when Rust lists this tile in the
+    // `vector_drape_changed` event. This skips a per-tile WASM-boundary call
+    // every frame, the dominant steady-state cost when many terrain tiles are
+    // visible.
+    if (this.sourcesChanged) {
+      this.sourcesChanged = false;
       this.refreshSlots();
+    } else if (this.renderTargets.length < this.vectorSlots.length) {
+      // `release` freed the targets; the handed slots still stand.
+      this.syncRenderTargets();
     }
 
     // Re-bake the offscreen vector scenes only when the resolved slots or their
@@ -189,6 +195,14 @@ export class VectorDrapeResolver implements DrapeResolver {
     this.prevSignature = "";
   }
 
+  release(): void {
+    if (this.renderTargets.length === 0) return;
+    this.dispose();
+    // The slots pointed at the disposed targets.
+    this.bindSlots();
+    this.prevSignature = "";
+  }
+
   liveRenderTargetCount(): number {
     return this.renderTargets.length;
   }
@@ -201,12 +215,12 @@ export class VectorDrapeResolver implements DrapeResolver {
   }
 
   /**
-   * Pull the Rust-resolved texturized-vector slots for this terrain tile into
+   * Pull the texturized-vector slots Rust handed over for this terrain tile into
    * {@link vectorSlots}: one bake slot per clamp-to-ground layer, keyed by the
    * rendered WM vector tile that backs it (ancestor fallback already resolved in
-   * Rust). Only layers with an actual draped scene take a slot — Rust also returns
-   * non-draped layers (rendered in the MRT scene), which must not consume the budget.
-   * Capped to the GPU slot budget; warns once when more draped layers are requested.
+   * Rust). Rust hands over only sources with a draped feature, so every layer
+   * has a scene to bake. Capped to the GPU slot budget; warns once when more
+   * draped layers are requested.
    */
   private refreshSlots() {
     const states =
@@ -225,19 +239,6 @@ export class VectorDrapeResolver implements DrapeResolver {
       const tileHandle = state.tile_handle;
       let slot = byLayer.get(layerId);
       if (!slot) {
-        // Rust returns a state for every vector layer with a rendered tile, including
-        // non-draped layers (those render in the MRT scene and never create a texturized
-        // scene). Only a layer that actually has a draped scene may consume a bake slot;
-        // otherwise non-draped layers would occupy the limited slot budget and crowd out
-        // genuinely-draped layers past the cap. A draped layer whose scene isn't ready yet
-        // simply gets no slot this pass and is picked up once its scene exists.
-        const hasScene =
-          this.host.texturizedScenes.findSceneByLayerId(tileHandle, layerId) !=
-          null;
-        if (!hasScene) {
-          state.free();
-          continue;
-        }
         // Cap the layer fan-out to the GPU slot budget; extra layers are dropped.
         if (byLayer.size >= this.host.numTexturizedVector) {
           droppedLayers.add(layerId);
@@ -407,12 +408,17 @@ export class VectorDrapeResolver implements DrapeResolver {
       // Use PolygonMesh getters that expose material enhancer state
       m.userData.reflectivities.value[lastIdx] = mesh.reflectivity;
       m.userData.roughnesses.value[lastIdx] = mesh.roughness;
-      m.userData.waters.value[lastIdx] = mesh.water;
-      m.userData.waterScaleNormals.value[lastIdx] = mesh.waterScaleNormal;
-      m.userData.waterSpeeds.value[lastIdx] = mesh.waterSpeed;
+      m.userData.waterParams.value[lastIdx].set(
+        mesh.waveExaggeration,
+        mesh.water ? 1 : 0,
+      );
+      if (mesh.water) {
+        m.userData.waterWaves.value[
+          1 + lastIdx - this.host.texturizedSceneIndexFrom
+        ] = mesh.waterWaves;
+      }
       m.userData.shininesses.value[lastIdx] = mesh.shininess;
       m.userData.specularStrengths.value[lastIdx] = mesh.specularStrength;
-      m.userData.applyWaterNormals.value[lastIdx] = mesh.applyWaterNormal;
       m.userData.speculars.value[lastIdx] = mesh.specular;
       m.userData.emissiveIntensities.value[lastIdx] = mesh.emissiveIntensity;
       m.userData.emissiveColors.value[lastIdx].set(mesh.emissiveColor);

@@ -9,6 +9,47 @@ sidebar:
 
 ## Properties
 
+### anchor
+
+**Type:** `"center" | "left" | "right" | "top" | "bottom" | "top-left" | "top-right" | "bottom-left" | "bottom-right" | undefined`
+
+**Description:** Sets which part of the text block sits on the label's position, as MapLibre's `text-anchor` does. The block is as wide as its widest line and one line height tall per line, so `"top"` hangs the text below the position and `"bottom"` stands it above. The anchor is also the point [`rotation`](#rotation) turns the label around.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `"center"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    anchor: "top"
+  }
+}
+```
+
+### backfaceCulling
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the label is hidden when seen from behind. When `false`, both sides of the label are drawn. When `true`, only its front is drawn.
+
+Only a flat label (see [`textFacing`](#textfacing)) has a back the camera can see. Its front faces away from the globe, so turning this on hides the parts of a large label that wrap over the horizon. It has no effect on an upright label, which always lies in the screen plane facing the viewer.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat",
+    backfaceCulling: true
+  }
+}
+```
+
 ### backgroundColor
 
 **Type:** `Color | undefined`
@@ -63,24 +104,6 @@ import { Color } from "@navaramap/three";
 {
   text: {
     borderWidth: 2
-  }
-}
-```
-
-### center
-
-**Type:** [`Vec2`](../../api/types/#vec2) | undefined
-
-**Description:** Specifies the shift amount from the center. The range is between 0 and 1.
-
-**Default:** `undefined`
-
-**Example:**
-
-```typescript
-{
-  text: {
-    center: { x: 0.5, y: 0.0 }
   }
 }
 ```
@@ -141,6 +164,24 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### declutterPadding
+
+**Type:** `number[] | undefined`
+
+**Description:** Extra space around the label's collision box, in screen pixels whatever [`sizeInMeters`](#sizeinmeters) is. One to four values, expanded like CSS padding: `[all]`, `[vertical, horizontal]`, `[top, horizontal, bottom]` or `[top, right, bottom, left]`. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `text-padding`.
+
+**Default:** `[2]`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    declutterPadding: [4, 8]
+  }
+}
+```
+
 ### declutterPriority
 
 **Type:** `number | undefined`
@@ -156,6 +197,24 @@ import { Color } from "@navaramap/three";
   text: {
     declutter: true,
     declutterPriority: 1
+  }
+}
+```
+
+### declutterRank
+
+**Type:** `number | undefined`
+
+**Description:** Coarse placement order for decluttering, compared before [`declutterPriority`](#declutterpriority): every label of a material with a higher rank is placed before any label or sprite with a lower one, whatever their priorities. A per-feature `declutterPriority` therefore only reorders labels and sprites of the same rank. Only meaningful when [`declutter`](#declutter) is enabled.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    declutterRank: 1
   }
 }
 ```
@@ -281,7 +340,7 @@ view.addFontFamily({
 
 **Type:** `("point" | "line" | "polygon")[] | undefined`
 
-**Description:** Source geometry categories this material consumes. Adding `"line"` emits one label per line-string vertex, and adding `"polygon"` emits one label per polygon-ring vertex (the closing duplicate vertex is skipped). Setting the array replaces the default, so include `"point"` when point geometry should keep rendering. This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` applies a new value only to tiles loaded afterwards, so already-loaded tiles keep their previous geometry until the layer is re-created.
+**Description:** Source geometry categories this material consumes. Adding `"line"` emits one label per line string by default, at its first vertex, as MapLibre places a `symbol-placement: "point"` symbol on a line. Set [`placement`](#placement) to lay labels along the line instead. Adding `"polygon"` emits one label per polygon, placed inside it at the point farthest from its edges (each part of a MultiPolygon gets its own), or along its rings with [`placement`](#placement). Setting the array replaces the default, so include `"point"` when point geometry should keep rendering. This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` applies a new value only to tiles loaded afterwards, so already-loaded tiles keep their previous geometry until the layer is re-created.
 
 **Default:** `["point"]`
 
@@ -313,6 +372,44 @@ view.addFontFamily({
 }
 ```
 
+### ignorePlacement
+
+**Type:** `boolean | undefined`
+
+**Description:** Keeps this label's box out of the collision check, so labels and sprites placed after it can overlap it. The label itself still hides when it collides with one placed before it, unless [`overlap`](#overlap) allows it. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `text-ignore-placement`.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    ignorePlacement: true
+  }
+}
+```
+
+### keepUpright
+
+**Type:** `boolean | undefined`
+
+**Description:** Flips a label placed along a line when it would otherwise read upside down, so that names stay legible whichever way the line was drawn. Only used when [`placement`](#placement) is `"line"` or `"line-center"`, and never flips a label drawn straight (see [`rotateWithCamera`](#rotatewithcamera)). Which way a label reads depends on the camera, so it is decided again as the camera moves, and `layer.update()` applies a new value to labels that are already shown.
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    keepUpright: false // Always read in the direction the line was drawn
+  }
+}
+```
+
 ### lang
 
 **Type:** `string | undefined`
@@ -331,13 +428,31 @@ view.addFontFamily({
 }
 ```
 
+### letterSpacing
+
+**Type:** `number | undefined`
+
+**Description:** Specifies extra space between characters in ems (multiples of `size`). Spacing is added between characters only, never after the last one, so alignment and anchoring are unaffected, and it counts toward the [`maxWidth`](#maxwidth) wrap width. Negative values tighten the text. Combining marks stay attached to their base character. Spacing is ignored for labels containing Arabic-script text, where it would break the joined letterforms. Can also be set per feature with the `letterSpacing` key of a feature evaluator.
+
+**Default:** `0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    letterSpacing: 0.2 // Add 0.2 em between characters
+  }
+}
+```
+
 ### lineHeight
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the line height of multi-line text as a multiplier of the font's natural line height (ascender − descender + line gap).
+**Description:** Specifies the distance between the baselines of multi-line text in ems (multiples of `size`), as MapLibre's `text-line-height` does. When unset, lines are spaced by the font's natural line height (ascender − descender + line gap), so the spacing then differs from font to font.
 
-**Default:** `1.0`
+**Default:** `undefined` (the font's natural line height)
 
 **Example:**
 
@@ -345,6 +460,48 @@ view.addFontFamily({
 {
   text: {
     lineHeight: 1.2
+  }
+}
+```
+
+### lineOffset
+
+**Type:** `number | undefined`
+
+**Description:** Shifts a label placed along a line sideways, away from the line. Positive values move it to the left of the line's direction of travel, which puts it above the line when the label reads left to right. The value uses the same unit as [`size`](#size): meters when [`sizeInMeters`](#sizeinmeters) is `true`, pixels otherwise. Use it to set a name beside a road instead of on top of it. Only used when [`placement`](#placement) is `"line"` or `"line-center"`, and not by a label drawn straight (see [`rotateWithCamera`](#rotatewithcamera)). `layer.update()` applies a new value to labels that are already shown.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    size: 14,
+    sizeInMeters: false,
+    lineOffset: 10 // 10 pixels beside the line
+  }
+}
+```
+
+### maxAngle
+
+**Type:** `number | undefined`
+
+**Description:** The largest turn, in degrees, that the line may make under a label placed along it before the label is hidden as unreadable. The turn is added up over a short stretch of the label, about one and a half times the font size, which slides along it: several small corners close together count together and can hide the label, while a long gentle curve is kept however far it turns in total. Only used when [`placement`](#placement) is `"line"` or `"line-center"`, and not for a label drawn straight (see [`rotateWithCamera`](#rotatewithcamera)), which does not bend. Whether a label fits is decided again as the camera moves, and `layer.update()` applies a new value to labels that are already shown.
+
+**Default:** `45.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    maxAngle: 90 // Allow labels on tighter curves
   }
 }
 ```
@@ -363,6 +520,27 @@ view.addFontFamily({
 {
   text: {
     maxWidth: 10 // Wrap lines longer than 10 ems
+  }
+}
+```
+
+### offset
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** Moves the text away from its anchor point, in ems (multiples of [`size`](#size)), as MapLibre's `text-offset` does. A positive `x` moves it right and a positive `y` moves it down. The offset lies in the label's own plane, so it turns with [`rotation`](#rotation).
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    anchor: "top",
+    offset: { x: 0, y: 0.5 } // Half an em below the position
   }
 }
 ```
@@ -399,6 +577,25 @@ view.addFontFamily({
 {
   text: {
     opacity: 0.5
+  }
+}
+```
+
+### outlineBlur
+
+**Type:** `number | undefined`
+
+**Description:** Specifies the width over which the outline's outer edge fades out, centered on that edge, in the same unit as [`outlineWidth`](#outlinewidth). The outline and its fade reach at most 17.5/64 em past the glyph (8/64 em with `highQuality`), less half a screen pixel kept for antialiasing, and a fade that would go further is narrowed to fit. Can be set per feature from a feature evaluator.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    outlineWidth: 4,
+    outlineBlur: 4
   }
 }
 ```
@@ -445,7 +642,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the outline thickness in CSS pixels.
+**Description:** Specifies the outline thickness in 1/64 em: pixels of text drawn 64 pixels tall, so the outline keeps its proportion to the glyphs at any `size`. A 2 pixel outline on 16 pixel text is `2 / 16 × 64 = 8`. The outline reaches at most 17.5/64 em past the glyph (8/64 em with `highQuality`), less half a screen pixel kept for antialiasing, so near that limit small text gets proportionally thinner outlines: at 10 pixels, a 16/64 em outline draws about 2.2 pixels wide instead of 2.5. Can be set per feature from a feature evaluator.
 
 **Default:** `0.0`
 
@@ -454,7 +651,124 @@ import { Color } from "@navaramap/three";
 ```typescript
 {
   text: {
-    outlineWidth: 2
+    outlineWidth: 8
+  }
+}
+```
+
+### overlap
+
+**Type:** `"never" | "always" | "cooperative" | undefined`
+
+**Description:** Whether the label may be drawn over labels and sprites placed before it (higher [`declutterRank`](#declutterrank), then higher [`declutterPriority`](#declutterpriority), places first). `"never"` hides it on any collision. `"always"` never hides it, and its box still keeps later `"never"` ones away unless [`ignorePlacement`](#ignoreplacement) is set. `"cooperative"` hides it only when it collides with a `"never"` one. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `text-overlap`.
+
+**Default:** `"never"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    overlap: "always"
+  }
+}
+```
+
+### placement
+
+**Type:** `"point" | "line" | "line-center" | undefined`
+
+**Description:** How labels are placed on line and polygon geometry. Only takes effect when [`geometryTypes`](#geometrytypes) includes `"line"` or `"polygon"`. Point geometry is always labeled at the point itself.
+
+- `"point"`: one label per line string, at its first vertex, and one label per polygon, inside it at the point farthest from its edges. On a vector-tile source, a line whose first vertex lies outside the tile (where the tile cut it) is not labeled in that tile.
+- `"line"`: labels repeat along the line every [`spacing`](#spacing) and, by default, follow its curve word by word, like a street name on a map. Each word turns to match the line under it, and the letters within a word stay straight. Set [`spreadGlyphs`](#spreadglyphs) to turn each glyph instead. Polygon boundary rings, holes included, are followed the same way.
+- `"line-center"`: a single label at the halfway point along each line string or polygon ring, bent along it in the same way.
+
+A label along a line is hidden instead of drawn when it would not read well:
+
+- it is longer than the line left on either side of its anchor, or
+- it bends through more than [`maxAngle`](#maxangle).
+
+These checks run again as the camera moves.
+
+Along-line labels also accept [`keepUpright`](#keepupright), [`lineOffset`](#lineoffset), and [`spreadGlyphs`](#spreadglyphs). With none of [`rotateWithCamera`](#rotatewithcamera), [`spreadGlyphs`](#spreadglyphs), and [`textFacing`](#textfacing) set, a label lies flat on the surface and follows the line. Together they choose the layout:
+
+| `rotateWithCamera` | `spreadGlyphs` | `textFacing` | Result |
+| --- | --- | --- | --- |
+| `false` (default) | `false` (default) | `"flat"` (default) | Words lie on the surface along the line, each word straight |
+| `false` | `true` | `"flat"` | Each glyph lies on the surface, turned to the line under it (MapLibre's default street name: `text-rotation-alignment` and `text-pitch-alignment` both `"map"`) |
+| `false` | either | `"upright"` | Glyphs, or words without `spreadGlyphs`, stay in the screen plane at the anchor's size. They are spaced along the line as it appears on screen, each turned to the line's direction on screen (`text-rotation-alignment: "map"` with `text-pitch-alignment: "viewport"`) |
+| `true` | `true` | either | Each glyph sits on the line and turns to the camera like a point label, spaced on screen (`text-rotation-alignment: "viewport-glyph"`) |
+| `true` | `false` | either | The label is not bent: it is drawn straight at each anchor, exactly like a point label, rotation and background included (`text-rotation-alignment: "viewport"`) |
+
+A straight label still repeats every [`spacing`](#spacing), but it is never flipped by [`keepUpright`](#keepupright), is not checked against [`maxAngle`](#maxangle), and ignores [`lineOffset`](#lineoffset).
+
+This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` does not rebuild labels that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `"point"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line", // Repeat along the line, bending with it
+    textFacing: "flat"
+  }
+}
+```
+
+### rotateWithCamera
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the label turns with the camera or with the map, as MapLibre's `text-rotation-alignment` (`true` is `"viewport"`, `false` is `"map"`).
+
+When `true`, the label reads left to right on screen. With [`textFacing`](#textfacing) set to `"upright"`, it is a screen-aligned billboard. With `"flat"`, the label turns around the globe's surface normal so the text still reads left to right.
+
+When `false`, the label is aligned with the map. With `"upright"`, it stays in the screen plane at full size but turns with the camera heading so that its x-axis keeps pointing east: the text reads along the east-west direction, and reads upside down when the camera faces south, as a north-up map label does. With `"flat"`, it is a north-up label painted on the surface that turns with the map.
+
+When [`placement`](#placement) is `"line"` or `"line-center"`, `false` makes the label follow the line, and `true` draws it straight at each anchor like a point label unless [`spreadGlyphs`](#spreadglyphs) is set. See [`placement`](#placement) for the resulting layouts.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `true` for `placement: "point"`, `false` along a line (MapLibre's `"auto"`)
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat",
+    rotateWithCamera: false // North-up, painted on the surface
+  }
+}
+```
+
+### rotation
+
+**Type:** `number | undefined`
+
+**Description:** Rotates the label within its own plane around its anchor point, in degrees, clockwise as seen from the front. The rotation is applied on top of the orientation that [`textFacing`](#textfacing) and [`rotateWithCamera`](#rotatewithcamera) resolve to. It spins a billboard on screen and turns a surface label like a compass bearing.
+
+When [`placement`](#placement) is `"line"` or `"line-center"`, each glyph spins about its own center and keeps its place on the line, as MapLibre's `text-rotate` does on line labels. A label drawn straight (`rotateWithCamera: true` without [`spreadGlyphs`](#spreadglyphs)) turns as a whole around its anchor, as a point label does.
+
+[`anchor`](#anchor) decides where inside the text the pivot sits. For example, `"center"` turns the label around its middle, and `"bottom"` turns it around the bottom of the text block.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/), so every label in a layer can point a different way.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat",
+    rotateWithCamera: false,
+    rotation: 45, // Turned 45° clockwise on the surface
+    anchor: "center" // Pivot around the middle of the text
   }
 }
 ```
@@ -531,6 +845,85 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### spacing
+
+**Type:** `number | undefined`
+
+**Description:** The distance between repeated labels when [`placement`](#placement) is `"line"`, in screen pixels. The unit is the same on `geojson` and `vector-tile` sources.
+
+The labels shown on a line are decided again as the camera moves. Pulling the camera back thins them out, and moving closer fills in more labels between them. Labels never slide along the line: they only appear or disappear. The gap on screen stays between one and two times `spacing`, also in a tilted view, where the near and far parts of the view each get their own density.
+
+A line always keeps the label at its halfway point, and a line shorter than `spacing` on screen gets only that one. Labels stop filling in very close to the ground (street level) on a GeoJSON source, and when a vector tile is shown much deeper than its own zoom level (overscaled). There they sit farther apart than `spacing`.
+
+Three more rules follow MapLibre's `symbol-spacing`:
+
+- A label longer than three quarters of `spacing` spreads its repeats to its own length plus a quarter of `spacing`, so long names are spaced out instead of hidden.
+- A label closer than half of `spacing` to an earlier label with the same text in the same tile is hidden, so a road split into several lines, or two carriageways with one name, is not labeled twice in the same spot.
+- On a vector tile source, each tile places labels only inside its own bounds. Each tile spaces its own labels, so repeats end up at most about one tile apart (512 to 1024 screen pixels) however large `spacing` is.
+
+This option applies when the layer's geometry is built. `layer.update()` does not rebuild labels that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `250.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    spacing: 400
+  }
+}
+```
+
+### spreadGlyphs
+
+**Type:** `boolean | undefined`
+
+**Description:** Places each glyph of a label along a line on its own instead of each word. How a glyph turns depends on [`rotateWithCamera`](#rotatewithcamera):
+
+- `false` (the default along a line): each glyph turns to match the line under it, the way MapLibre lays out `symbol-placement: "line"` labels. A word bends with a curve instead of staying straight, and on a tight bend the letters of a word spread apart.
+- `true`: each glyph turns to follow the camera, as a point label does with the same [`textFacing`](#textfacing), so the text stays readable however the line runs (MapLibre's `text-rotation-alignment: "viewport-glyph"`). The glyphs also keep one size and are spaced along the line as it appears on screen, so a name stays evenly spaced where the line runs away from the camera. Without `spreadGlyphs`, `rotateWithCamera: true` draws the label straight instead.
+
+Only used when [`placement`](#placement) is `"line"` or `"line-center"`. `layer.update()` applies a new value to labels that are already shown.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/), for example to keep a label in a cursive script or font word by word while the rest of the layer spreads its glyphs.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    textFacing: "flat",
+    rotateWithCamera: false, // Follow the line, like a MapLibre street name
+    spreadGlyphs: true
+  }
+}
+```
+
+### standalone
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the label may show while the layer's billboard at the same anchor is hidden. Unless both are `standalone`, a layer's label and billboard of the same feature and anchor are placed as a pair, tested together so they never block each other. With `false`, the label is hidden whenever its billboard loses its spot, so `false` on both means both show or neither does. With `true` on both, they are placed independently and block each other where they overlap. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `icon-optional` (inverted: `icon-optional: true` means `standalone: true` on the label).
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    standalone: false
+  }
+}
+```
+
 ### text
 
 **Type:** `string | undefined`
@@ -551,9 +944,9 @@ import { Color } from "@navaramap/three";
 
 ### textAlign
 
-**Type:** `string | undefined`
+**Type:** `"left" | "center" | "right" | "auto" | undefined`
 
-**Description:** Specifies the horizontal alignment of lines within a multi-line text block. One of `"left"`, `"center"`, or `"right"`. Has a visible effect only when the text spans multiple lines (via [`maxWidth`](#maxwidth) or explicit `\n` characters).
+**Description:** Specifies the horizontal alignment of lines within a multi-line text block. One of `"left"`, `"center"`, `"right"`, or `"auto"`, which aligns the lines towards the horizontal side of [`anchor`](#anchor), as MapLibre's `text-justify: auto` does. Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/). Has a visible effect only when the text spans multiple lines (via [`maxWidth`](#maxwidth) or explicit `\n` characters).
 
 **Default:** `"center"`
 
@@ -563,6 +956,74 @@ import { Color } from "@navaramap/three";
 {
   text: {
     textAlign: "left"
+  }
+}
+```
+
+### textFacing
+
+**Type:** `"upright" | "flat" | undefined`
+
+**Description:** Whether the label lies in the screen plane or on the globe surface, as MapLibre's `text-pitch-alignment` (`"upright"` is `"viewport"`, `"flat"` is `"map"`). An upright label is never foreshortened, however the camera is pitched. `"flat"` lays the label on the globe surface around its anchor, following the globe's curvature so that long text stays on the surface instead of lifting off at its ends. A flat label reads as painted onto the surface and foreshortens with camera pitch.
+
+On a point label, combine with [`rotateWithCamera`](#rotatewithcamera) for four behaviours:
+
+| `textFacing` | `rotateWithCamera` | Result |
+| --- | --- | --- |
+| `"upright"` | `true` | Screen-aligned billboard (the default) |
+| `"upright"` | `false` | In the screen plane, turned with the camera heading so the text reads along east-west (upside down when the camera faces south) |
+| `"flat"` | `true` | Painted on the surface, turned so it always reads left to right |
+| `"flat"` | `false` | Painted on the surface, north-up, turning with the map |
+
+For labels along a line, see [`placement`](#placement).
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/) as `facing`.
+
+**Default:** `"upright"`, or `"flat"` when `rotateWithCamera` is `false` (MapLibre's `"auto"`)
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat"
+  }
+}
+```
+
+### translate
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** Moves the drawn label by a number of screen pixels, as MapLibre's `text-translate` does. A positive `x` moves it right and a positive `y` moves it down, in the frame [`translateAnchor`](#translateanchor) sets. The shift is applied after the label is projected, so it stays the same number of pixels at any distance and does not turn with [`rotation`](#rotation). Decluttering reserves the space where the label is drawn.
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    translate: { x: 0, y: -10 } // 10 px up
+  }
+}
+```
+
+### translateAnchor
+
+**Type:** `"map" | "viewport" | undefined`
+
+**Description:** Sets the frame [`translate`](#translate) is measured in. With `"map"`, the shift turns with the camera heading, so a positive `x` points east and a positive `y` points south. With `"viewport"`, it follows the screen axes. Unlike MapLibre's `"map"`, the shift is not foreshortened when the camera is pitched.
+
+**Default:** `"map"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    translate: { x: 10, y: 0 },
+    translateAnchor: "viewport" // 10 px right on screen, whatever the heading
   }
 }
 ```
@@ -582,6 +1043,31 @@ import { Color } from "@navaramap/three";
   text: {
     transparent: true,
     opacity: 0.5
+  }
+}
+```
+
+### variableAnchors
+
+**Type:** `{ anchor: Anchor, offset?: Vec2 }[] | undefined`
+
+**Description:** Placements the label may take, tried in order by [`declutter`](#declutter) until one has room, as MapLibre's `text-variable-anchor-offset` does. Each entry is an [`anchor`](#anchor) and an [`offset`](#offset) in ems. The placement in use is tried first, so a label moves only when its current spot is taken. If no placement has room, the label is hidden; with an [`overlap`](#overlap) other than `"never"`, it is drawn at the placement in use instead. When the list is not empty it replaces `anchor` and `offset`, except for labels placed along a line. Without `declutter` the first entry is used. With [`textAlign`](#textalign) `"auto"` the lines align towards the side of the chosen anchor.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `[]`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textAlign: "auto",
+    variableAnchors: [
+      { anchor: "left", offset: { x: 0.5, y: 0 } }, // Right of the point
+      { anchor: "right", offset: { x: -0.5, y: 0 } }, // Left of the point
+      { anchor: "top", offset: { x: 0, y: 0.5 } } // Below the point
+    ]
   }
 }
 ```

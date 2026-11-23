@@ -12,7 +12,6 @@ import type {
   Tiles3dSourceDescription,
   SourceDescription as SourceDescriptionImpl,
 } from "@navaramap/engine";
-import type { Promise as WorkerPoolPromise } from "@navaramap/worker";
 import type { Feature, FeatureCollection, Geometry } from "geojson";
 import type { Mesh, Sprite, Object3D } from "three";
 
@@ -24,10 +23,12 @@ import type {
   SkyEnvMapPassConfig,
   TransparentPassConfig,
 } from "../layers/effect";
+import type { LineCap } from "../lineDash";
 import type { TileMesh } from "../mesh";
 import type { Source } from "../source";
 
 export type { Promise as WorkerPoolPromise } from "@navaramap/worker";
+export type { LineCap } from "../lineDash";
 
 export type Descriptions = {
   mesh?: object;
@@ -85,15 +86,107 @@ type WithColorSupport<T> = ConvertColorFields<T>;
 export type SourceGeometryType = "point" | "line" | "polygon";
 
 /**
- * Helper type to narrow the generated `geometryTypes?: string[]` material
- * fields to the {@link SourceGeometryType} literal union.
+ * The plane a label or sprite lies in: the screen (`"upright"`, never
+ * foreshortened) or the globe surface around its anchor (`"flat"`), following
+ * its curvature so it reads as painted on the surface — MapLibre's
+ * `*-pitch-alignment` `viewport` and `map`. The value of `textFacing` /
+ * `billboardFacing` / `pointFacing`. Pair with `rotateWithCamera`, which
+ * chooses whether the quad turns with the camera or with the map. Left unset,
+ * it is `"flat"` when `rotateWithCamera` resolves to `false` and `"upright"`
+ * otherwise.
  */
-type ConvertGeometryTypeFields<T> = {
+export type Facing = "upright" | "flat";
+
+/** @deprecated Use {@link Facing}, which covers all three material types. */
+export type TextFacing = Facing;
+
+/**
+ * Whether a decluttered label or sprite may be drawn over the ones placed
+ * before it — MapLibre's `*-overlap`. `"never"` hides it on any collision,
+ * `"always"` never does, `"cooperative"` hides it only when it collides with a
+ * `"never"` one. The value of `overlap` on text, billboard and point materials.
+ */
+export type Overlap = "never" | "always" | "cooperative";
+
+/**
+ * Part of a label or sprite placed at its anchor point — MapLibre's
+ * `text-anchor` / `icon-anchor`. The value of `anchor` on text, billboard and
+ * point materials.
+ */
+export type Anchor =
+  | "center"
+  | "left"
+  | "right"
+  | "top"
+  | "bottom"
+  | "top-left"
+  | "top-right"
+  | "bottom-left"
+  | "bottom-right";
+
+/**
+ * One placement a label may take — an entry of MapLibre's
+ * `text-variable-anchor-offset`: the part of the block placed at the anchor
+ * point, and the shift after it in ems, x right and y down. An entry of
+ * `variableAnchors` on the text material.
+ */
+export type VariableAnchor = {
+  anchor: Anchor;
+  offset?: { x: number; y: number };
+};
+
+/**
+ * Horizontal alignment of the lines of a multi-line label — MapLibre's
+ * `text-justify`. `"auto"` aligns towards the horizontal side of the text's
+ * `anchor`.
+ */
+export type TextAlign = "left" | "center" | "right" | "auto";
+
+/**
+ * Frame of a label's or sprite's `translate` — MapLibre's
+ * `*-translate-anchor`. `"map"` turns it with the camera heading so +x points
+ * east and +y south; `"viewport"` keeps it on the screen axes.
+ */
+export type TranslateAnchor = "map" | "viewport";
+
+/**
+ * What the bottom of a polygon with `perPositionHeight` follows. `"position"`
+ * keeps both caps at the heights of the positions; `"ellipsoid"` lays the
+ * bottom flat on the ellipsoid. The value of `extrusionBase` on the polygon
+ * material.
+ */
+export type ExtrusionBase = "position" | "ellipsoid";
+
+/**
+ * Helper type to narrow the material fields that wasm-bindgen generates as
+ * bare `string`s to their literal unions, and its typed arrays to the plain
+ * arrays the layer description accepts. One recursive pass covers them all.
+ */
+type ConvertStringUnionFields<T> = {
   [K in keyof T]: K extends "geometryTypes"
     ? SourceGeometryType[] | Extract<T[K], undefined>
-    : T[K] extends object | undefined
-      ? ConvertGeometryTypeFields<T[K]> | Extract<T[K], undefined>
-      : T[K];
+    : K extends "textFacing" | "billboardFacing" | "pointFacing"
+      ? Facing | Extract<T[K], undefined>
+      : K extends "cap"
+        ? LineCap | Extract<T[K], undefined>
+        : K extends "overlap"
+          ? Overlap | Extract<T[K], undefined>
+          : K extends "anchor"
+            ? Anchor | Extract<T[K], undefined>
+            : K extends "textAlign"
+              ? TextAlign | Extract<T[K], undefined>
+              : K extends "translateAnchor"
+                ? TranslateAnchor | Extract<T[K], undefined>
+                : K extends "extrusionBase"
+                  ? ExtrusionBase | Extract<T[K], undefined>
+                  : K extends "variableAnchors"
+                    ? VariableAnchor[] | Extract<T[K], undefined>
+                    : K extends "dashArray" | "declutterPadding"
+                      ? number[] | Extract<T[K], undefined>
+                      : T[K] extends object | undefined
+                        ? | ConvertStringUnionFields<T[K]>
+                          | Extract<T[K], undefined>
+                        : T[K];
 };
 
 /**
@@ -108,7 +201,7 @@ export type SourceLayerBase<Layer extends { source?: string | undefined }> =
   };
 
 type VectorLayerBase = WithColorSupport<
-  ConvertGeometryTypeFields<Layer<VectorLayerDescription & { type: "vector" }>>
+  ConvertStringUnionFields<Layer<VectorLayerDescription & { type: "vector" }>>
 >;
 
 /**
@@ -227,10 +320,6 @@ export type MeshCache = Map<string, Mesh | Sprite | Object3D>;
 
 // Make a reference of TileMesh by TileHandle.
 export type TileMapByHandle = Map<TileHandle, TileMesh>;
-
-export type AbortControllers = Map<string, AbortController>;
-
-export type WorkerPoolPromises = Map<string, WorkerPoolPromise<unknown>>;
 
 export type PickedFeature = FeatureInfo;
 

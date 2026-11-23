@@ -8,6 +8,7 @@ mod input;
 mod property_value;
 mod raster_tile;
 mod source_types;
+mod terrain;
 mod types;
 mod vector_tile;
 
@@ -100,7 +101,10 @@ pub struct DynamicSse {
     pub enabled: bool,
     /// Distance scale of the relaxation ramp before tilt/height scaling.
     pub density: f64,
-    /// Maximum SSE relaxation (in pixels) at full tilt and saturation.
+    /// Maximum SSE relaxation (in pixels) at full tilt and saturation for a
+    /// layer with the reference max SSE of 16 (the CesiumJS 3D Tiles default);
+    /// each layer scales it by its own max SSE, so terrain and imagery
+    /// (max SSE 2) relax by at most `sseFactor / 8` pixels.
     #[wasm_bindgen(js_name = sseFactor)]
     pub sse_factor: f64,
     /// Fraction of the height band below which the effect is at full strength.
@@ -326,8 +330,8 @@ impl Core {
     }
 
     #[wasm_bindgen(js_name = triggerDataRequesterFailed)]
-    pub fn trigger_data_requester_failed(&mut self, bits: u64) {
-        self.app.trigger_data_requester_failed(bits);
+    pub fn trigger_data_requester_failed(&mut self, bits: u64, handle: i32) {
+        self.app.trigger_data_requester_failed(bits, handle);
     }
 
     pub fn resize(&mut self, width: FloatType, height: FloatType, pixel_ratio: FloatType) {
@@ -526,6 +530,15 @@ impl Core {
         source_description_to_js(&source)
     }
 
+    /// `[scale, relativeHeight]` of the surface rendered from `source_id`,
+    /// `[1, 0]` when the exaggerated terrain layer does not render it.
+    /// Used by `view.sampleTerrainMostDetailed` to return rendered heights.
+    #[wasm_bindgen(js_name = getTerrainExaggerationForSource)]
+    pub fn get_terrain_exaggeration_for_source(&mut self, source_id: &str) -> Vec<f64> {
+        let exaggeration = self.app.terrain_exaggeration_for_source(source_id);
+        vec![exaggeration.scale(), exaggeration.relative_height()]
+    }
+
     #[wasm_bindgen(js_name = getLayerIndex)]
     pub fn get_layer_index(&self, layer_id: &str) -> Option<usize> {
         self.app.get_layer_index(layer_id)
@@ -652,9 +665,14 @@ impl Core {
         self.app.get_tile(handle).map(|v| v.into())
     }
 
-    #[wasm_bindgen(js_name = getParentTile)]
-    pub fn get_parent_tile(&mut self, handle: TileHandle) -> Option<TransferableTile> {
-        self.app.get_parent_tile(handle).map(|v| v.into())
+    /// Buffer handle of a tile's loaded raw DEM bytes (the data a raster-DEM
+    /// upsample of a descendant resamples from), `undefined` until it landed.
+    #[wasm_bindgen(js_name = getTerrainDemBytes)]
+    pub fn get_terrain_dem_bytes(
+        &mut self,
+        handle: TileHandle,
+    ) -> Option<navara_buffer_store::Handle> {
+        self.app.get_terrain_dem_bytes(handle)
     }
 
     #[wasm_bindgen(js_name = getVectorTileStates)]
@@ -664,14 +682,6 @@ impl Core {
             .into_iter()
             .map(VectorTileState::from)
             .collect()
-    }
-
-    /// Monotonic revision that changes only when the vector-tile resolution could have
-    /// changed. The web renderer reads it once per frame and skips the per-terrain-tile
-    /// `getVectorTileStates` calls while it is unchanged.
-    #[wasm_bindgen(js_name = vectorRevision)]
-    pub fn vector_revision(&self) -> u32 {
-        self.app.vector_revision()
     }
 
     /// The WebMercator raster tiles to bake into per-layer drape render targets for a
@@ -944,15 +954,59 @@ impl Core {
         None
     }
 
+    /// The whole camera in one call: `[lng, lat, height, heading, pitch,
+    /// roll, fov]`; angles in degrees (fov is the vertical field of view),
+    /// height in meters above the ellipsoid. `undefined` until the camera
+    /// exists.
+    #[wasm_bindgen(js_name = getCameraState)]
+    pub fn get_camera_state(&mut self) -> Option<Vec<f64>> {
+        self.app.get_camera_state().map(Vec::from)
+    }
+
     /// Vertical field of view in radians as set via `setFrustum`.
     #[wasm_bindgen(js_name = getCameraFOV)]
     pub fn get_camera_fov(&mut self) -> Option<FloatType> {
         self.app.get_camera_fov()
     }
 
+    /// Get the current zoom level of the camera.
+    ///
+    /// # Arguments
+    /// * `tile_size_px` - Optional tile size for zoom calculation. Defaults to 256.
+    ///                    Use 512 for MapLibre-compatible zoom values.
     #[wasm_bindgen(js_name = getZoomLevel)]
-    pub fn get_zoom_level(&mut self) -> Option<FloatType> {
-        self.app.get_zoom_level()
+    pub fn get_zoom_level(&mut self, tile_size_px: Option<FloatType>) -> Option<FloatType> {
+        self.app.get_zoom_level(tile_size_px)
+    }
+
+    /// Compute camera viewing distance required to achieve a target zoom level.
+    ///
+    /// This is the inverse of `getZoomLevel`. Given a Web Mercator zoom level
+    /// and latitude, returns the camera-to-target viewing distance in meters
+    /// that would produce that zoom level.
+    ///
+    /// Uses the current viewport height and camera FOV from the engine state.
+    ///
+    /// # Arguments
+    /// * `zoom_level` - Target Web Mercator zoom level
+    /// * `lat_deg` - Latitude in degrees (affects scale due to Web Mercator projection)
+    /// * `tile_size_px` - Tile size for zoom calculation (defaults to 256)
+    /// * `fov_rad` - Optional FOV override in radians
+    ///
+    /// # Returns
+    /// Camera viewing distance to target in meters, or `undefined` if inputs are invalid
+    #[wasm_bindgen(js_name = zoomLevelToCameraDistance)]
+    pub fn zoom_level_to_camera_distance(
+        &mut self,
+        zoom_level: FloatType,
+        lat_deg: FloatType,
+        tile_size_px: Option<FloatType>,
+        fov_rad: Option<FloatType>,
+    ) -> Option<FloatType> {
+        // Default to 256 for backward compatibility
+        let tile_size = tile_size_px.unwrap_or(256.0);
+        self.app
+            .zoom_level_to_camera_distance(zoom_level, lat_deg, tile_size, fov_rad)
     }
 
     #[wasm_bindgen(js_name = rotateAroundAxis)]
@@ -965,6 +1019,17 @@ impl Core {
         self.app.sample_terrain_height((&lle).into())
     }
 
+    /// `[min, max]` height of the ground rendered over `extent` (radians).
+    #[wasm_bindgen(js_name = sampleTerrainHeightRange)]
+    pub fn sample_terrain_height_range(
+        &mut self,
+        extent: navara_wasm_types::ExtentRadianF32,
+    ) -> Option<Vec<FloatType>> {
+        self.app
+            .sample_terrain_height_range(extent.into())
+            .map(|(min, max)| vec![min, max])
+    }
+
     #[wasm_bindgen(js_name = registerSampleTerrainHeightEvent)]
     pub fn register_sample_terrain_height_event(&mut self, lle: LLE) -> u64 {
         self.app.add_terrain_height_observer((&lle).into())
@@ -973,6 +1038,19 @@ impl Core {
     #[wasm_bindgen(js_name = unregisterSampleTerrainHeightEvent)]
     pub fn unregister_sample_terrain_height_event(&mut self, bits: u64) {
         self.app.remove_terrain_height_observer(bits);
+    }
+
+    #[wasm_bindgen(js_name = registerTerrainHeightRangeEvent)]
+    pub fn register_terrain_height_range_event(
+        &mut self,
+        extent: navara_wasm_types::ExtentRadianF32,
+    ) -> u64 {
+        self.app.add_terrain_height_range_observer(extent.into())
+    }
+
+    #[wasm_bindgen(js_name = unregisterTerrainHeightRangeEvent)]
+    pub fn unregister_terrain_height_range_event(&mut self, bits: u64) {
+        self.app.remove_terrain_height_range_observer(bits);
     }
 
     #[wasm_bindgen(js_name = setFrustum)]
@@ -1037,11 +1115,6 @@ impl Core {
         self.app.get_globe().map(|g| g.wireframe)
     }
 
-    #[wasm_bindgen(js_name = getGlobeElevationColormap)]
-    pub fn get_globe_elevation_colormap(&self) -> Option<Vec<f32>> {
-        self.app.get_globe().map(|g| g.elevation_colormap.clone())
-    }
-
     /// Updates the LOD fog parameters (distance-based screen-space-error
     /// relaxation: far tiles tolerate a larger error and stay coarser). This
     /// only affects tile LOD selection, never visual fog rendering.
@@ -1068,6 +1141,29 @@ impl Core {
     #[wasm_bindgen(js_name = setMaxPendingRequests)]
     pub fn set_max_pending_requests(&mut self, value: u32) {
         self.app.set_max_pending_requests(value);
+    }
+
+    /// Caps the number of delegated worker tasks in flight across all task
+    /// kinds (terrain mesh, MVT parse, polygon / polyline build, ...).
+    #[wasm_bindgen(js_name = setMaxWorkerTasks)]
+    pub fn set_max_worker_tasks(&mut self, value: u32) {
+        self.app.set_max_worker_tasks(value);
+    }
+
+    /// Reports the worker-pool tasks in flight outside delegated tasks (image
+    /// decodes, Draco, descriptor / plugin tasks, tasks cancelled mid-run);
+    /// they take from the `setMaxWorkerTasks` cap.
+    #[wasm_bindgen(js_name = setWorkerExternalLoad)]
+    pub fn set_worker_external_load(&mut self, value: u32) {
+        self.app.set_worker_external_load(value);
+    }
+
+    /// Pauses or resumes worker intake: while paused, nothing that runs on
+    /// the worker pool is handed out, model feature adds and image fetches
+    /// included.
+    #[wasm_bindgen(js_name = setWorkerIntakePaused)]
+    pub fn set_worker_intake_paused(&mut self, paused: bool) {
+        self.app.set_worker_intake_paused(paused);
     }
 
     /// Sets the memory-pressure SSE multiplier range. `min` is the resting
@@ -1161,11 +1257,6 @@ impl Core {
     #[wasm_bindgen(js_name = setGlobeWireframe)]
     pub fn set_globe_wireframe(&mut self, value: bool) {
         self.app.set_globe_wireframe(value);
-    }
-
-    #[wasm_bindgen(js_name = setGlobeElevationColormap)]
-    pub fn set_globe_elevation_colormap(&mut self, value: Vec<f32>) {
-        self.app.set_globe_elevation_colormap(value);
     }
 
     // === Globe definition ===

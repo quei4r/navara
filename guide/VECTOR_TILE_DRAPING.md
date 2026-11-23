@@ -72,8 +72,10 @@ flowchart LR
     VQT --- TR
     RES["resolve_vector_tile_states()<br/>overlap + walk-up/down<br/>+ reproject band"]
     TR --> RES
+    HO["hand_over_vector_drape_sources()<br/>per shown terrain tile,<br/>source switches paced"]
+    RES --> HO
   end
-  RES -->|"getVectorTileStates (per terrain tile)"| JS
+  HO -->|"vector_drape_changed + getVectorTileStates"| JS
   subgraph JS["TypeScript"]
     CACHE["TexturizedSceneByTileCoordinates<br/>Map&lt;tileHandle, per-layer feature scenes&gt;"]
     BAKE["renderVectorScenes()<br/>offscreen bake → per-layer RT"]
@@ -84,16 +86,17 @@ flowchart LR
 
 Per terrain tile, every rendered frame, the tile's `VectorDrapeResolver`
 (`mesh/tile/vectorDrapeResolver.ts`, driven from `TileMesh._onBeforeRender`)
-pulls the Rust-resolved sources, groups them by layer, bakes the backing
-feature scenes into a per-layer render target, and the composite pass pastes
-each RT onto the terrain tile (with reprojection on Geographic terrain).
+holds the sources Rust handed over, grouped by layer, bakes the backing
+feature scenes into a per-layer render target when they change, and the
+composite pass pastes each RT onto the terrain tile (with reprojection on
+Geographic terrain).
 
 ## Rust side: the traverse and the drape source
 
 The vector traverse (`crates/navara_vector_tile/src/tile/traverse.rs`) is an SSE
-quadtree walk like the raster one. It reads terrain relief **by extent**
-(`terrain_height_for_extent`, scheme-agnostic) so its LOD tracks the terrain's
-subdivision depth rather than treating the tile as flat.
+quadtree walk like the raster one. It reads terrain relief like the raster one
+(`terrain_height_for_tile`, which also handles Geographic terrain) so its LOD
+tracks the terrain's subdivision depth rather than treating the tile as flat.
 
 The load-bearing piece for draping is a single field on `VectorTile`
 (`crates/navara_tile_component/src/vector_tile.rs`):
@@ -196,7 +199,8 @@ invariants). Each source is framed by a **single fixed** `[-1, 1]` orthographic
 camera reframed to the source's Rust-supplied `uvOffset` / `uvScale` sub-rect —
 there is no per-tile camera transform or JS-side parent walk anymore, because
 the ancestor/descendant fallback is already baked into those affines. The
-sources accumulate additively, so the RT ends up spanning the terrain tile's
+sources accumulate additively (in a `transparent` layer, each clipped in the
+stencil to the part of its own square no finer source took), so the RT ends up spanning the terrain tile's
 extent. The composite pass then pastes it like a raster layer (identity UV in
 longitude, latitude reprojected).
 
@@ -208,13 +212,41 @@ clamp-to-ground layer's tiles. See
 [TILE_TEXTURE_COMPOSITING.md](TILE_TEXTURE_COMPOSITING.md) for how the bake and paste
 consume this.
 
-### Avoiding per-frame cost
+### Handing sources over and pacing re-bakes
 
-The resolver's `update()` runs per terrain tile per rendered frame, so the
-WASM-boundary resolve is gated by a **revision counter**: Rust bumps
-`VectorResolveRevision` (`crates/navara_vector_tile/src/lib.rs`) whenever a
-traverse runs; JS reads `vectorRevision()` once per frame and re-fetches a tile's
-slots only when it changed (`vectorDrapeResolver.ts` `lastRevision`).
+Every change of a terrain tile's sources re-bakes its drape, and one vector tile
+becoming a drape source switches every terrain tile it covers in the same frame.
+So Rust does not let the frontend pull the resolve directly: the
+`hand_over_vector_drape_sources` system
+(`crates/navara_vector_tile/src/drape_sources.rs`) resolves the shown terrain
+tiles and keeps the sources it handed over per terrain tile in the
+`VectorDrapeSources` resource. A tile's first sources, and a switch away from a
+source tile that was evicted (the frontend no longer holds its scene), are
+handed over at once. Other switches wait in FIFO order and only
+`DRAPE_SOURCE_SWITCHES_PER_FRAME` of them are handed over per frame, while the
+frontend keeps showing the last bake; a waiting tile that is hidden or whose
+sources switch back leaves the queue. Only clamp-to-ground layers
+(`TraversalConfig::has_clamp_to_ground`) take part, and only their source tiles
+with a draped feature (`RenderableFeature::is_draped`) are handed over: the
+frontend bakes nothing else, so any other source would only take a drape slot.
+
+The system re-resolves only when the outcome can change: when
+`VectorResolveRevision` (`crates/navara_vector_tile/src/lib.rs`) moved, which a
+traverse bumps when it changes some tile's `ready_parent_tile_handle`, when a
+vector tile was destroyed (an evicted source leaves its quadtree without any
+traverse recording a new drape source), when terrain meshes were added or
+changed, when the layer set or order changed, or while switches are waiting.
+The terrain tiles whose handed sources changed are listed in the
+`vector_drape_changed` event, and only those re-read them through
+`getVectorTileStates`, so a static or merely moving view costs no per-tile
+WASM-boundary call.
+
+Re-bakes also follow scene content: `markDirty` bumps a scene's revision on
+every change event of a draped feature. So the vector traverse flips `active`
+without marking a change when the frontend draws the feature the same either
+way (`activate_if_changed`, `is_drawn_regardless_of_activation`: draped, and
+not a polygon with an outline, which follows `active`), and the `is_rendered`
+report from the frontend is not echoed back as a change either.
 
 ## Scheme cases
 
@@ -239,10 +271,11 @@ the Geographic drape came out one level finer than WM.
 ## Layer ordering
 
 Vector layers stack by declaration order (lower = bottom, later = on top), matching the
-composite's last-writer-wins blend. `get_vector_tiles`
-(`crates/navara_ecs/src/lib.rs`) sorts the layers by `LayerDescStore::get_order`
-before resolving — the vector `LayerResources` carry no `Order` component, so
-without this sort the composite would stack them in arbitrary ECS query order.
+composite's last-writer-wins blend. `hand_over_vector_drape_sources`
+(`crates/navara_vector_tile/src/drape_sources.rs`) sorts the layers by
+`LayerDescStore::get_order` before resolving — the vector `LayerResources` carry no
+`Order` component, so without this sort the composite would stack them in arbitrary ECS
+query order.
 
 ## Key files
 
@@ -251,12 +284,14 @@ without this sort the composite would stack them in arbitrary ECS query order.
 | `crates/navara_vector_tile/src/tile/traverse.rs` | SSE traverse; sets `ready_parent_tile_handle` (self-inclusive drape source) |
 | `crates/navara_vector_tile/src/resolve.rs` | `resolve_vector_tile_states` / `collect_drape_sources` — overlap + walk-up/down, dedup, cap |
 | `crates/navara_tile_component/src/vector_tile.rs` | `VectorTile.ready_parent_tile_handle` |
-| `crates/navara_vector_tile/src/lib.rs` | `VectorResolveRevision` (per-frame re-fetch gate) |
-| `crates/navara_ecs/src/lib.rs` | `get_vector_tiles` (layer-order sort), `vector_revision` |
-| `crates/navara_wasm/src/lib.rs` | `getVectorTileStates`, `vectorRevision` bindings |
+| `crates/navara_vector_tile/src/lib.rs` | `VectorResolveRevision` (re-resolve gate, bumped when a drape source changes) |
+| `crates/navara_vector_tile/src/drape_sources.rs` | `VectorDrapeSources` / `hand_over_vector_drape_sources` — layer-order sort, hand-over and switch pacing, `vector_drape_changed` |
+| `crates/navara_ecs/src/lib.rs` | `get_vector_tiles` (the handed-over sources) |
+| `crates/navara_wasm/src/lib.rs` | `getVectorTileStates` binding |
 | `crates/navara_core/src/terrain/geometric_error.rs` | scheme-aware level-zero geometric error (keeps drape zoom consistent across schemes) |
 | `web/navara_three/src/scene.ts` | `TexturizedSceneByTileCoordinates` — per-feature scene cache |
 | `web/navara_three/src/event/feature.ts` | draped feature lifecycle: insert on create, `removeMesh`, `markDirty` |
+| `web/navara_three/src/event/tile.ts` | `processVectorDrapeChanged` — marks the listed terrain tiles to re-read their sources |
 | `web/navara_three/src/mesh/tile/vectorDrapeResolver.ts` | `VectorDrapeResolver` — `refreshSlots`, `signature` re-bake gate, `bindSlots` (identity UV + representative mesh attrs), `setPickBake` (pick bakes skip MSAA), bake driver |
 | `web/navara_three/src/mesh/tile/drapeResolver.ts` | `DrapeResolver` interface shared with the raster drape resolvers |
 | `web/navara_three/src/tileTexture/TileTextureCompositor.ts` | `renderVectorScenes` offscreen bake |

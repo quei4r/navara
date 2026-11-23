@@ -1,0 +1,106 @@
+# Plugins — reusing purpose-built features
+
+A plugin bundles descriptor registrations and/or high-level behavior behind one object. Lifecycle:
+
+1. Construct the plugin.
+2. `view.addPlugin(plugin)` — **must happen before `view.init()`** (after → throws).
+3. During `await view.init()`, every plugin's `init(view, ctx)` runs **in parallel** (`Promise.all`).
+4. After init, call the plugin's post-init methods.
+
+## Built-in plugins
+
+### `DefaultPlugin` — `@navaramap/three-default-plugin`
+
+Registers ~40 built-in descriptors; provides `DefaultDescriptions` type; `addDefaultPhotorealScene()`
+
+### `AttributionPlugin` — `@navaramap/three` (built-in)
+
+Zoom-aware credit UI. `ThreeView` creates one by default, exposed as `view.attribution` (opt out with `defaultAttribution: false`; `undefined` in a worker). Feed credits with `view.attribution?.add([{ attribution, attributionUrl }, { attributionHtml }, ...])` / `.remove([...])`; `show()`/`hide()` toggle the popover. Include credits in every example that loads third-party data — see recipes.md for a full call
+
+### `TileJsonPlugin` — `@navaramap/three-plugins`
+
+TileJSON 3.0.0 sources: `await tilejson.addSource({ type, id?, url })` after init registers the document as a Navara source and auto-surfaces its `attribution` via `view.attribution`
+
+### `StreetLightsPlugin` — `@navaramap/three-plugins`
+
+Night streets from a vector tile set (any schema): `await start({ roads, buildings, radius?, traffic?, effectIds? })` after `view.init()` opens each side's source (`sourceType: "tilejson" | "vector-tile"`, `sourceUrl`, `sourceLayers`, as in `addSource` / `addLayer`; the same type and URL share one source), draws the road surface with `roads.polyline` and hides every feature without lights, then `follow(lng, lat)` on `postUpdate` streams zoom-14 tiles around the camera and places lamps along the roads, beacons on the roofs the `BuildingReader` gives a height and cars driving the segments (`StreetTrafficMeshDesc`, registered on init; type the view `ThreeView<DefaultDescriptions | StreetTrafficDescriptions>`). Lamps/beacons bloom through `effectIds` (pass the `selectiveBloom` id); the cars are additive points and do not. Visibility is per feature, so use `setVisible()` (all parts, or one: `roads`, `lamps`, `beacons` or `traffic`; the last call wins) / `setLightsOn()` rather than `layer.update({ show })`; `update({ traffic })`, `dispose()` (drops the sources and road surface it opened; a `tileJsonPlugin` passed to the constructor stays the caller's). Needs `animation: true`. The caller gives a `RoadReader` (returning one of the seven `RoadClass` names, whose widths and lamp/traffic densities are fixed inside the plugin; `isRoadClass(value)` narrows a tile value to them) and `BuildingReader` (returning the roof height above the ellipsoid: beacons are not clamped, so add the ground height for buildings on terrain). Reference: `example/pages/examples/showcase/night-city/`
+
+### `PersonViewPlugin` — `@navaramap/three-plugins`
+
+WASD first/third-person walk with GLTF character: `.start()` / `.stop()` (hand the camera back to ThreeView and take it again, resuming in place), `.teleport()`, `.setViewMode()`, `.setCollision()`. Flies free by default — `collision: { mode: "ground" }` is all it takes to walk the terrain surface (`"clamp"` = terrain as a floor only). The remaining defaults are tuned for that: slope tilt (`alignToSlope`), and tilting the TPV/FPV view with the slope so a climb does not fill the frame with hillside (`cameraSlopeFollow`). The LOD churn at load, which would otherwise fling the character up the mountainside, is handled internally with no setting to reach for. Instead of hand-measuring `startHeight`, call `await plugin.resolveStartHeight(terrainSource)` between `view.init()` and `.start()` — it pins the start height to the source's most-detailed terrain data (one-shot sample; source explicit, same contract as `sampleTerrainMostDetailed`; the height includes `collision.groundOffset`, and it returns the resolved height or `undefined` when the source has no data there). The resolved height is held until the first movement input (or `teleport`), so the coarse tiles resident right after load cannot drag the character off it
+
+### `OverlayPlugin` — `@navaramap/three-plugins`
+
+World→screen DOM overlays: `.setPositions([...])`, `.onUpdate(({ projected }) => ...)`
+
+### `CesiumIonPlugin` — `@navaramap/three-plugins`
+
+Cesium Ion assets (quantized-mesh terrain)
+
+### `MapLibreStylePlugin` — `@navaramap/maplibre-style`
+
+Render a MapLibre style JSON: `new MapLibreStylePlugin(styleJson)`
+
+### `DevtoolsPlugin` — `@navaramap/three-plugins`
+
+Development-only tools on one tweakpane panel (the `` ` `` key toggles it), a tab per tool: `new DevtoolsPlugin({ tools?, panel?, profiler?, layers?, camera? })` before `init()`; `devtools.profiler` / `devtools.layers` / `devtools.camera` are the tool instances (or `undefined` when left out of `tools`), `dispose()` removes all. The tools below are also exported; added alone, one opens its own pane.
+
+### `ProfilerPlugin` — `@navaramap/three-plugins`
+
+Development-only tweakpane profiler with hover explanations: summary (frame rate and CPU/GPU frame time of drawn frames, draw calls, engine memory vs budget, downloads, workers), per-step frame breakdown (WASM update, loading, each render pass with CPU/GPU/draws), memory by kind, downloads per source, background jobs, a buffer viewer (normals, depth as distance, roughness, …), frame recording. `profiler.enabled = false` detaches everything. GPU timings need `EXT_disjoint_timer_query_webgl2` (Chrome). Not for production bundles
+
+### `LayerInspectorPlugin` — `@navaramap/three-plugins`
+
+Development-only layer inspector: `view.layers` with meshes, memory and per-source downloads (with `{ profiler }`), a hide checkbox per layer, solo, wireframe (polygon layers, or `view.globe.wireframe` for terrain/imagery), bounding boxes, and a live style form generated from the engine's material schema (every field, defaults shown, `•` = set on the layer, undo). Turns on `ViewContext.retainGeometryArrays` for wireframes (a JS-heap copy of terrain/polygon geometry; `wireframe: false` opts out). `new LayerInspectorPlugin({ panel, profiler })` before `init()`
+
+### `CameraInspectorPlugin` — `@navaramap/three-plugins`
+
+Development-only camera panel: `lng` / `lat` / `height` / `heading` / `pitch` / `roll` / `fov` follow the camera (`move`, `frustumChanged`) while the tab is shown and set it when edited; copy / paste the camera as a JS object (paste reads the outermost object's `key: number` pairs, so a `setCamera({ … })` call works; `lng`, `lat`, `height` required; out-of-range values rejected; clipboard needs https or localhost). `apply(partial)` (sends only the keys given, next frame; `lng`/`lat`/`height` fill each other from the camera; `fov` only when given) from code after `init()`; read the camera with `view.getCamera()`
+
+### `MaterialSchemaPlugin` — `@navaramap/three-plugins`
+
+For an app's own style UI: `schema` (= `MATERIAL_SCHEMA` from `@navaramap/material-schema`, which has no dependencies and can be used without a view; keep its version equal to `@navaramap/three`'s) is JSON of each layer type's materials and every field (`kind`, `doc`, `default`, `options`, `applies`: `"live"` / `"reload"` = only when the layer is built, re-add it / `"never"`); `describeLayer(layer)` adds `set` and `value` per field. Add before `init()`: only layers added after it are described. A `color` value is a hex number: pass `new Color().setHex(v)` back to `layer.update()`, and typed-array fields come back as plain arrays
+
+## addDefaultPhotorealScene()
+
+```typescript
+const scene = defaultPlugin.addDefaultPhotorealScene(); // after view.init()
+// → handles: { sky, stars, sun, skyLightProbe, aerialPerspective, toneMapping, lensFlare, antialiasing }
+scene.sun.update({ sun: { castShadow: true } }); // tweak individual pieces via their handles
+```
+
+It is mobile-aware (respects `mobileOptimization`) — note `lensFlare` is `undefined` on mobile, so guard before using that handle. Prefer this over hand-assembling sky/sun/AA effects. For the full photoreal _base scene_ composition (terrain + imagery + attribution), see [recipes.md](recipes.md).
+
+## Composing plugins
+
+```typescript
+view.addPlugin(defaultPlugin);
+view.addPlugin(new PersonViewPlugin({ ... }));
+const overlay = new OverlayPlugin({ maxDistance: 100_000 });
+view.addPlugin(overlay);
+await view.init();
+overlay.setPositions(landmarks.map((l) => ({ id: l.id, lng: l.lng, lat: l.lat, alt: l.alt })));
+overlay.onUpdate(({ projected }) => {
+  const pos = projected.get(id);            // { x, y, distance }
+  moveOverlayElement(el, pos.x, pos.y);
+});
+```
+
+Plugin docs: https://navara.world/docs/three_plugins/about/ — runnable references in the Navara repo: `example/pages/plugins/overlay-marker/`, `example/pages/use-cases/interior-explore/` (PersonViewPlugin walkthrough of building interiors).
+
+## Writing your own plugin
+
+Extend `Plugin<TView, TCtx>` and implement the single hook `init(view, ctx)`. Typical work inside `init`: bulk-register mesh/effect/light descriptor classes, wire event listeners, expose high-level methods on the plugin instance.
+
+```typescript
+import { Plugin } from "@navaramap/three";
+
+export class MyPlugin extends Plugin {
+  async init(view, ctx) {
+    view.registerEffect("myEffect", MyEffectDesc);
+    // stash view/ctx for post-init methods
+  }
+}
+```
+
+**Stability note:** `Plugin` and `ViewContext` are Tier 1 API — they may break between minor versions (vs. Tier 0 `ThreeView`, which is stable). Fine for plugins you maintain alongside Navara; document the coupling.

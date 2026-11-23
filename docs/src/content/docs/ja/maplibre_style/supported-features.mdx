@@ -1,0 +1,81 @@
+---
+title: Supported Features
+description: サポートされている MapLibre Style 機能とプロパティの完全なリスト
+sidebar:
+  order: 4
+tableOfContents:
+  minHeadingLevel: 2
+  maxHeadingLevel: 3
+---
+
+import MapLibreSupportTable from "@components/MapLibreSupportTable.astro";
+
+このページは `@navaramap/maplibre-style` でサポートされているすべての MapLibre Style 仕様機能をリストしています。
+
+各機能の完全な API ドキュメントについては、[MapLibre Style Specification](https://maplibre.org/maplibre-style-spec/) を参照してください。
+
+**凡例:**
+
+- ✅ サポート
+- ⚠️ 部分的にサポート
+- ❌ 未サポート
+
+## Expression
+
+<MapLibreSupportTable category="expression" />
+
+完全なドキュメントについては [MapLibre Expressions](https://maplibre.org/maplibre-style-spec/expressions/) を参照してください。
+
+## Font-faces
+
+<MapLibreSupportTable category="font-faces" />
+
+## Glyphs
+
+<MapLibreSupportTable category="glyphs" />
+
+**注意:** 標準的な MapLibre の `glyphs` プロパティ（SDF glyph PBF の読み込み用）はサポートされていません。テキストレンダリングには `font-faces` を使用して Web フォントを読み込んでください。詳細は [フォント設定](../maplibre-style-plugin/#フォント設定を使用する) を参照してください。
+
+## Layer
+
+<MapLibreSupportTable category="layer" />
+
+## Light
+
+<MapLibreSupportTable category="light" />
+
+## Projection
+
+<MapLibreSupportTable category="projection" />
+
+## Root
+
+<MapLibreSupportTable category="root" />
+
+## Sky
+
+<MapLibreSupportTable category="sky" />
+
+## Source
+
+<MapLibreSupportTable category="source" />
+
+## Sprite
+
+<MapLibreSupportTable category="sprite" />
+
+## State
+
+<MapLibreSupportTable category="state" />
+
+## Terrain
+
+<MapLibreSupportTable category="terrain" />
+
+## Transition
+
+<MapLibreSupportTable category="transition" />
+
+## Types
+
+<MapLibreSupportTable category="types" />

@@ -25,4 +25,8 @@ pub struct BufferStoreLoadedEvent {
 #[derive(Debug, Message)]
 pub struct BufferStoreFailedEvent {
     pub id: Entity,
+    /// The handle the failed fetch was for. Carried in the report because
+    /// the requester may be gone by the time it lands, while the consumers
+    /// sharing the handle still wait on it.
+    pub handle: Handle,
 }

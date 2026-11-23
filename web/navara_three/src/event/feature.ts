@@ -1,12 +1,14 @@
-import type { TileHandle } from "@navaramap/core";
-import { generate_id_from_entity } from "@navaramap/core";
+import { type JobHandler, generate_id_from_entity } from "@navaramap/core";
 import {
   type RenderableFeatureAddedEvent,
   type RenderableFeature,
   RenderableFeatureChangedEvent,
+  type RenderableFeatureRemovedEvent,
 } from "@navaramap/engine";
 import { Mesh, Sprite, Object3D, Scene } from "three";
 
+import { declutterPairGroup } from "../declutter/participant";
+import { Layer } from "../layer";
 import {
   BatchedSdfTextMesh,
   InstancedSpriteMesh,
@@ -34,6 +36,7 @@ import {
 } from "./features/polygonOutline";
 import { renderPolyline, processPolylineChanged } from "./features/polyline";
 import { renderText, processTextChanged } from "./features/text";
+import { processObjectRemoved } from "./objectRemoved";
 
 import { setTransform } from ".";
 
@@ -70,14 +73,14 @@ function overlayScene(
 export function renderFeature(
   ctx: EventContext,
   f: RenderableFeature,
-  tileHandle: TileHandle | undefined,
   layerId: string,
+  pairGroup?: number,
 ): Promise<Mesh | Sprite | Object3D | undefined> | undefined {
   if (f.point) {
     return renderPoint(ctx, f.point);
   }
   if (f.billboard) {
-    return renderBillboard(ctx, f.billboard);
+    return renderBillboard(ctx, f.billboard, pairGroup);
   }
   if (f.model) {
     return renderModel(ctx, f.model);
@@ -86,24 +89,56 @@ export function renderFeature(
     return renderPolyline(ctx, f.polyline);
   }
   if (f.polygon) {
-    return renderPolygon(ctx, f.polygon, tileHandle, layerId);
+    return renderPolygon(ctx, f.polygon, layerId);
   }
   if (f.text) {
-    return renderText(ctx, f.text, layerId);
+    return renderText(ctx, f.text, layerId, pairGroup);
   }
 }
 
-// Define whether the feature uses web worker internally.
-// - `model` feature uses Web worker internally to parse glTF and its compression.
-export const checkFeatureParallel = (feature: RenderableFeature): boolean => {
-  const { model } = feature;
-  return !!model;
-};
+export const isModelFeature = (feature: RenderableFeature): boolean =>
+  !!feature.model;
+
+/** Products whose `featureCreated` was emitted; only those get a matching
+ * `featureRemoved`. */
+const createdFeatures = new WeakSet<Object3D>();
+
+export const renderableFeatureJobHandler = (
+  ctx: EventContext,
+): JobHandler<
+  RenderableFeatureAddedEvent,
+  RenderableFeatureChangedEvent,
+  RenderableFeatureRemovedEvent,
+  Mesh | Sprite | Object3D
+> => ({
+  name: "renderable feature",
+  events: {
+    requested: "renderable_feature_added",
+    changed: "renderable_feature_changed",
+    removed: "renderable_feature_removed",
+  },
+  start: (ev, abort) => processRenderableFeatureAdded(ctx, ev, abort),
+  change: (obj, ev) => processRenderableFeatureChanged(ctx, obj, ev),
+  teardown: (obj, ev) => {
+    // A start that threw after `featureCreated` left its object indexed only.
+    const created =
+      obj ?? (ev ? ctx.meshes.get(generate_id_from_entity(ev)) : undefined);
+    if (ev && created && createdFeatures.has(created)) {
+      const layer = ctx.layersManager.get(ev.layer_id);
+      if (layer && layer instanceof Layer) {
+        layer._unregisterFeatureEvaluator(ev.bits);
+        layer.emit("featureRemoved", { featureSetId: ev.bits });
+      }
+    }
+    processObjectRemoved(ctx, obj, ev);
+  },
+});
 
 export async function processRenderableFeatureAdded(
   ctx: EventContext,
   ev: RenderableFeatureAddedEvent,
-) {
+  abort: AbortController,
+): Promise<Mesh | Sprite | Object3D | undefined> {
   const {
     scenes,
     meshes,
@@ -111,7 +146,6 @@ export async function processRenderableFeatureAdded(
     featureHandler,
     viewEvents,
     layersManager,
-    viewContext,
     updatedAt,
     layerHandler,
   } = ctx;
@@ -140,42 +174,41 @@ export async function processRenderableFeatureAdded(
             ? "polygon"
             : undefined;
 
-  const useParallel = checkFeatureParallel(feature);
+  // A layer's labels and billboards in one tile share a pair group, so the
+  // declutter pass can place each label with its billboard.
+  const pairGroup = declutterPairGroup(featureLayerId, tileHandle);
+  const obj = await renderFeature(
+    ctx,
+    feature,
+    featureLayerId,
+    pairGroup,
+  )?.then((r) => {
+    if (abort.signal.aborted) return r;
+    // The glTF/Draco decode happened on the JS side, so report the actual
+    // decoded GPU size back to the ledger (its compressed-payload estimate
+    // undercounts Draco content). Draco decode inflates geometry markedly.
+    if (model && r) {
+      featureHandler.reportFeatureGpuBytes(ev.bits, sumModelGpuBytes(r));
+    }
+    // The billboard image atlas (CPU pixel buffer + GPU texture) is
+    // allocated and grown lazily on the JS side as images load, so the
+    // mesh reports its measured footprint whenever it changes; the ledger
+    // folds it into the owning vector tile's cost. Capture `bits` as a
+    // plain number now: the reporter fires long after this WASM event
+    // object is freed (async image packs), and a deferred `ev.bits` read
+    // would throw "null pointer passed to rust".
+    if (billboard && r instanceof InstancedSpriteMesh) {
+      const featureBits = ev.bits;
+      r.setAtlasBytesReporter((bytes) =>
+        featureHandler.reportFeatureGpuBytes(featureBits, bytes),
+      );
+    }
+    return r;
+  });
 
-  if (useParallel) {
-    // Start parallel process
-    viewContext.concurrencyManager.increment();
-  }
-
-  const obj = await renderFeature(ctx, feature, tileHandle, featureLayerId)
-    ?.then((r) => {
-      // The glTF/Draco decode happened on the JS side, so report the actual
-      // decoded GPU size back to the ledger (its compressed-payload estimate
-      // undercounts Draco content). Draco decode inflates geometry markedly.
-      if (model && r) {
-        featureHandler.reportFeatureGpuBytes(ev.bits, sumModelGpuBytes(r));
-      }
-      // The billboard image atlas (CPU pixel buffer + GPU texture) is
-      // allocated and grown lazily on the JS side as images load, so the
-      // mesh reports its measured footprint whenever it changes; the ledger
-      // folds it into the owning vector tile's cost. Capture `bits` as a
-      // plain number now: the reporter fires long after this WASM event
-      // object is freed (async image packs), and a deferred `ev.bits` read
-      // would throw "null pointer passed to rust".
-      if (billboard && r instanceof InstancedSpriteMesh) {
-        const featureBits = ev.bits;
-        r.setAtlasBytesReporter((bytes) =>
-          featureHandler.reportFeatureGpuBytes(featureBits, bytes),
-        );
-      }
-      return r;
-    })
-    .finally(() => {
-      if (useParallel) {
-        // End parallel process
-        viewContext.concurrencyManager.decrement();
-      }
-    });
+  // Removed while the mesh was being built: the dispatcher tears the product
+  // down, and the engine no longer waits for a report.
+  if (abort.signal.aborted) return obj;
 
   if (!obj) {
     // renderFeature produced no mesh (e.g. empty geometry); still report
@@ -205,10 +238,14 @@ export async function processRenderableFeatureAdded(
       ? STROKE_RENDER_ORDER
       : FEATURE_RENDER_ORDER;
 
+  // Tag the root for per-layer accounting (debug tooling walks the scenes).
+  obj.userData.layerId = featureLayerId;
+
   // Add to MRT scene if not draped (draped features render to texturized scene)
   const isDraped =
     (obj instanceof PolygonMesh && obj.clampToGround) ||
     (obj instanceof PolylineMesh && obj.draped);
+
   if (!isDraped) {
     const material = point?.material ?? billboard?.material ?? text?.material;
     overlayScene(material, scenes).add(obj);
@@ -266,7 +303,12 @@ export async function processRenderableFeatureAdded(
 
   if (obj instanceof PolygonMesh && polygon && polygon.outline_geometry) {
     const outline = await renderPolygonOutline(ctx, polygon);
+    if (abort.signal.aborted) {
+      outline.clear();
+      return obj;
+    }
     outline.renderOrder = FEATURE_RENDER_ORDER;
+    outline.userData.layerId = featureLayerId;
     scenes.mrt.add(outline);
 
     obj.outline = outline;
@@ -277,6 +319,7 @@ export async function processRenderableFeatureAdded(
     });
   }
 
+  createdFeatures.add(obj);
   handleFeatureCreatedEventByLayerId(
     featureHandler,
     obj,
@@ -316,27 +359,27 @@ export async function processRenderableFeatureAdded(
   // across decluttered swaps comes from the placement handoff in `setActive`.
   if (renderedType && obj instanceof BatchedSdfTextMesh) {
     void obj.whenLabelsSettled(TEXT_LABELS_SETTLE_TIMEOUT_MS).then(() => {
+      if (abort.signal.aborted) return;
       featureHandler.markFeatureIsRendered(renderedType, bits);
       ctx.renderFlag.forceUpdate = true;
     });
   }
+
+  return obj;
 }
 
 export async function processRenderableFeatureChanged(
   ctx: EventContext,
+  obj: Mesh | Sprite | Object3D,
   ev: RenderableFeatureChangedEvent,
 ) {
   const {
     scenes,
-    meshes,
     texturizedSceneByTileCoordinates,
     viewEvents,
     layersManager,
     updatedAt,
   } = ctx;
-  const id = generate_id_from_entity(ev);
-  const obj = meshes.get(id);
-  if (!obj) return;
 
   const layerId = ev.layer_id;
 
@@ -383,7 +426,7 @@ export async function processRenderableFeatureChanged(
     processPolylineChanged(obj, polyline, active);
   }
   if (obj instanceof PolygonMesh && polygon) {
-    processPolygonChanged(obj, polygon, active, tileHandle);
+    processPolygonChanged(obj, polygon, active);
 
     if (obj.outline) {
       processPolygonOutlineChanged(obj.outline, polygon, active);

@@ -19,6 +19,59 @@ describe("LabelDataTexture", () => {
     expect(dataOf(store).length).toBe(width * height * 4);
   });
 
+  // WebGL2 guarantees only 2048 texels per side.
+  const MIN_MAX_TEXTURE_SIZE = 2048;
+
+  it("sizes a small store by its label count", () => {
+    // 16 labels are 80 texels: a 16 × 5 texture, not a whole wide row.
+    const store = new LabelDataTexture(16);
+    expect(store.size.x).toBe(16);
+    expect(store.size.y).toBe(5);
+  });
+
+  it("stays under the GPU texture limit when grown to a large capacity", () => {
+    // Grown, not constructed: capacity doubling overshoots the request, and
+    // the overshoot is what used to push a narrow texture past the limit.
+    const store = new LabelDataTexture();
+    store.ensureCapacity(60_000);
+    expect(store.capacity).toBeGreaterThanOrEqual(60_000);
+    expect(store.size.x).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+    expect(store.size.y).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+  });
+
+  it("grows no further than the GPU limit when the request fits under it", () => {
+    // Doubling from 16 overshoots 600k to 1,048,576 labels (5.2M texels),
+    // which no 2048 × 2048 texture holds; the request itself does.
+    const store = new LabelDataTexture();
+    store.ensureCapacity(600_000);
+    expect(store.capacity).toBeGreaterThanOrEqual(600_000);
+    expect(store.size.x).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+    expect(store.size.y).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+
+    // The same for the path texture's wider slots.
+    const path = new LabelDataTexture(16, 16);
+    path.ensureCapacity(200_000);
+    expect(path.capacity).toBeGreaterThanOrEqual(200_000);
+    expect(path.size.x).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+    expect(path.size.y).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+  });
+
+  it("keeps a slot's linear address when a grow widens the rows", () => {
+    // The path texture: 16 texels a label, with the same linear addressing.
+    const store = new LabelDataTexture(16, 16);
+    store.setRow(9, 3, 1, 2, 3, 4);
+    const base = (9 * 16 + 3) * 4;
+    const width = store.size.x;
+
+    store.ensureCapacity(100_000);
+    expect(store.size.x).toBeGreaterThan(width);
+    expect(store.size.x).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+    expect(store.size.y).toBeLessThanOrEqual(MIN_MAX_TEXTURE_SIZE);
+    expect(Array.from(dataOf(store).slice(base, base + 4))).toEqual([
+      1, 2, 3, 4,
+    ]);
+  });
+
   it("writes a row at the address the shader reads", () => {
     const store = new LabelDataTexture(8);
     store.setRow(3, LabelRow.BOX, 0.25, 0.5, 0.75, 0.5);
@@ -78,9 +131,9 @@ describe("LabelDataTexture", () => {
     });
 
     // The allocation is padded out to whole texture rows, and that padding is
-    // usable space — 17 labels round up to 2 rows, which address 32. Growing
-    // at 18 would mean an allocate + copy + texture recreate (and a full GPU
-    // re-upload) while free slots were still sitting in the buffer.
+    // usable space. Growing at 18 would mean an allocate + copy + texture
+    // recreate (and a full GPU re-upload) while free slots were still sitting
+    // in the buffer.
     it("uses the row padding before growing", () => {
       const store = new LabelDataTexture(17);
       const before = store.texture;
@@ -118,10 +171,12 @@ describe("LabelDataTexture", () => {
       store.setRow(0, LabelRow.BOX, 1, 2, 3, 4);
       store.setRow(1, LabelRow.STATE, 5, 6, 7, 8);
       const before = store.texture;
+      // Past the padded capacity, which is larger than the 2 requested.
+      const target = store.capacity + 1;
 
-      expect(store.ensureCapacity(40)).toBe(true);
+      expect(store.ensureCapacity(target)).toBe(true);
       expect(store.texture).not.toBe(before);
-      expect(store.capacity).toBeGreaterThanOrEqual(40);
+      expect(store.capacity).toBeGreaterThanOrEqual(target);
 
       // Addresses are stable across a grow: the width is fixed, so only the
       // height changes and previously written texels keep their index.
@@ -129,17 +184,18 @@ describe("LabelDataTexture", () => {
       expect(store.getComponent(1, LabelRow.STATE, 3)).toBe(8);
 
       // ...and the new tail is addressable.
-      store.setRow(39, LabelRow.BOX, 11, 12, 13, 14);
-      expect(store.getComponent(39, LabelRow.BOX, 0)).toBe(11);
+      store.setRow(target - 1, LabelRow.BOX, 11, 12, 13, 14);
+      expect(store.getComponent(target - 1, LabelRow.BOX, 0)).toBe(11);
     });
 
     it("reports the grown dimensions through size", () => {
       const store = new LabelDataTexture(2);
-      const heightBefore = store.size.y;
+      const texelsBefore = store.size.x * store.size.y;
 
-      store.ensureCapacity(500);
+      expect(store.ensureCapacity(store.capacity + 1)).toBe(true);
 
-      expect(store.size.y).toBeGreaterThan(heightBefore);
+      // Wider, taller or both: the texture stays roughly square.
+      expect(store.size.x * store.size.y).toBeGreaterThan(texelsBefore);
       expect(store.size.x).toBe(store.texture.image.width);
       expect(store.size.y).toBe(store.texture.image.height);
       expect(dataOf(store).length).toBe(store.size.x * store.size.y * 4);
@@ -147,7 +203,7 @@ describe("LabelDataTexture", () => {
 
     it("keeps the highest addressable slot inside the buffer", () => {
       const store = new LabelDataTexture(3);
-      store.ensureCapacity(100);
+      expect(store.ensureCapacity(store.capacity + 1)).toBe(true);
 
       const last = texelIndex(store.capacity - 1, LABEL_ROWS - 1) * 4 + 3;
       expect(last).toBeLessThan(dataOf(store).length);
@@ -156,7 +212,7 @@ describe("LabelDataTexture", () => {
 
   // `needsUpdate` is a write-only setter that bumps `version`, so the upload
   // request is only observable through the version counter.
-  it("flags the texture for upload on every write", () => {
+  it("flags the texture for upload on every write that changes it", () => {
     const store = new LabelDataTexture(4);
 
     let version = store.texture.version;
@@ -166,6 +222,10 @@ describe("LabelDataTexture", () => {
     version = store.texture.version;
     store.setComponent(0, LabelRow.STATE, 0, 1);
     expect(store.texture.version).toBeGreaterThan(version);
+
+    version = store.texture.version;
+    store.setComponent(0, LabelRow.STATE, 0, 1);
+    expect(store.texture.version).toBe(version);
 
     version = store.texture.version;
     store.clearSlot(0);

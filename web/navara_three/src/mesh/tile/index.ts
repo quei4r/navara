@@ -10,7 +10,7 @@ import type {
 } from "@navaramap/engine";
 import BranchFreeTernary from "@shaders/glsl/chunks/branchFreeTernary.glsl?raw";
 import SpecularParsFragment from "@shaders/glsl/chunks/spucular_pars_fragment.glsl";
-import WaterParsFragment from "@shaders/glsl/chunks/water_pars_fragment.glsl?raw";
+import WaterParsFragment from "@shaders/glsl/chunks/water_pars_fragment.glsl";
 import {
   BufferAttribute,
   BufferGeometry,
@@ -34,23 +34,26 @@ import {
   ShaderChunk,
   Box3,
   Box3Helper,
-  Sphere,
   NoColorSpace,
   MeshBasicMaterial,
   LinearFilter,
 } from "three";
 import type { texture } from "three/tsl";
+import invariant from "tiny-invariant";
 
 import { setTransform } from "../../event";
 import type { EventContext, TileHandler } from "../../event/context";
 import {
   GBUFFER_EFFECT_WRITE_BUILTIN,
   GBUFFER_NORMAL_WRITE_BASIC,
+  GBUFFER_PHONG_ROUGHNESS,
   generateTileCommonInjection,
   generateTileMapFragment,
+  generateTileNormalBufferReplacement,
   generateTileNormalFragmentMaps,
+  generateTileOutgoingLight,
   TILE_EMISSIVE_EFFECT_BUFFER_REPLACEMENT,
-  TILE_NORMAL_BUFFER_REPLACEMENT,
+  generateTileWaterDefines,
   TILE_PICK_FRAGMENT_OVERRIDE,
   TILE_VERTEX_INJECTIONS,
   applyLitOption,
@@ -59,6 +62,8 @@ import { deriveCompositeFeatures } from "../../material/enhancer/tileComposite";
 import type { CustomObject3DEventMap } from "../../object3DEvent";
 import type { TextureOptions } from "../../textures";
 import {
+  atlasUniforms,
+  DEFAULT_ELEVATION_HEATMAP_LOG_BOUNDARY,
   planSlots,
   type CompositeFeatures,
   type CompositeGlobals,
@@ -73,14 +78,26 @@ import {
   updateTextureFragmentIndex,
   removeTextureFragmentIndex,
 } from "../../utils/textureFragmentIndex";
+import {
+  DEFAULT_WAVE_CONDITIONS,
+  type WaterWavesRef,
+} from "../../water/waterState";
 import type { PickableMesh } from "../pickableMesh";
-import { releaseGeometryArraysAfterUpload } from "../releaseGeometryArrays";
+import {
+  canDrawWireframe,
+  releaseGeometryArraysAfterUpload,
+} from "../releaseGeometryArrays";
 
 import type { DrapeResolver } from "./drapeResolver";
 import {
   BakedRasterDrapeResolver,
   DirectRasterDrapeResolver,
 } from "./rasterDrapeResolver";
+import {
+  exaggeratedTerrainBounds,
+  injectTerrainExaggeration,
+  terrainDepthMaterial,
+} from "./terrainExaggeration";
 import { VectorDrapeResolver } from "./vectorDrapeResolver";
 
 // 1×1 white stand-in for inactive texture slots. Each slot MUST get its own
@@ -115,23 +132,9 @@ type WebgpuSlotNodes = {
 
 export type TileMaterial = MeshBasicMaterial | MeshLambertMaterial;
 
-/** The MRT composite atlas has three RGBA attachments (color, attr, normal). */
-const ATLAS_ATTACHMENTS = 3;
 /** GPU bytes for one drape render target at side length `size`: size² RGBA. */
 function drapeRtBytes(size: number): number {
   return size * size * 4;
-}
-/** GPU bytes for the per-tile composite atlas at side length `size`: one MRT
- * with three size² RGBA attachments. A terrain tile acquires this atlas in its
- * constructor and holds it for its whole lifetime (raster-only tiles
- * included), so Rust seeds it into the tile's cost at mesh-attach time and
- * every drape report from here must keep including it. The side length is 512²
- * on both desktop and mobile (so ~3MB per tile with three attachments) and
- * flows in from the compositor, which is the SAME source of truth
- * `getDefaultMemoryCostHints` feeds to the Rust ledger — so the reported bytes
- * always match the seed. */
-function compositeAtlasBytes(size: number): number {
-  return size * size * 4 * ATLAS_ATTACHMENTS;
 }
 
 export class TileMesh
@@ -153,23 +156,38 @@ export class TileMesh
   private readonly vectorDrape: VectorDrapeResolver;
   private readonly rasterDrape: DrapeResolver;
 
-  // Separate mesh for shadow casting (uses terrain-only geometry without skirt)
-  private shadowMesh?: Mesh<BufferGeometry, TileMaterial>;
+  // Index count of the terrain surface, which sits in front of the skirt in
+  // the geometry's index buffer.
+  private terrainIndexCount = 0;
+  private boundingBoxHelper?: Box3Helper;
+  // Unexaggerated geometry bounds (`Mesh::aabb`) and the height range they
+  // span (`Mesh::min_height`/`max_height`), kept to rebuild the exaggerated bounds
+  // when the exaggeration changes.
+  private rawBounds = {
+    center: new Vector3(),
+    extent: new Vector3(),
+    minHeight: 0,
+    maxHeight: 0,
+  };
 
   private compositor: TileTextureCompositor;
 
-  // Drape RT side length + atlas byte cost, read from the compositor (the
-  // single source of truth shared with the Rust cost hints) in the constructor.
-  // Per-instance rather than module constants because the compositor size is a
-  // runtime value (512² on both desktop and mobile today, but configurable).
+  // Drape RT side length, read from the compositor (the single source of truth
+  // shared with the Rust cost hints) in the constructor. Per-instance rather
+  // than a module constant because the compositor size is a runtime value
+  // (512² on both desktop and mobile today, but configurable).
   private readonly drapeRtSize: number;
-  private readonly atlasBytes: number;
+  /** Current `Mesh::fill_quadrants` mask (see `setFillQuadrants`). */
+  private fillQuadrants = 0;
   // Drape footprint (bytes) last reported to the memory ledger, so a report
-  // only crosses the WASM boundary when it actually changes. Starts at the
-  // atlas cost to match the seed Rust charges at mesh-attach time (the atlas
-  // is acquired in the constructor) — a tile that never drapes therefore
-  // never reports. Assigned in the constructor once `atlasBytes` is known.
-  private reportedDrapeGpuBytes: number;
+  // only crosses the WASM boundary when it actually changes. Starts at 0 to
+  // match the drape term Rust seeds at mesh-attach time.
+  private reportedDrapeGpuBytes = 0;
+  // Whether the frame being rendered drew this tile.
+  private drawnInFrame = false;
+  // Whether the tile gave its drape memory back since it was last drawn.
+  private drapeGpuMemoryReleased = false;
+  private _waterMaskWaves: WaterWavesRef | undefined;
 
   readonly ctx: EventContext;
 
@@ -193,8 +211,6 @@ export class TileMesh
     // Device-dependent atlas / drape RT sizing, sourced from the compositor so
     // it always matches the ledger cost hints (see device.ts).
     this.drapeRtSize = this.compositor.size;
-    this.atlasBytes = compositeAtlasBytes(this.compositor.size);
-    this.reportedDrapeGpuBytes = this.atlasBytes;
 
     // Acquire the per-tile composite atlas from the compositor. Pairing the
     // acquire with the mesh keeps the atlas lifecycle tied to the tile and lets
@@ -208,7 +224,6 @@ export class TileMesh
     const additionalTexturesInUse =
       textureOptions.additionalTexturesInUse ?? {};
     let numAdditionalTextures = 0;
-    if (additionalTexturesInUse.waterTexture) numAdditionalTextures++;
     if (additionalTexturesInUse.colorMapTexture) numAdditionalTextures++;
 
     this.numTexturizedVector =
@@ -262,40 +277,71 @@ export class TileMesh
       : new DirectRasterDrapeResolver();
 
     tileMapByHandle.set(handle, this);
+    // The atlas shared with the mesh this one replaces may already be
+    // allocated.
+    this.reportDrapeGpuBytesIfChanged();
 
     this.onBeforeRender = this._onBeforeRender;
+    this.onBeforeShadow = this._onBeforeShadow;
+    this.onAfterShadow = this._onAfterShadow;
   }
 
   /**
    * Report the tile's drape GPU footprint (composite atlas + vector and baked-raster
-   * drape render targets) to the memory ledger when it changed. The atlas is acquired
-   * in the constructor and held for the tile's lifetime regardless of draping, so it
-   * is always part of the report — otherwise a tile whose last draped layer vanished
-   * would report 0 and wipe the atlas cost Rust seeds at mesh-attach time. The render
-   * targets on top of it scale with terrain subdivision past the layers' maxZoom — a
-   * cost per-source-tile accounting cannot see.
+   * drape render targets) to the memory ledger when it changed. The atlas counts while
+   * it is allocated, regardless of draping;
+   * it grows by the normal attachment while the tile has hillshade.
+   * The render targets on top of it scale with terrain subdivision past the layers'
+   * maxZoom — a cost per-source-tile accounting cannot see.
    */
   private reportDrapeGpuBytesIfChanged() {
-    const rtCount =
-      this.vectorDrape.liveRenderTargetCount() +
-      this.rasterDrape.liveRenderTargetCount();
-    const bytes = this.atlasBytes + rtCount * drapeRtBytes(this.drapeRtSize);
-    if (bytes === this.reportedDrapeGpuBytes) return;
     // Only the mesh currently registered for this position-stable handle may
     // report. During a terrain mesh replacement the outgoing mesh briefly
     // coexists with the incoming one, which has already claimed the handle
     // (constructor's `tileMapByHandle.set`) and been seeded by
     // `attach_terrain_mesh_cost`. A stray report from the outgoing mesh would
     // resolve on the Rust side (via `Without<Deleted>`) to the NEW live entity
-    // and overwrite its freshly-seeded atlas cost — the same hazard the
-    // dispose() 0-report guards against, here on the non-zero path.
-    if (this.ctx.tileMapByHandle.get(this.handle) !== this) return;
+    // and overwrite its drape cost — the same hazard the dispose() 0-report
+    // guards against, here on the non-zero path. The two meshes share the
+    // handle's atlas, so a change the outgoing mesh makes to it (a bake that
+    // allocates or reshapes it) is reported by the registered mesh instead.
+    const owner = this.ctx.tileMapByHandle.get(this.handle);
+    if (owner !== this) {
+      owner?.reportDrapeGpuBytesIfChanged();
+      return;
+    }
+    const rtCount =
+      this.vectorDrape.liveRenderTargetCount() +
+      this.rasterDrape.liveRenderTargetCount();
+    const bytes =
+      this.compositor.atlasGpuBytes(this.handle) +
+      rtCount * drapeRtBytes(this.drapeRtSize);
+    if (bytes === this.reportedDrapeGpuBytes) return;
     this.reportedDrapeGpuBytes = bytes;
     this.tileHandler.reportDrapeGpuBytes(this.handle, bytes);
   }
 
+  /**
+   * Called after each rendered frame. A tile the frame did not draw (hidden,
+   * or outside every camera) frees its drape render targets and composite
+   * atlas; its next render bakes them again.
+   */
+  releaseDrapeGpuMemoryUnlessDrawn() {
+    if (this.drawnInFrame) {
+      this.drawnInFrame = false;
+      this.drapeGpuMemoryReleased = false;
+      return;
+    }
+    if (this.drapeGpuMemoryReleased) return;
+    this.vectorDrape.release();
+    this.rasterDrape.release();
+    this.drapeGpuMemoryReleased = this.compositor.releaseAtlas(this.handle);
+    this.reportDrapeGpuBytesIfChanged();
+  }
+
   private _onBeforeRender = () => {
     if (!this.visible) return;
+    this.drawnInFrame = true;
 
     // Drape resolvers (see `drapeResolver.ts`): each refreshes its Rust-resolved
     // slots on a revision bump and re-bakes on a slot/content signature change.
@@ -312,13 +358,34 @@ export class TileMesh
       this.texturizedSceneIndexFrom,
       this.maxTextures,
     );
-    this.compositor.runCompositePassIfDirty(
+    const baked = this.compositor.runCompositePassIfDirty(
       this.handle,
       plan,
       globals,
       deriveCompositeFeatures(layers, globals),
+      // The atlas carries the normal attachment for its only reader: the
+      // main shader's hillshade branch.
+      this.computeFeatures().hasHillshade,
     );
+    if (baked) this.reportDrapeGpuBytesIfChanged();
   };
+
+  // The skirt casts no shadow.
+  private _onBeforeShadow = () => {
+    this.geometry.setDrawRange(0, this.terrainIndexCount);
+  };
+
+  private _onAfterShadow = () => {
+    this.geometry.setDrawRange(0, Infinity);
+  };
+
+  /** The waves of the watermask's water, held for as long as the tile lives. */
+  private waterMaskWaves(): WaterWavesRef {
+    this._waterMaskWaves ??= this.ctx.uniforms.water.createWaves(
+      DEFAULT_WAVE_CONDITIONS,
+    );
+    return this._waterMaskWaves;
+  }
 
   /**
    * Feature flags for the **main** TileMesh shader (atlas-sampling side): drives
@@ -329,17 +396,18 @@ export class TileMesh
   private computeFeatures(): CompositeFeatures {
     const ud = this.material.userData;
     // Only slots that are still shown count: bindVectorSlots sets shows=0 when a
-    // slot loses its representative mesh but leaves the per-slot waters/heatmap
+    // slot loses its representative mesh but leaves the per-slot water/elevation heatmap
     // uniforms at their previous values, so a disappeared layer would otherwise
     // keep its shader feature (e.g. water) compiled in. Mirrors the shows gate in
     // buildCompositeLayers.
     const shows: number[] = ud.shows?.value ?? [];
-    const waters = ud.waters?.value as boolean[] | undefined;
-    const heatmaps = ud.isElevationHeatmaps?.value as boolean[] | undefined;
+    const waterParams = ud.waterParams?.value as Vector2[] | undefined;
+    const elevationHeatmaps = ud.isElevationHeatmaps?.value as
+      boolean[] | undefined;
     return {
       hasHillshade: ud.defines?.USE_HILLSHADE === 1,
-      hasWater: !!waters?.some((v, i) => v === true && shows[i] === 1),
-      hasElevationHeatmap: !!heatmaps?.some(
+      hasWater: !!waterParams?.some((v, i) => v.y > 0 && shows[i] === 1),
+      hasElevationHeatmap: !!elevationHeatmaps?.some(
         (v, i) => v === true && shows[i] === 1,
       ),
       hasWatermask: this.userData.watermask != null,
@@ -366,7 +434,19 @@ export class TileMesh
     const layerUvScale: Vector2[] = ud.layerUvScale?.value ?? [];
     const isHillshades: boolean[] = ud.isHillshades?.value ?? [];
     const isElevationHeatmaps: boolean[] = ud.isElevationHeatmaps?.value ?? [];
-    const waters: boolean[] = ud.waters?.value ?? [];
+    const elevationHeatmapUsesBilinear: boolean[] =
+      ud.elevationHeatmapUsesBilinear?.value ?? [];
+    const elevationHeatmapLayerIds: (string | undefined)[] =
+      ud.elevationHeatmapLayerIds?.value ?? [];
+    const elevationMinHeights: number[] = ud.elevationMinHeights?.value ?? [];
+    const elevationMaxHeights: number[] = ud.elevationMaxHeights?.value ?? [];
+    const elevationLogBoundaries: number[] =
+      ud.elevationLogBoundaries?.value ?? [];
+    const elevationRGBScalersAndBoundaries: Vector4[] =
+      ud.elevationRGBScalersAndBoundaries?.value ?? [];
+    const elevationDecoderOffsets: Vector4[] =
+      ud.elevationDecoderOffsets?.value ?? [];
+    const waterParams: Vector2[] = ud.waterParams?.value ?? [];
     const boundary = this.texturizedSceneIndexFrom;
 
     const layers: CompositeLayer[] = [];
@@ -397,6 +477,16 @@ export class TileMesh
           region === "vector" ? this.vectorDrape : this.rasterDrape
         ).slotReproject(absSlot);
         if (isElevationHeatmaps[absSlot]) {
+          const usesBilinear = elevationHeatmapUsesBilinear[absSlot] ?? true;
+          // Resolved per composite: atlas rows shift as colorMaps come and go.
+          const colorRamp = this.ctx.colorMapAtlas?.getRow(
+            elevationHeatmapLayerIds[absSlot],
+          );
+          const minHeight = elevationMinHeights[absSlot] ?? 0;
+          const maxHeight = elevationMaxHeights[absSlot] ?? minHeight + 1;
+          const logBoundary = elevationLogBoundaries[absSlot] ?? 0;
+          const logarithmic = logBoundary > 0;
+
           layers.push({
             kind: "elevationHeatmap",
             region,
@@ -406,6 +496,14 @@ export class TileMesh
             uvScale,
             opacity: opacities[absSlot] ?? 1,
             reproject: slotReproject,
+            filter: usesBilinear ? "linear" : "nearest",
+            colorRamp,
+            minHeight,
+            maxHeight,
+            logarithmic,
+            logBoundary,
+            rgbScalersAndBoundary: elevationRGBScalersAndBoundaries[absSlot],
+            decoderOffsets: elevationDecoderOffsets[absSlot],
           });
         } else {
           layers.push({
@@ -417,7 +515,7 @@ export class TileMesh
             uvScale,
             color: colors[absSlot] ?? new Color(),
             opacity: opacities[absSlot] ?? 1,
-            water: waters[absSlot] ?? false,
+            water: (waterParams[absSlot]?.y ?? 0) > 0,
             reproject: slotReproject,
           });
         }
@@ -425,31 +523,17 @@ export class TileMesh
     }
 
     const globals: CompositeGlobals = {
-      hillshadeExaggeration: ud.hillshadeExaggeration?.value ?? 1,
       watermask: this.userData.watermask?.texture ?? null,
-      colorMapTexture: this.ctx.uniforms.colorMapTexture.value ?? null,
-      elevationRGBScaler: ud.elevationRGBScaler?.value ?? new Vector3(),
-      elevationMinMaxHeightAndBoundary:
-        ud.elevationMinMaxHeightAndBoundary?.value ?? new Vector3(),
-      elevationMinMaxOffsetAndEpsilonAndOffset:
-        ud.elevationMinMaxOffsetAndEpsilonAndOffset?.value ?? new Vector4(),
-      logarithmic: ud.logarithmic?.value ?? false,
-      logBase: ud.logBase?.value ?? 10,
-      logBoundary: ud.logBoundary?.value ?? 10,
+      // Built lazily here, so a burst of colorMap changes rebuilds it once.
+      colorMapTexture: this.ctx.colorMapAtlas?.getTexture() ?? null,
     };
 
     return { layers, globals };
   }
 
   async _init(mesh: MeshAdded) {
-    await this.createMesh(
-      generate_id_from_entity(mesh),
-      mesh.mesh,
-      mesh.material,
-      mesh.transform,
-      mesh.globe,
-    );
-
+    // Registered first so a `createMesh` that throws still releases what the
+    // constructor acquired.
     this.addEventListener("removedFromWorld", () => {
       this.dispose(
         this.ctx.tileMapByHandle,
@@ -457,6 +541,14 @@ export class TileMesh
         this.ctx.tileMeshToFragmentIds,
       );
     });
+
+    await this.createMesh(
+      generate_id_from_entity(mesh),
+      mesh.mesh,
+      mesh.material,
+      mesh.transform,
+      mesh.globe,
+    );
   }
 
   private async createMesh(
@@ -469,7 +561,6 @@ export class TileMesh
     const {
       scenes,
       meshes,
-      buf,
       loadedTexs,
       textureOptions,
       uniforms,
@@ -477,99 +568,10 @@ export class TileMesh
       tileMeshToFragmentIds,
     } = this.ctx;
 
-    // Read the AABB before grabbing the buffer views below. `mesh.aabb` (and its
-    // Vec3 center/extent) are wasm-bindgen getters that allocate WASM objects,
-    // which can grow linear memory and detach any previously-obtained buffer
-    // view. Reading it first keeps position/uv/indices/normals valid until
-    // createSkirtMesh copies them.
-    const aabb = mesh.aabb;
-    const center = aabb.center;
-    const extent = aabb.extent;
-    const aabb_center = new Vector3(center.x, center.y, center.z);
-    const aabb_extent = new Vector3(extent.x, extent.y, extent.z);
+    const boundingBox = this.installGeometry(mesh);
+    if (!boundingBox) return;
 
-    const position = buf.f32(mesh.vertices);
-    const indices = buf.u32(mesh.indices);
-    if (!position || !indices) return;
-
-    const uv = buf.f32(mesh.uvs);
-    const normals = mesh.normals != null ? buf.f32(mesh.normals) : null;
-
-    // The buf.* arrays are short-lived views into WASM memory: they must be
-    // consumed before any further WASM call that allocates. createSkirtMesh only
-    // reads non-allocating handle getters and consecutive buf.* views, then
-    // copies them once — into the combined buffers when a skirt exists, or via
-    // slice() otherwise.
-    // Terrain-only geometry (for shadow rendering). createSkirtMesh fills it:
-    // when a skirt exists it shares the combined geometry's buffers (with the
-    // skirt cut off via drawRange).
-    const terrainGeometry = new BufferGeometry();
-
-    const geometry = this.createSkirtMesh(
-      mesh,
-      terrainGeometry,
-      position,
-      uv,
-      indices,
-      normals,
-    );
-
-    // Watermask: 1 byte = uniform, 65536 bytes = 256x256 grid. Stored for downstream consumers.
-    if (mesh.watermask != null) {
-      const watermask = buf.u8(mesh.watermask);
-      if (watermask) {
-        const isUniform = watermask.length === 1;
-        const size = isUniform ? 1 : 256;
-        // Single-channel R8 — the composite shader only reads `.r`. RedFormat
-        // halves GPU memory vs. RGBA (256×256 = 64KB instead of 256KB).
-        // `watermask` is a short-lived view into WASM memory; copy it once and
-        // share the copy between the texture and `data` (both only read it).
-        const data = watermask.slice();
-        const texture = new DataTexture(
-          data,
-          size,
-          size,
-          RedFormat,
-          UnsignedByteType,
-        );
-        texture.flipY = true;
-        texture.needsUpdate = true;
-        this.userData.watermask = {
-          data,
-          isUniform,
-          texture,
-        };
-      }
-    }
-
-    this.userData.hasNormalAttribute = normals != null;
-
-    geometry.boundingBox = new Box3(
-      aabb_center.clone().sub(aabb_extent),
-      aabb_center.clone().add(aabb_extent),
-    );
-
-    geometry.boundingSphere = new Sphere(aabb_center, aabb_extent.length());
-
-    if (mat.showBoundingBox) {
-      const bb = new Box3Helper(geometry.boundingBox, 0x00ff00);
-      this.add(bb);
-    }
-    this.geometry = geometry;
-
-    // Drop the CPU-side typed arrays (position/uv/normal/index, and the skirt
-    // data merged into the same combined buffers above) once the GPU upload
-    // completes, so terrain geometry keeps a single resident (GPU) copy — the
-    // premise behind GPU_GEOMETRY_RESIDENCY_FACTOR=1 in the Rust ledger.
-    // Bounding volumes are already assigned from the WASM aabb above (no
-    // computeBoundingBox re-read), nothing else re-reads these arrays, and
-    // terrain geometry never goes through the worker `toBufferGeometryLike`
-    // path, so releasing is safe. CONSTRAINT: once released these geometries
-    // can no longer be re-uploaded on a WebGL context loss — acceptable because
-    // terrain is re-fetched from Rust on demand, not restored from CPU memory.
-    // When a skirt exists, `terrainGeometry` (shadow mesh) shares these exact
-    // BufferAttribute instances, so this one call releases both meshes' arrays.
-    releaseGeometryArraysAfterUpload(geometry);
+    this.syncBoundingBoxHelper(!!mat.showBoundingBox);
 
     this.material = this.initMaterial(mat, uniforms, globe);
 
@@ -582,26 +584,11 @@ export class TileMesh
     );
     this.setupTextures(loadedTexs, textureOptions, maxTextures, mat);
 
-    // Create shadow mesh if we have separate terrain geometry (i.e., skirt exists)
-    // This prevents the skirt from casting unexpected shadows
-    if (geometry !== terrainGeometry) {
-      terrainGeometry.boundingBox = geometry.boundingBox.clone();
-      terrainGeometry.boundingSphere = geometry.boundingSphere.clone();
-
-      // Create shadow mesh using terrain-only geometry (without skirt)
-      this.shadowMesh = new Mesh(terrainGeometry, this.material);
-      this.shadowMesh.castShadow = !!mat.castShadow;
-      this.shadowMesh.receiveShadow = !!mat.receiveShadow;
-      this.add(this.shadowMesh);
-
-      // Main mesh with skirt doesn't cast shadow, but receives it
-      this.castShadow = false;
-      this.receiveShadow = !!mat.receiveShadow;
-    } else {
-      // No skirt - use the main mesh for both rendering and shadow
-      this.castShadow = !!mat.castShadow;
-      this.receiveShadow = !!mat.receiveShadow;
-    }
+    this.customDepthMaterial = terrainDepthMaterial(
+      this.ctx.uniforms.terrainExaggeration,
+    );
+    this.castShadow = !!mat.castShadow;
+    this.receiveShadow = !!mat.receiveShadow;
     applyLitOption(this.material, mat.lit);
 
     this.visible = false;
@@ -621,7 +608,8 @@ export class TileMesh
           transform.qz,
           transform.qw,
         );
-        const upWorld = geometry.boundingSphere.center
+        this.geometry.computeBoundingSphere();
+        const upWorld = this.geometry.boundingSphere!.center
           .clone()
           .multiply(new Vector3(transform.sx, transform.sy, transform.sz))
           .applyQuaternion(q)
@@ -636,17 +624,213 @@ export class TileMesh
     meshes.set(id, this);
   }
 
-  // Create combined geometry (terrain + skirt) for rendering, and populate
-  // `terrainGeometry` (used by shadowMesh so the skirt casts no shadow) with
-  // the same buffers, restricted to the terrain via drawRange.
+  // Watermask: 1 byte = uniform, 65536 bytes = 256x256 grid. Stored for
+  // downstream consumers (the composite pass); replaces any previous mask.
+  private setWatermask(handle: number | undefined) {
+    this.userData.watermask?.texture?.dispose();
+    this.userData.watermask = undefined;
+    if (handle == null) return;
+    const watermask = this.ctx.buf.u8(handle);
+    if (!watermask) return;
+
+    const isUniform = watermask.length === 1;
+    const size = isUniform ? 1 : 256;
+    // Single-channel R8 — the composite shader only reads `.r`. RedFormat
+    // halves GPU memory vs. RGBA (256×256 = 64KB instead of 256KB).
+    // `watermask` is a short-lived view into WASM memory; copy it once and
+    // share the copy between the texture and `data` (both only read it).
+    const data = watermask.slice();
+    const texture = new DataTexture(
+      data,
+      size,
+      size,
+      RedFormat,
+      UnsignedByteType,
+    );
+    texture.flipY = true;
+    // The composite's B-spline lookup weighs texels through the filter.
+    texture.minFilter = LinearFilter;
+    texture.magFilter = LinearFilter;
+    texture.needsUpdate = true;
+    this.userData.watermask = {
+      data,
+      isUniform,
+      texture,
+    };
+  }
+
+  /**
+   * Rebuild the geometry from new buffer handles under this same TileMesh.
+   * Rust replaces an upsampled terrain mesh with its real-DEM mesh in place
+   * (same entity, same tile handle) and reports it as `mesh_geometry_replaced`
+   * rather than `mesh_updated`, so material, textures, atlas and drape state
+   * are left alone; only geometry, shadow mesh, bounds and watermask change.
+   * A changed watermask rebakes the atlas, and recompiles the program when it
+   * appears or disappears.
+   * Touching the material path here would blank the tile until its drape is
+   * baked again.
+   */
+  replaceGeometry(mesh: EventMesh) {
+    const outgoing = this.geometry;
+    const hadNormalAttribute = !!this.userData.hasNormalAttribute;
+    const hadWatermask = this.userData.watermask != null;
+
+    if (!this.installGeometry(mesh)) return;
+
+    outgoing.dispose();
+
+    if (hadNormalAttribute !== this.userData.hasNormalAttribute) {
+      // USE_VERTEX_NORMAL is compiled into the program: recompile it.
+      this.material.userData.defines.USE_VERTEX_NORMAL = this.userData
+        .hasNormalAttribute
+        ? 1
+        : 0;
+      this.material.needsUpdate = true;
+    }
+
+    const hasWatermask = this.userData.watermask != null;
+    if (hadWatermask !== hasWatermask) {
+      // `hasWatermask` decides whether the water surface is compiled in.
+      this.material.needsUpdate = true;
+    }
+    if (hadWatermask || hasWatermask) {
+      this.compositor.markDirty(this.handle, "watermask");
+    }
+  }
+
+  // Build the geometry from `mesh`'s buffer handles and make it this tile's
+  // geometry, along with its bounds and watermask. Returns the bounding box, or
+  // undefined when the buffers are gone.
+  private installGeometry(mesh: EventMesh): Box3 | undefined {
+    const { buf } = this.ctx;
+
+    // Read the AABB before grabbing the buffer views below. `mesh.aabb` (and its
+    // Vec3 center/extent) are wasm-bindgen getters that allocate WASM objects,
+    // which can grow linear memory and detach any previously-obtained buffer
+    // view. Reading it first keeps position/uv/indices/normals valid until
+    // createSkirtMesh copies them.
+    const aabb = mesh.aabb;
+    const center = aabb.center;
+    const extent = aabb.extent;
+    const aabbCenter = new Vector3(center.x, center.y, center.z);
+    const aabbExtent = new Vector3(extent.x, extent.y, extent.z);
+
+    const position = buf.f32(mesh.vertices);
+    const indices = buf.u32(mesh.indices);
+    if (!position || !indices) return;
+
+    const uv = buf.f32(mesh.uvs);
+    const normals = mesh.normals != null ? buf.f32(mesh.normals) : null;
+    // Absent for a flat tile, whose vertices all sit at height 0.
+    const heights = mesh.heights != null ? buf.f32(mesh.heights) : null;
+
+    // The buf.* arrays are short-lived views into WASM memory: they must be
+    // consumed before any further WASM call that allocates. createSkirtMesh only
+    // reads non-allocating handle getters and consecutive buf.* views, then
+    // copies them once — into the combined buffers when a skirt exists, or via
+    // slice() otherwise.
+    this.terrainIndexCount = indices.length;
+    const geometry = this.createSkirtMesh(
+      mesh,
+      position,
+      uv,
+      indices,
+      normals,
+      heights,
+    );
+
+    this.rawBounds = {
+      center: aabbCenter,
+      extent: aabbExtent,
+      minHeight: mesh.min_height,
+      maxHeight: mesh.max_height,
+    };
+
+    this.setWatermask(mesh.watermask);
+
+    this.userData.hasNormalAttribute = normals != null;
+
+    this.geometry = geometry;
+    const boundingBox = this.applyExaggeratedBounds();
+
+    // Drop the CPU-side typed arrays (position/uv/normal/index, and the skirt
+    // data merged into the same combined buffers above) once the GPU upload
+    // completes, so terrain geometry keeps a single resident (GPU) copy — the
+    // premise behind GPU_GEOMETRY_RESIDENCY_FACTOR=1 in the Rust ledger.
+    // Bounding volumes are already assigned from the WASM aabb above (no
+    // computeBoundingBox re-read), nothing else re-reads these arrays, and
+    // terrain geometry never goes through the worker `toBufferGeometryLike`
+    // path, so releasing is safe. CONSTRAINT: once released these geometries
+    // can no longer be re-uploaded on a WebGL context loss — acceptable because
+    // terrain is re-fetched from Rust on demand, not restored from CPU memory.
+    if (!this.ctx.viewContext.retainGeometryArrays) {
+      releaseGeometryArraysAfterUpload(geometry);
+    }
+
+    return boundingBox;
+  }
+
+  /**
+   * Rebuild the bounds for the current exaggeration. The GPU displaces the
+   * vertices through the shared `uTerrainExaggeration` uniform, so only the
+   * culling bounds need updating when it changes.
+   */
+  updateTerrainExaggeration() {
+    this.applyExaggeratedBounds();
+  }
+
+  /** Re-read the vector drape sources Rust handed over for this tile on the
+   * next render. */
+  markVectorDrapeSourcesChanged() {
+    this.vectorDrape.markSourcesChanged();
+  }
+
+  /**
+   * Adds or removes the bounding-box helper so it matches `show`. Runs when
+   * the tile is built and on every material change, so toggling
+   * `showBoundingBox` reaches tiles that already exist.
+   */
+  private syncBoundingBoxHelper(show: boolean) {
+    if (show && !this.boundingBoxHelper && this.geometry.boundingBox) {
+      this.boundingBoxHelper = new Box3Helper(
+        this.geometry.boundingBox,
+        0x00ff00,
+      );
+      this.add(this.boundingBoxHelper);
+    } else if (!show && this.boundingBoxHelper) {
+      this.remove(this.boundingBoxHelper);
+      this.boundingBoxHelper.dispose();
+      this.boundingBoxHelper = undefined;
+    }
+  }
+
+  private applyExaggeratedBounds(): Box3 {
+    const { center, extent, minHeight, maxHeight } = this.rawBounds;
+    const { box, sphere } = exaggeratedTerrainBounds(
+      center,
+      extent,
+      minHeight,
+      maxHeight,
+      this.ctx.uniforms.terrainExaggeration.value,
+    );
+    this.geometry.boundingBox = box;
+    this.geometry.boundingSphere = sphere;
+    if (this.boundingBoxHelper) {
+      this.boundingBoxHelper.box = box;
+    }
+    return box;
+  }
+
+  // Create the geometry for rendering, with the terrain data at the front of
+  // every buffer and the skirt, if any, behind it.
   // Normals are computed dynamically in the fragment shader from vPosition.
   createSkirtMesh(
     mesh: EventMesh,
-    terrainGeometry: BufferGeometry,
     position: Float32Array,
     uv: Float32Array | null,
     indices: Uint32Array,
     normals: Float32Array | null,
+    heights: Float32Array | null,
   ) {
     const { buf } = this.ctx;
     // Check for separate skirt data
@@ -654,6 +838,7 @@ export class TileMesh
     const skirtIndicesHandle = mesh.skirt_indices;
     const skirtUvsHandle = mesh.skirt_uvs;
     const skirtNormalsHandle = mesh.skirt_normals;
+    const skirtHeightsHandle = mesh.skirt_heights;
 
     const hasSkirt = skirtVerticesHandle != null && skirtIndicesHandle != null;
     const skirtPosition =
@@ -663,26 +848,22 @@ export class TileMesh
     const skirtUv = skirtUvsHandle != null ? buf.f32(skirtUvsHandle) : null;
     const skirtNormals =
       skirtNormalsHandle != null ? buf.f32(skirtNormalsHandle) : null;
+    const skirtHeights =
+      skirtHeightsHandle != null ? buf.f32(skirtHeightsHandle) : null;
+    const vertexCount = position.length / 3;
 
-    // Create combined geometry (terrain + skirt) for main rendering
-    let geometry: BufferGeometry;
+    const geometry = new BufferGeometry();
     if (hasSkirt && skirtPosition && skirtIndices) {
-      geometry = new BufferGeometry();
-
-      // The terrain data sits at the front of every combined buffer, so the
-      // terrain-only (shadow) geometry shares the combined attributes — one
-      // CPU array and one GPU buffer per attribute — and drawRange below cuts
-      // the skirt off.
-
       // Combine vertices: terrain vertices + skirt vertices
       const combinedPosition = new Float32Array(
         position.length + skirtPosition.length,
       );
       combinedPosition.set(position);
       combinedPosition.set(skirtPosition, position.length);
-      const positionAttribute = new BufferAttribute(combinedPosition, 3);
-      geometry.setAttribute("position", positionAttribute);
-      terrainGeometry.setAttribute("position", positionAttribute);
+      geometry.setAttribute(
+        "position",
+        new BufferAttribute(combinedPosition, 3),
+      );
 
       // Combine UVs
       if (uv) {
@@ -691,9 +872,7 @@ export class TileMesh
         if (skirtUv) {
           combinedUv.set(skirtUv, uv.length);
         }
-        const uvAttribute = new BufferAttribute(combinedUv, 2);
-        geometry.setAttribute("uv", uvAttribute);
-        terrainGeometry.setAttribute("uv", uvAttribute);
+        geometry.setAttribute("uv", new BufferAttribute(combinedUv, 2));
       }
 
       // Combine normals: terrain normals + skirt normals (computed in Rust as edge normals)
@@ -705,9 +884,10 @@ export class TileMesh
         if (skirtNormals) {
           combinedNormals.set(skirtNormals, normals.length);
         }
-        const normalAttribute = new BufferAttribute(combinedNormals, 3);
-        geometry.setAttribute("normal", normalAttribute);
-        terrainGeometry.setAttribute("normal", normalAttribute);
+        geometry.setAttribute(
+          "normal",
+          new BufferAttribute(combinedNormals, 3),
+        );
       }
 
       // Skirt flag: 0 for terrain vertices, 1 for skirt vertices. The WebGPU
@@ -719,7 +899,18 @@ export class TileMesh
       skirtFlag.fill(1, position.length / 3);
       const skirtFlagAttribute = new BufferAttribute(skirtFlag, 1);
       geometry.setAttribute("aSkirt", skirtFlagAttribute);
-      terrainGeometry.setAttribute("aSkirt", skirtFlagAttribute);
+      // Combine heights: terrain heights + skirt heights. A flat tile's
+      // terrain vertices stay zero.
+      invariant(skirtHeights, "a terrain skirt carries its vertex heights");
+      const combinedHeights = new Float32Array(
+        vertexCount + skirtHeights.length,
+      );
+      if (heights) combinedHeights.set(heights);
+      combinedHeights.set(skirtHeights, vertexCount);
+      geometry.setAttribute(
+        "terrainHeight",
+        new BufferAttribute(combinedHeights, 1),
+      );
 
       // Combine indices: terrain indices + skirt indices
       const combinedIndices = new Uint32Array(
@@ -727,29 +918,31 @@ export class TileMesh
       );
       combinedIndices.set(indices);
       combinedIndices.set(skirtIndices, indices.length);
-      const indexAttribute = new BufferAttribute(combinedIndices, 1);
-      geometry.setIndex(indexAttribute);
-
-      terrainGeometry.setIndex(indexAttribute);
-      terrainGeometry.setDrawRange(0, indices.length);
+      geometry.setIndex(new BufferAttribute(combinedIndices, 1));
     } else {
       // No skirt data - build the terrain geometry from the arrays. slice()
       // copies out of the WASM-memory views since BufferAttribute retains them.
-      terrainGeometry.setAttribute(
+      geometry.setAttribute(
         "position",
         new BufferAttribute(position.slice(), 3),
       );
       if (uv) {
-        terrainGeometry.setAttribute("uv", new BufferAttribute(uv.slice(), 2));
+        geometry.setAttribute("uv", new BufferAttribute(uv.slice(), 2));
       }
       if (normals) {
-        terrainGeometry.setAttribute(
+        geometry.setAttribute(
           "normal",
           new BufferAttribute(normals.slice(), 3),
         );
       }
-      terrainGeometry.setIndex(new BufferAttribute(indices.slice(), 1));
-      geometry = terrainGeometry;
+      geometry.setAttribute(
+        "terrainHeight",
+        new BufferAttribute(
+          heights ? heights.slice() : new Float32Array(vertexCount),
+          1,
+        ),
+      );
+      geometry.setIndex(new BufferAttribute(indices.slice(), 1));
     }
 
     return geometry;
@@ -879,7 +1072,7 @@ export class TileMesh
     for (let i = 0; i < this.maxTextures; i++) {
       const slot = slots[i];
       const slotUv = uvNode.mul(slot.scale).add(slot.offset);
-      const sample = slot.node.sample(
+      const sample: any = slot.node.sample(
         vec2(slotUv.x, mix(slotUv.y, slotUv.y.oneMinus(), slot.flipV)),
       );
       const srcA = sample.a.mul(slot.opacity).mul(slot.has);
@@ -985,7 +1178,7 @@ export class TileMesh
       value: 0,
     };
 
-    m.userData.uTime = uniforms.time;
+    m.userData.fillQuadrants = { value: this.fillQuadrants };
 
     m.userData.defines = {
       USE_UV: 1,
@@ -999,16 +1192,14 @@ export class TileMesh
     const maxTextures = this.maxTextures;
 
     // Bind the compositor's atlas outputs as TileMesh-visible uniforms so the
-    // slim shader can sample them. Atlas Textures are created once per tile
-    // and persist across composite passes — `needsUpdate` is flipped by the
-    // compositor when a new pass writes to them.
-    const atlasOutputs = this.compositor.acquireOutputs(this.handle);
-    m.userData.uColorAtlas = { value: atlasOutputs.color };
-    m.userData.uAttrAtlas = { value: atlasOutputs.attr };
-    m.userData.uNormalAtlas = { value: atlasOutputs.normal };
+    // slim shader can sample them.
+    Object.assign(
+      m.userData,
+      atlasUniforms(this.compositor.acquireOutputs(this.handle)),
+    );
 
     m.customProgramCacheKey = () =>
-      "TILE" + JSON.stringify(this.computeFeatures());
+      `TILE${this.numTexturizedVector}${JSON.stringify(this.computeFeatures())}`;
 
     m.onBeforeCompile = (shader) => {
       shader.defines ??= {};
@@ -1027,11 +1218,11 @@ export class TileMesh
       shader.uniforms.uColors = m.userData.colors;
       shader.uniforms.uReflectivities = m.userData.reflectivities;
       shader.uniforms.uRoughnesses = m.userData.roughnesses;
-      shader.uniforms.uWaterScaleNormals = m.userData.waterScaleNormals;
-      shader.uniforms.uWaterSpeeds = m.userData.waterSpeeds;
+      shader.uniforms.uWaterParams = m.userData.waterParams;
+      shader.uniforms.uWaterMaskColor = m.userData.waterMaskColor;
+      shader.uniforms.uWaterMaskExaggeration = m.userData.waterMaskExaggeration;
       shader.uniforms.uShininesses = m.userData.shininesses;
       shader.uniforms.uSpecularStrengths = m.userData.specularStrengths;
-      shader.uniforms.uApplyWaterNormals = m.userData.applyWaterNormals;
       shader.uniforms.uSpeculars = m.userData.speculars;
       shader.uniforms.uEmissiveIntensities = m.userData.emissiveIntensities;
       shader.uniforms.uEmissiveColors = m.userData.emissiveColors;
@@ -1040,12 +1231,21 @@ export class TileMesh
       // arrays + winIdx indexing instead).
       shader.uniforms.uEffectIdsMask = { value: 0 };
       shader.uniforms.uEmissiveIntensity = { value: 0 };
-      shader.uniforms.uWaterNormalMap = uniforms.waterTexture;
+      const hasWaterSurface = features.hasWater || features.hasWatermask;
+      if (useNormal && hasWaterSurface) {
+        Object.assign(shader.uniforms, uniforms.water.uniforms, {
+          nvrWaterWaves: m.userData.waterWaves,
+        });
+      }
       shader.uniforms.uHillshadeExaggeration = m.userData.hillshadeExaggeration;
       shader.uniforms.uIor = { value: 1.33333 };
-      shader.uniforms.uTime = m.userData.uTime;
+      shader.uniforms.uFillQuadrants = m.userData.fillQuadrants;
+      shader.uniforms.uTerrainExaggeration = uniforms.terrainExaggeration;
 
-      shader.vertexShader = createReplacer(shader.vertexShader)
+      shader.vertexShader = injectTerrainExaggeration(
+        createReplacer(shader.vertexShader),
+        true,
+      )
         .replace(
           "#include <common>",
           `${TILE_VERTEX_INJECTIONS.afterCommon}
@@ -1076,7 +1276,7 @@ ${generateTileCommonInjection(maxTextures)}
           `
         #include <lights_lambert_pars_fragment>
 
-        ${WaterParsFragment}
+        ${hasWaterSurface ? `${generateTileWaterDefines(features.hasWater, this.numTexturizedVector, this.texturizedSceneIndexFrom)}\n${WaterParsFragment}` : ""}
         ${SpecularParsFragment}
         ${BranchFreeTernary}
         `,
@@ -1084,7 +1284,7 @@ ${generateTileCommonInjection(maxTextures)}
         )
         .replace(
           "#include <map_fragment>",
-          generateTileMapFragment(maxTextures, features),
+          generateTileMapFragment(maxTextures),
         )
         .replaceWithCondition(
           "#include <normal_fragment_maps>",
@@ -1095,7 +1295,7 @@ ${generateTileCommonInjection(maxTextures)}
           "vec3 outgoingLight = reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + totalEmissiveRadiance;",
           `
           vec3 outgoingLight = reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + totalEmissiveRadiance;
-          outgoingLight += specular;
+          ${generateTileOutgoingLight(features)}
         `,
           useNormal,
         )
@@ -1103,7 +1303,7 @@ ${generateTileCommonInjection(maxTextures)}
           "#include <envmap_fragment>",
           createReplacer(ShaderChunk.envmap_fragment).replace(
             "outgoingLight += envColor.xyz * specularStrength * reflectivity;",
-            "outgoingLight += nvr_branchFreeTernary(useSpecular, vec3(0.0), envColor.xyz * specularStrength * tileReflectivity);",
+            "outgoingLight += nvr_branchFreeTernary(useSpecular || tileWater, vec3(0.0), envColor.xyz * specularStrength * tileReflectivity);",
           ).source,
           useNormal,
         )
@@ -1117,7 +1317,7 @@ ${generateTileCommonInjection(maxTextures)}
         )
         .replaceWithCondition(
           GBUFFER_NORMAL_WRITE_BASIC,
-          TILE_NORMAL_BUFFER_REPLACEMENT,
+          generateTileNormalBufferReplacement(features),
           useNormal,
         )
         .replace(
@@ -1131,6 +1331,18 @@ ${generateTileCommonInjection(maxTextures)}
     return m;
   }
 
+  /**
+   * Restrict drawing to the given child quadrants (`Mesh::fill_quadrants`
+   * bitmask, `0` = whole tile): a shown parent fills only the quadrants of
+   * children that are not prepared yet, without overlapping the children on
+   * screen. Kept on the instance so a material rebuild carries it over.
+   */
+  private setFillQuadrants(mask: number) {
+    this.fillQuadrants = mask;
+    const uniform = this.material?.userData.fillQuadrants;
+    if (uniform) uniform.value = mask;
+  }
+
   _update(mesh: MeshChanged) {
     const {
       loadedTexs,
@@ -1142,11 +1354,12 @@ ${generateTileCommonInjection(maxTextures)}
     const changedMaterial = mesh.material;
     const tileMesh = mesh.mesh;
     const active = tileMesh.active;
+    this.syncBoundingBoxHelper(!!changedMaterial?.showBoundingBox);
+    this.setFillQuadrants(tileMesh.fill_quadrants);
 
     const maxTextures = textureOptions.maxTextures;
 
-    // TODO: Support hide entire globe.
-    this.visible = active;
+    this.visible = active && changedMaterial.showMesh;
 
     if (active) {
       this.ensureCorrectMaterialType(changedMaterial, globe);
@@ -1175,20 +1388,8 @@ ${generateTileCommonInjection(maxTextures)}
     }
 
     // Update shadow settings
-    // If shadowMesh exists, it handles castShadow while main mesh only receives shadows
-    if (this.shadowMesh) {
-      if (this.shadowMesh.castShadow !== changedMaterial.castShadow) {
-        this.shadowMesh.castShadow = !!changedMaterial.castShadow;
-      }
-      if (this.shadowMesh.receiveShadow !== changedMaterial.receiveShadow) {
-        this.shadowMesh.receiveShadow = !!changedMaterial.receiveShadow;
-      }
-      // Main mesh with skirt never casts shadow
-      this.castShadow = false;
-    } else {
-      if (this.castShadow !== changedMaterial.castShadow) {
-        this.castShadow = !!changedMaterial.castShadow;
-      }
+    if (this.castShadow !== changedMaterial.castShadow) {
+      this.castShadow = !!changedMaterial.castShadow;
     }
     if (this.receiveShadow !== changedMaterial.receiveShadow) {
       this.receiveShadow = !!changedMaterial.receiveShadow;
@@ -1204,8 +1405,14 @@ ${generateTileCommonInjection(maxTextures)}
     if (this.material.opacity !== globe.opacity) {
       this.material.opacity = globe.opacity;
     }
-    if (this.material.wireframe !== globe.wireframe) {
-      this.material.wireframe = globe.wireframe;
+    const wireframe =
+      globe.wireframe &&
+      canDrawWireframe(
+        this.geometry,
+        this.ctx.viewContext.retainGeometryArrays,
+      );
+    if (this.material.wireframe !== wireframe) {
+      this.material.wireframe = wireframe;
     }
   }
 
@@ -1235,10 +1442,6 @@ ${generateTileCommonInjection(maxTextures)}
       // Create new material with correct type. Per-layer UV uniforms will be
       // re-populated by setupTextures before the next render.
       this.material = this.initMaterial(mat, this.ctx.uniforms, globe);
-
-      if (this.shadowMesh) {
-        this.shadowMesh.material = this.material;
-      }
 
       // Dispose old material
       this.ctx.viewContext?.removeShadowMaterial(oldMaterial);
@@ -1271,23 +1474,27 @@ ${generateTileCommonInjection(maxTextures)}
     }
     if (!m.userData.roughnesses) {
       m.userData.roughnesses = {
-        value: [...new Array(maxTextures)].fill(0),
+        value: [...new Array(maxTextures)].fill(GBUFFER_PHONG_ROUGHNESS),
       };
     }
-    if (!m.userData.waters) {
-      m.userData.waters = {
-        value: [...new Array(maxTextures)].fill(false),
+    if (!m.userData.waterParams) {
+      m.userData.waterParams = {
+        value: [...new Array(maxTextures)].map(() => new Vector2()),
       };
     }
-    if (!m.userData.waterScaleNormals) {
-      m.userData.waterScaleNormals = {
-        value: [...new Array(maxTextures)].fill(0),
+    // The watermask's and then one per vector slot, which `VectorDrapeResolver`
+    // binds. The shader reads a slot's entry only when that slot is water.
+    if (!m.userData.waterWaves) {
+      const { waves } = this.waterMaskWaves();
+      m.userData.waterWaves = {
+        value: new Array(this.numTexturizedVector + 1).fill(waves),
       };
     }
-    if (!m.userData.waterSpeeds) {
-      m.userData.waterSpeeds = {
-        value: [...new Array(maxTextures)].fill(0),
-      };
+    if (!m.userData.waterMaskColor) {
+      m.userData.waterMaskColor = { value: new Vector4() };
+    }
+    if (!m.userData.waterMaskExaggeration) {
+      m.userData.waterMaskExaggeration = { value: 1 };
     }
     if (!m.userData.shininesses) {
       m.userData.shininesses = {
@@ -1296,11 +1503,6 @@ ${generateTileCommonInjection(maxTextures)}
     }
     if (!m.userData.specularStrengths) {
       m.userData.specularStrengths = {
-        value: [...new Array(maxTextures)].fill(0),
-      };
-    }
-    if (!m.userData.applyWaterNormals) {
-      m.userData.applyWaterNormals = {
         value: [...new Array(maxTextures)].fill(0),
       };
     }
@@ -1331,34 +1533,50 @@ ${generateTileCommonInjection(maxTextures)}
         value: [...new Array(maxTextures)].fill(false),
       };
     }
-    if (!m.userData.elevationRGBScaler) {
-      m.userData.elevationRGBScaler = {
-        value: new Vector3(0, 0, 0),
+    // Elevation Heatmap shader-side resampling (true = bilinear, false = nearest)
+    if (!m.userData.elevationHeatmapUsesBilinear) {
+      m.userData.elevationHeatmapUsesBilinear = {
+        value: [...new Array(maxTextures)].fill(true),
       };
     }
-    if (!m.userData.elevationMinMaxHeightAndBoundary) {
-      m.userData.elevationMinMaxHeightAndBoundary = {
-        value: new Vector3(0, 0, 0), // minHeight, maxHeight, boundary
+    // Per-slot layer IDs for colorMap atlas row lookup at composite time
+    if (!m.userData.elevationHeatmapLayerIds) {
+      m.userData.elevationHeatmapLayerIds = {
+        value: [...new Array(maxTextures)].fill(undefined),
       };
     }
-    if (!m.userData.elevationMinMaxOffsetAndEpsilonAndOffset) {
-      m.userData.elevationMinMaxOffsetAndEpsilonAndOffset = {
-        value: new Vector4(0, 0, 0, 0), // minOffset, maxOffset, epsilon, offset
+    // Per-layer elevation min/max heights for normalization
+    if (!m.userData.elevationMinHeights) {
+      m.userData.elevationMinHeights = {
+        value: [...new Array(maxTextures)].fill(0),
       };
     }
-    if (!m.userData.logarithmic) {
-      m.userData.logarithmic = {
-        value: false,
+    if (!m.userData.elevationMaxHeights) {
+      m.userData.elevationMaxHeights = {
+        value: [...new Array(maxTextures)].fill(1),
       };
     }
-    if (!m.userData.logBase) {
-      m.userData.logBase = {
-        value: 10,
+    // Per-layer logarithmic scaling (0 = off, >0 = on with boundary value)
+    if (!m.userData.elevationLogBoundaries) {
+      m.userData.elevationLogBoundaries = {
+        value: [...new Array(maxTextures)].fill(0),
       };
     }
-    if (!m.userData.logBoundary) {
-      m.userData.logBoundary = {
-        value: 10,
+    // Per-layer DEM decoder parameters
+    if (!m.userData.elevationRGBScalersAndBoundaries) {
+      m.userData.elevationRGBScalersAndBoundaries = {
+        value: Array.from(
+          { length: maxTextures },
+          () => new Vector4(0, 0, 0, 0),
+        ),
+      };
+    }
+    if (!m.userData.elevationDecoderOffsets) {
+      m.userData.elevationDecoderOffsets = {
+        value: Array.from(
+          { length: maxTextures },
+          () => new Vector4(0, 0, 1, 0),
+        ),
       };
     }
 
@@ -1390,6 +1608,8 @@ ${generateTileCommonInjection(maxTextures)}
       m.userData.colors.value[i] = new Color();
       m.userData.opacities.value[i] = 1;
       m.userData.isElevationHeatmaps.value[i] = false; // Reset elevation heatmap flags
+      m.userData.elevationHeatmapUsesBilinear.value[i] = true;
+      m.userData.elevationHeatmapLayerIds.value[i] = undefined; // Reset colorMap layer ID
       m.userData.isHillshades.value[i] = false; // Reset hillshade flags
     }
 
@@ -1412,6 +1632,64 @@ ${generateTileCommonInjection(maxTextures)}
       ) {
         m.userData.isElevationHeatmaps.value[i] =
           mat.isElevationHeatmaps[i] !== 0;
+
+        // Apply per-layer filter to elevation heatmap slots
+        if (mat.isElevationHeatmaps[i] !== 0 && mat.elevationHeatmapFilters) {
+          const filter = mat.elevationHeatmapFilters[i] || "linear";
+          m.userData.elevationHeatmapUsesBilinear.value[i] =
+            filter !== "nearest";
+        }
+
+        // Set per-layer min/max heights
+        if (mat.elevationMinHeights) {
+          m.userData.elevationMinHeights.value[i] =
+            mat.elevationMinHeights[i] ?? 0;
+        }
+        if (mat.elevationMaxHeights) {
+          const minH = m.userData.elevationMinHeights.value[i] ?? 0;
+          m.userData.elevationMaxHeights.value[i] =
+            mat.elevationMaxHeights[i] ?? minH + 1;
+        }
+
+        // Set per-layer logarithmic boundary (0 = off, >0 = on with boundary value).
+        // The pseudo-log divides by ln(boundary), so it must be > 1; a missing
+        // or smaller one falls back to the default instead of turning
+        // logarithmic scaling off (or inverting / breaking the mapping).
+        if (mat.logarithmics && mat.logBoundaries) {
+          const logarithmic = (mat.logarithmics[i] ?? 0) !== 0;
+          const boundary = mat.logBoundaries[i] ?? 0;
+          m.userData.elevationLogBoundaries.value[i] = logarithmic
+            ? boundary > 1
+              ? boundary
+              : DEFAULT_ELEVATION_HEATMAP_LOG_BOUNDARY
+            : 0;
+        }
+
+        // Set per-layer DEM decoder parameters
+        m.userData.elevationRGBScalersAndBoundaries.value[i].set(
+          mat.elevationRScalers?.[i] ?? 0,
+          mat.elevationGScalers?.[i] ?? 0,
+          mat.elevationBScalers?.[i] ?? 0,
+          mat.elevationBoundaries?.[i] ?? 0,
+        );
+        m.userData.elevationDecoderOffsets.value[i].set(
+          mat.elevationMinOffsets?.[i] ?? 0,
+          mat.elevationMaxOffsets?.[i] ?? 0,
+          mat.elevationEpsilons?.[i] ?? 1,
+          mat.elevationOffsets?.[i] ?? 0,
+        );
+      }
+    }
+
+    // Keep layer IDs; the colorMap atlas row is resolved at composite time
+    if (mat.colorMapLayerIds && mat.colorMapLayerIds.length > 0) {
+      for (
+        let i = 0;
+        i < Math.min(mat.colorMapLayerIds.length, maxTextures);
+        i++
+      ) {
+        m.userData.elevationHeatmapLayerIds.value[i] =
+          mat.colorMapLayerIds[i] || undefined;
       }
     }
 
@@ -1425,28 +1703,24 @@ ${generateTileCommonInjection(maxTextures)}
     // Hillshade exaggeration (applied during normal map sampling in shader)
     m.userData.hillshadeExaggeration.value = mat.hillshadeExaggeration;
 
-    m.userData.elevationRGBScaler.value.set(
-      mat.elevationRScaler,
-      mat.elevationGScaler,
-      mat.elevationBScaler,
-    );
+    const waterMaskWaves = this.waterMaskWaves();
+    waterMaskWaves.set({
+      strength: mat.waveStrength,
+      direction: mat.waveDirection,
+      scale: "ocean",
+      flowSpeed: mat.flowSpeed,
+    });
+    m.userData.waterWaves.value[0] = waterMaskWaves.waves;
+    m.userData.waterMaskExaggeration.value = mat.waveExaggeration;
 
-    m.userData.elevationMinMaxHeightAndBoundary.value.set(
-      mat.elevationMinHeight,
-      mat.elevationMaxHeight,
-      mat.elevationBoundary,
-    );
-
-    m.userData.elevationMinMaxOffsetAndEpsilonAndOffset.value.set(
-      mat.elevationMinOffset,
-      mat.elevationMaxOffset,
-      mat.elevationEpsilon,
-      mat.elevationOffset,
-    );
-
-    m.userData.logarithmic.value = mat.logarithmic;
-    m.userData.logBase.value = Math.log(mat.logBoundary);
-    m.userData.logBoundary.value = mat.logBoundary;
+    // The terrain layer's body color for the watermask's water.
+    const waterMaskColor: Vector4 = m.userData.waterMaskColor.value;
+    if (mat.waterMaskColor === undefined) {
+      waterMaskColor.w = 0;
+    } else {
+      const color = new Color().setHex(mat.waterMaskColor);
+      waterMaskColor.set(color.r, color.g, color.b, 1);
+    }
 
     const prevHillshade = m.userData.defines.USE_HILLSHADE;
     const newHillshade = m.userData.isHillshades.value.some(
@@ -1628,34 +1902,22 @@ ${generateTileCommonInjection(maxTextures)}
       // CRITICAL: Elevation DEM textures must use NearestFilter to prevent interpolation artifacts.
       // Linear interpolation between ocean RGB(128,0,0) and land RGB(0,0,5)
       // produces intermediate values like RGB(64,0,2) which decode to ~42000m!
-      // However, hillshade normal maps (which store normals directly in RGB, not encoded heights)
-      // should use LinearFilter for smooth bilinear interpolation at tile boundaries.
-      // Always apply these settings for DEM textures, independent of colorSpace change
+      // The elevation heatmap shader reads DEM texels with texelFetch and does its own
+      // decode-then-interpolate for "linear" resampling, so the hardware filter
+      // stays nearest regardless of the layer's resampling — this also matches
+      // the raster bake (`configureRasterBakeSource`), so the two never fight
+      // over the sampler and re-upload the texture.
+      // Hillshade normal maps (which store normals directly in RGB, not encoded
+      // heights) use LinearFilter for smooth bilinear interpolation at tile boundaries.
       if (isDEMTexture) {
-        if (isHillshade) {
-          // Hillshade normal maps: use LinearFilter for hardware bilinear interpolation
-          // Normals are stored directly in RGB [-1,1] -> [0,1], so linear filtering is safe
-          if (t.minFilter !== LinearFilter) {
-            t.minFilter = LinearFilter;
-            t.needsUpdate = true;
-          }
-          if (t.magFilter !== LinearFilter) {
-            t.magFilter = LinearFilter;
-            t.needsUpdate = true;
-          }
+        const targetFilter = isHillshade ? LinearFilter : NearestFilter;
+        if (t.minFilter !== targetFilter) {
+          t.minFilter = targetFilter;
+          t.needsUpdate = true;
         }
-
-        if (isElevationHeatmap) {
-          // Elevation DEM textures: use NearestFilter to prevent decoding artifacts
-          // RGB-encoded heights must not be interpolated before decoding
-          if (t.minFilter !== NearestFilter) {
-            t.minFilter = NearestFilter;
-            t.needsUpdate = true;
-          }
-          if (t.magFilter !== NearestFilter) {
-            t.magFilter = NearestFilter;
-            t.needsUpdate = true;
-          }
+        if (t.magFilter !== targetFilter) {
+          t.magFilter = targetFilter;
+          t.needsUpdate = true;
         }
 
         if (t.generateMipmaps !== false) {
@@ -1872,13 +2134,8 @@ ${generateTileCommonInjection(maxTextures)}
 
     this.ctx.viewContext?.removeShadowMaterial(this.material);
 
-    // Note: geometry disposal (including shadowMesh.geometry) is handled by
-    // disposeObject3D() in event/index.ts before removedFromWorld is dispatched.
-    // We only need to remove shadowMesh from the scene graph here.
-    if (this.shadowMesh) {
-      this.remove(this.shadowMesh);
-      this.shadowMesh = undefined;
-    }
+    // Note: geometry disposal is handled by disposeObject3D() in event/index.ts
+    // before removedFromWorld is dispatched.
 
     // Dispose the drape resolvers' WebGLRenderTargets to free GPU memory
     this.vectorDrape.dispose();
@@ -1890,15 +2147,17 @@ ${generateTileCommonInjection(maxTextures)}
     // mesh-replacement path the old entity is marked `Deleted` while a NEW live
     // mesh reuses the same position-stable handle, so `reportDrapeGpuBytes(0)`
     // would resolve (via `Without<Deleted>`) to the NEW entity and wipe the
-    // atlas cost `attach_terrain_mesh_cost` just seeded. Leaving accounting to
+    // atlas cost the incoming mesh reported. Leaving accounting to
     // the entity despawn keeps both paths correct.
     this.reportedDrapeGpuBytes = 0;
 
     // Release the watermask DataTexture (one per tile, RedFormat 1×1 or 256×256).
     this.userData.watermask?.texture?.dispose();
+    this._waterMaskWaves?.dispose();
 
-    // Clean up from tileMapByHandle
-    if (tileMapByHandle) {
+    // Clean up from tileMapByHandle, unless an incoming mesh replacing this
+    // one has already claimed the handle (see `reportDrapeGpuBytesIfChanged`).
+    if (tileMapByHandle?.get(this.handle) === this) {
       tileMapByHandle.delete(this.handle);
     }
 

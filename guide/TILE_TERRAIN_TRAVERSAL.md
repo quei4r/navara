@@ -144,6 +144,14 @@ next frame.
 
 ## Terrain traversal — strict LOD
 
+The shared `Tile::calc_sse` scales WebMercator geometric error by the cosine
+of the tile latitude nearest the equator. Mercator tiles shrink on the globe
+toward the poles; using the equatorial error there selects excessive detail
+in all three traversals (terrain, raster, vector). The equatorward edge gives
+the largest ground scale across the tile, keeping refinement conservative.
+Use the original tile extent, excluding polar caps. Geographic tiles retain
+their scheme-aware error without this Mercator correction.
+
 `traverse_terrain()` (`crates/navara_tile/src/tile/traverse.rs`) walks the terrain
 quadtree from each root and decides, recursively, whether a tile renders, its
 children render, or nothing renders yet. It is a screen-space-error (SSE)
@@ -157,18 +165,134 @@ flowchart TD
   B -- no --> C["compute SSE, readiness"]
   C --> D{"SSE ≤ max_sse ?"}
   D -- "yes (tile is detailed enough)" --> E{renderable?}
-  E -- yes --> R["TileRendered"]
-  E -- "no" --> REQ["request terrain data → NotFound"]
+  E -- "yes (own DEM, or upsampled)" --> R["TileRendered<br/>still upsampled → fetch own DEM after 200 ms as leaf"]
+  E -- "no (nothing to upsample from)" --> REQ["request terrain data → NotFound"]
   D -- "no (need more detail)" --> F["recurse into 4 children"]
   F --> G{all children prepared?}
-  G -- yes --> CMP["ChildrenMeshesPrepared<br/>activate children, hide parent"]
-  G -- "no" --> H["keep parent visible<br/>(children fill in as ready)"]
+  G -- yes --> CMP["ChildrenMeshesPrepared<br/>record take-over masks, defer"]
+  G -- "no" --> H["keep parent visible<br/>apply: hide every finished subtree"]
 ```
 
-Two subtleties make terrain + imagery work together:
+The swap is applied top down, not by the tile whose group completed. A tile
+returning `ChildrenMeshesPrepared` only records which children hand off in
+turn and which stay hidden (`TerrainTile::children_take_over`); the nearest
+ancestor whose own group is still incomplete (or `update_terrain` at the
+root) walks those masks with `activate_selected_subtree`. This matters with
+upsample-first: grandchildren are upsampled from any ready ancestor and built
+nearest-first, so a near child's subtree routinely finishes before its
+far-away uncles. Activating it inside its own recursion would draw it on top
+of the still-visible grandparent (z-fighting flicker); deferring keeps exactly
+one surface per region until the whole group swaps in one frame. The same
+invariant holds in the other direction: a tile that comes on screen hides
+every rendered descendant in that frame (`show_tile_over_descendants`), so a
+zoom-out that makes an ancestor the SSE leaf never draws it over the finer
+tiles it replaces — the deeper ones are no longer visited by the traversal and
+would otherwise linger until `clear_caches` retires them. And a tile that
+cannot render yet while its children are on screen (the zoom-out hold: it
+waits for its own DEM rather than upsampling) reports `ChildrenRendered`, so
+its shown descendants stay as cover and no coarser ancestor takes over in the
+meantime; the take-over masks record such a child as `covered`, and
+`activate_selected_subtree` leaves its subtree alone. Likewise a group that is
+already on screen is never collapsed back to its parent because a member only
+now came into view without a prepared mesh (revealed past the horizon, never
+spawned): that member is held hidden until it is prepared while its siblings
+keep the screen — otherwise every reveal during a zoom-out would flash the
+whole region back to a z2/z3 ancestor for a frame. So that the held member
+leaves no hole, the parent is shown in *fill* mode: `Mesh::fill_quadrants`
+carries the held children's quadrant bits and the tile shader discards every
+fragment outside them (`uFillQuadrants`, quadrant from `vOrigUv`), so the
+parent's own mesh covers exactly the missing quadrants without overlapping the
+prepared children. The mask is recorded as `ChildrenTakeOver::held` and applied
+by `activate_selected_subtree` (`TileCacheManager::fill_rendered_tile`);
+`activate_rendered_tile` resets it. Held members only ever appear at the far
+edge of the view (they are revealed past the horizon), outside the shadow
+cascades, so the shadow/depth materials carry no matching cut — revisit this if
+shadows are ever extended to the horizon. The memory budget's
+prefetch eviction (`enforce_memory_budget`) respects the same idea from the other
+side: a `prefetched` tile is only speculative while the traversal no longer
+visits it, and the traversal clears the flag on every non-hidden child it
+touches — a hidden group member destroyed under the view comes back as a fresh
+node with no mesh and no DEM, and the group collapses to a coarse ancestor.
 
+Three subtleties make terrain + imagery work together:
+
+- **Upsample first, fetch later.** A tile that meets SSE but has no DEM of its
+  own does not wait for the network: if any ancestor holds real data it is
+  **upsampled** from that ancestor immediately (`UpsampleAncestors::source`
+  picks the nearest real-data ancestor, falling back to the nearest upsampled
+  one; one task covers every level in between). For raster DEM that is the
+  ancestor's own landed DEM, which the worker resamples, so an ancestor counts
+  before its mesh is built; quantized mesh clips the ancestor's mesh, so it
+  needs one built from its own data.
+  The source may sit at most `MAX_UPSAMPLE_DEPTH` (2) levels up: clipping or
+  resampling an ancestor many levels up yields a near-flat patch at an
+  interpolated height, which a ground-level camera sees as terrain floating
+  above (or sunk below) the real surface until the tile's own DEM lands. A
+  tile whose nearest real-data ancestor is farther up is not renderable, so
+  the ladder below fetches real DEMs on the way down; the bound is lifted
+  only where no DEM of the tile's own will ever land — the overscale band and
+  a failed DEM request (`TerrainTile::is_upsample_depth_bounded`). Those two
+  never fetch a DEM that would replace the mesh they first got, so the tile
+  records the level it was built from (`TerrainTile::upsample_source_z`) and,
+  while it is on screen, the traversal flags it for a rebuild from a nearer
+  real-data ancestor (`TerrainTile::has_stale_upsample_source`; `transfer_mesh`
+  picks the flag up and upsamples again). The levels above turn real one at a
+  time, so a rebuild is spent only on a source that brings the tile within the
+  bound, on a jump of at least `MAX_UPSAMPLE_DEPTH` levels, or on the last
+  source the tile will ever get: every tile between it and the tile is in the
+  band or failed its request. Without the rebuild the tiles directly under a
+  ground-level camera keep a clip of a z12 surface while their parent already
+  shows z17 terrain, which reads as a tile-sized plane floating above (or sunk
+  below) the ground. The nearest level that can still hold real data for such
+  tiles is usually covered by them, and a covered tile is never an SSE leaf or
+  activated, so nothing else fetches its DEM: the traversal fetches it for any
+  covered tile with a child in the band or with a failed request
+  (`prepare_covered_anchor`). A quantized-mesh anchor is also spawned, hidden,
+  once its data lands, since its descendants clip its mesh.
+  The traversal hands the nearest such ancestors down the recursion
+  (`UpsampleAncestors::extend_with`), so readiness costs O(1) per tile;
+  only the task dispatch walks the quadtree (`TerrainTile::find_upsample_source`),
+  and only it allocates the tile's terrain-data placeholder. A child is spawned
+  as soon as *some* ancestor holds real data (not necessarily its parent), so
+  one traversal spawns every level below a shown tile and they all build in
+  parallel, nearest first; the swap still applies top down, group by group, so
+  the coarse ancestor covering a region revealed by a zoom-out is replaced
+  after one round trip rather than one per level. Quantized-mesh tiles clip the ancestor's TIN down along the quadrant
+  path (an upsampled ancestor works as a source too); raster-DEM tiles instead
+  resample the ancestor's DEM pixels bilinearly and mesh them with martini
+  at the tile's own level, so the upsampled tile looks like a lower-resolution
+  real tile rather than a copy of the ancestor's coarser simplification. A
+  rejected DEM request (rate limiter) only drops the requester; the tile keeps
+  its terrain data and upsampled mesh and retries next frame. The SSE leaf
+  fetches its own DEM without waiting to be activated, in parallel with its
+  upsample: the upsampled mesh is only a stand-in, and waiting for every
+  group above it to swap in first would just delay the replacement.
+  Intermediate levels never meet SSE and fetch only once they are actually
+  on screen (activated) with their children still building, so an upsample
+  chain does not fetch every level it passes. Both wait out
+  `STAND_IN_FETCH_DELAY_MS` (200 ms) of consecutive traversals while their
+  stand-in covers them (`TerrainTile::dem_wanted_since`): a camera flight
+  drops its transient leaves and briefly shown levels within that time, so
+  they never fetch. With a static camera, waiting tiles do not force a
+  traversal every frame: they record the earliest due time in
+  `TileCacheManager::retraverse_at`, and `update_terrain` traverses once
+  when it passes. A leaf with nothing to upsample from fetches at once.
+  When the DEM lands, `transfer_mesh` rebuilds the mesh from real data and
+  rewrites the tile's `Mesh` in place, reported through the geometry-only
+  `mesh_geometry_replaced` event (not `mesh_updated`, whose handler rebinds
+  textures and drapes and would blank the tile for a few frames) — the web side
+  rebuilds the geometry under the same `TileMesh`, keeping its material and
+  handle-keyed drape state. The exception is
+  zoom-out: a tile whose children are on screen already shows finer data than
+  any ancestor could give, so it waits for its own DEM instead — unless that
+  request already failed (a failed request is never retried), in which case it
+  upsamples after all. Because the
+  terrain reaches its SSE level right away, clamp-to-ground vector layers can
+  be baked onto the right-sized terrain tiles from a parent vector tile without
+  ever showing a magnified parent.
 - **Upsampling to follow imagery.** A terrain tile keeps subdividing past its own
-  data's max zoom by **upsampling** the parent mesh (`overscaled_max_zoom`). This
+  data's max zoom by **upsampling** (`overscaled_max_zoom`; both bounds are
+  inclusive, so `max_zoom` is fetched and the band starts one level below). This
   is what lets fine raster (e.g. OSM z23) sit on coarse terrain (e.g.
   quantized-mesh z18): the terrain geometry is subdivided to z23 so there is a
   surface to drape the z23 texture onto. Keeping the terrain subdivided to the
@@ -180,19 +304,38 @@ Two subtleties make terrain + imagery work together:
   texture readiness (`is_texture_ready`) therefore only gates on **hillshade**,
   which is terrain-owned.
 
-The mesh itself is built off the main thread: `traverse_terrain` requests the DEM /
-quantized-mesh bytes, a worker constructs the mesh, and `transfer_mesh` moves the
-result onto a `TileMeshMarker` entity.
+The mesh itself is built off the main thread: `transfer_mesh` spawns a worker
+task for every newly selected tile — an upsample from the nearest ready
+ancestor when the tile has no DEM yet, a construct from the DEM bytes otherwise
+— and moves the result onto a `TileMeshMarker` entity. A `Rendered` tile
+re-enters `transfer_mesh` only when flagged `RemeshPending`: by
+`mark_landed_dem_for_remesh` when its own DEM lands under an upsampled mesh
+(a construct), or by the traversal for a stale upsample source (a fresh
+upsample). The result is written into the existing `Mesh` instead of a new
+entity, and that rewrite waits until the web side has reported the mesh
+prepared: until then its queued `mesh_added` still names the buffers the
+rewrite frees. The flag stays exactly while a task it started is in flight.
+A lost task leaves a tile that already shows a mesh on that mesh; a lost
+upsample also makes the tile fetch its own DEM instead (`upsample_failed`),
+except in the overscale band, where it is retried.
+Horizon-occluded prefetch only meshes tiles whose own DEM has landed (or that
+sit in the overscale band): upsampling a hidden tile would cost a second
+construct when its `Low`-priority DEM arrives.
 
 ```mermaid
 sequenceDiagram
   participant T as traverse_terrain
-  participant W as worker (navara_worker)
   participant TM as transfer_mesh
-  T->>T: request_terrain_data() (DEM / .terrain bytes)
-  T->>W: spawn ConstructTerrainMesh / UpsampleTerrainMesh task
+  participant W as worker (navara_worker)
+  T->>TM: tile selected (no own DEM, ancestor mesh available)
+  TM->>W: spawn UpsampleTerrainMesh task (source = ancestor)
   W-->>TM: task completed (geometry)
   TM->>TM: store buffers, spawn TileMeshMarker + Mesh + Material
+  T->>T: tile stays the SSE leaf for 200 ms → request_terrain_data() (no wait for activation)
+  T->>TM: DEM landed on an upsampled tile
+  TM->>W: spawn ConstructTerrainMesh task
+  W-->>TM: task completed (geometry)
+  TM->>TM: free old buffers, rewrite Mesh + transform in place, re-cost
 ```
 
 ## Raster traversal — lenient LOD
@@ -227,18 +370,38 @@ sits flat at sea level. But SSE depends on the camera-to-tile distance, so a
 flat tile over elevated terrain measures itself as farther away than it really
 is and stops subdividing too early — leaving coarse imagery on a detailed
 (upsampled) surface. To avoid this, the raster traversal looks up the tile's
-elevation with `terrain_height_for_extent(terrain_qt, &extent)` and calls
-`update_heights` before computing SSE, so the imagery refines in step with the
-terrain. A terrain-mesh change therefore also re-triggers the raster traversal
+elevation with `terrain_height_for_tile(terrain_qt, exaggeration, coords)` and
+calls `update_heights` before computing SSE, horizon culling and frustum
+culling, so the imagery refines in step with the terrain. A terrain-mesh change therefore also re-triggers the raster traversal
 even when the camera is still.
 
-`terrain_height_for_extent` walks the **`TerrainTileQuadtree`** and reads the
-heights of the deepest *rendered* terrain tile covering the raster extent's
-**center point**. Looking up by extent (point-in-tile) rather than by `x/y/z`
-makes it scheme-independent: a WebMercator raster tile can borrow the height of
-the **Geographic** quantized-mesh tile beneath it, where a coordinate-identity
-lookup would find nothing. (This replaced an earlier coordinate-climb against a
-separate `TerrainInformationQuadtree`.)
+`terrain_height_for_tile` reads the **`TerrainTileQuadtree`** tiles of the
+raster tile's size, directly by coordinates (`encode_quadleaf_handle`, O(1)),
+and takes the min/max of their heights, mapped through the
+[terrain exaggeration](#terrain-exaggeration). A tile without a mesh is replaced
+by its nearest ancestor with one (deeper tiles are never searched), so a
+fallback only widens the range. On WebMercator terrain that is the raster
+tile's own `x/y/z`; on **Geographic** (quantized-mesh) terrain it is the level
+`z - 1` tiles, which share the raster tile's columns and cover it with one or
+two rows. Covering the whole raster tile, rather than a point in it, keeps the
+range from missing relief the tile spans.
+
+## Min zoom descent
+
+A source has no tiles below its `minZoom`, so a tile below it never counts as
+detailed enough: the traversal keeps subdividing it whatever its screen-space
+error, and the view shows the source from its first level. The terrain and
+raster traversals apply this below the lowest min zoom among the regular
+(non-hillshade) raster layers, the vector traversal below its own source's.
+
+Each level of that descent quadruples the tiles under the view, so it is
+bounded. `MinZoomDescentBudget` (one per tile cache manager, refilled per
+traversal) counts the in-frustum tiles subdivided this way, up to
+`DEFAULT_LIMIT`. Once it is spent a tile stays undivided: a terrain tile
+renders as the leaf without the source's drape, a raster tile ends the
+descent, and a vector tile reports `Culled`. The traversals are depth-first,
+so the tiles reached first show the source and the rest of the view goes
+without it.
 
 ## Joining the two — the pull
 
@@ -413,12 +576,103 @@ flowchart LR
 > edge), and the composite shader stretches the band-edge imagery row across
 > the cap, so the surface near the poles is covered rather than blank.
 
+## Terrain exaggeration
+
+The terrain layer owns the exaggeration (`TerrainMaterial::exaggeration` /
+`exaggeration_relative_height`). `sync_terrain_exaggeration` mirrors it every
+frame into the `TerrainExaggeration` resource (`navara_tile_component`), the
+single value the engine reads; it is the identity without a terrain layer. A
+change, and the first frame, emits `terrain_exaggeration_updated`, on which the
+web side sets the shared uniforms (`uTerrainExaggeration`,
+`nvrHorizonMinHeight`) and rebuilds the tile bounds; heights the web side needs
+exaggerated go through the exported pure function `exaggerateTerrainHeight`
+(`navara_wasm/src/terrain.rs`) with that uniform's value, rather than a JS copy
+of the formula. It scales the rendered terrain:
+`h' = (h - relative_height) * scale + relative_height`, with `scale >= 0`
+(a negative input is clamped). It is applied in exactly two places, and
+everything else keeps unexaggerated heights:
+
+- **The GPU displaces vertices.** Terrain meshes carry a per-vertex
+  `terrainHeight` attribute (`Mesh::heights` plus `Mesh::skirt_heights`; a flat
+  tile has no `heights` and the web side uploads zeros). The tile material and
+  the shared terrain shadow-depth material move each vertex along the geodetic
+  surface normal by `exaggerate(h) - h` from the shared `uTerrainExaggeration`
+  uniform, and a quantized-mesh vertex normal gets its tangential part scaled
+  by `scale`. A skirt vertex holds its edge vertex's height minus the skirt
+  height, so skirts lengthen with the exaggeration and keep covering LOD cracks,
+  which grow by the same factor. Changing the exaggeration therefore never
+  remeshes, and must reach neither `Globe` nor the live tile materials: either
+  change emits `mesh_updated` for every mesh, which rebinds drapes and blanks
+  tiles (`update_terrain_layer` only touches a material when one of its render
+  fields differs).
+- **The CPU maps heights wherever they must agree with the drawn surface.**
+  `TerrainTile` builds `bounding_region`, `sse_bounding_region` and `aabb`
+  from its raw `max_height`/`min_height` through the exaggeration it last saw
+  (`TerrainTile::exaggeration`), and the traversal syncs that copy on every
+  visit (`begin_traverse_terrain` → `set_exaggeration`), so frustum and horizon
+  culling and the SSE distance follow the raised surface while the geometric
+  error stays unscaled. A relative height sinks low terrain below the
+  ellipsoid (scale 5 around 2000 m puts the sea at -8000 m), where the
+  ellipsoid would hide tiles that are in view, so horizon culling tests each
+  tile against the ellipsoid shrunk by its `bounding_region.minimum_height`
+  when that is negative (`Tile::is_occluded_by_horizon`, the occludee point
+  computed against the same shrunk ellipsoid). The camera's zoom/translate
+  floor (`CameraController::minimum_zoom_distance`, a distance from the
+  globe center) is lowered by the same sinking: `sync_camera_surface_floor`
+  sets `CameraController::surface_floor` to the displaced sea level when it
+  is below 0. Reducing the exaggeration raises the floor without moving the
+  camera, so translate and follow-zoom keep accepting moves away from the
+  globe center below it (`CameraController::sinks_below_floor`), as zoom does.
+  The atmosphere's ground (`Atmosphere.ellipsoid`, shared by every takram
+  consumer: aerial perspective, sky, stars, sun light, sky light probe,
+  clouds) is WGS84 with its radii moved to the exaggerated sea level, so
+  sunk terrain stays above it; `Atmosphere._update` changes the radii in
+  place, and aerial perspective and clouds reassign it every frame because
+  their setters copy it.
+  Ground-clamped points, billboards, text and polylines are horizon-culled
+  against the ellipsoid shrunk by `TerrainExaggeration::horizon_minimum_height`
+  (the exaggerated sea level, when below 0), so features seen across sunk
+  ground are kept. The GPU (`nvr_horizon_culled` reading the shared
+  `nvrHorizonMinHeight` uniform) tests the drawn position, and scales that
+  ellipsoid down further to pass through the point or the camera when either
+  lies below it, so features on ground deeper than the sea level (bathymetry,
+  or land a relative height sinks) are not hidden by the ellipsoid they are
+  under, and a camera below it culls at its own tangent plane, as the CPU
+  occluder does. The CPU pre-check for clamped points (`is_point_visible`),
+  which runs before their terrain height is known, tests the anchor (without
+  the height offset, like the GPU) at the highest possible ground
+  (`MAX_TERRAIN_HEIGHT` exaggerated) against the ellipsoid shrunk to the
+  lowest (`LOWEST_TERRAIN_HEIGHT` exaggerated), so it never drops a point the
+  GPU would keep. `terrain_height_for_tile` (raster/vector
+  SSE, falling back to the exaggerated height 0 where no terrain is rendered),
+  `compute_terrain_height_at_point` (`sampleTerrainHeight`, height observers),
+  `compute_terrain_height_by_tile_handle` (clamped points, text, billboards),
+  `terrain_height_range` (`sampleTerrainHeightRange`, range observers) and
+  `sample_terrain_height_within_extent` (non-draped clamped polylines,
+  whose caller pads the range into the extruded volume) return exaggerated
+  heights. On a change the terrain, raster and vector
+  traversals rerun, and the observer and clamp systems recompute, from
+  `Res<TerrainExaggeration>::is_changed`.
+
+Raw everywhere else is the invariant that makes this safe: worker-built
+positions, the `heights` buffers upsampling rebuilds positions from,
+`TerrainData::current_*_height`, `TerrainTile::max_height`/`min_height` (and so
+`Tile::max_height()`, which children inherit) and `Mesh::aabb`. An exaggerated
+value in any of them would be exaggerated a second time. The web side widens
+the raw `Mesh::aabb` by the largest displacement over the height range the
+geometry spans (`Mesh::min_height`/`max_height`, which a pole cap widens to
+height 0) for three.js culling (`exaggeratedTerrainBounds`) and redoes it on
+every change. `sampleTerrainMostDetailed` decodes tiles in JS, so `ThreeView`
+exaggerates its result itself (`getTerrainExaggerationForSource`). With several
+terrain layers, the engine and this lookup both use the first `TerrainLayer`
+a query yields; a source it does not render is sampled unexaggerated.
+
 ## Key files
 
 | Concern | Path |
 | --- | --- |
 | Terrain tile | `crates/navara_tile_component/src/terrain_tile.rs` |
-| Terrain height by extent | `crates/navara_tile_component/src/terrain_tile.rs` (`terrain_height_for_extent`) |
+| Terrain height for a raster/vector tile | `crates/navara_tile_component/src/terrain_tile.rs` (`terrain_height_for_tile`) |
 | Raster tile | `crates/navara_tile_component/src/raster_tile.rs` |
 | Tiling scheme / extents | `crates/navara_core/src/tiles.rs` |
 | Cross-scheme overlap | `crates/navara_core/src/tiles.rs` (`web_mercator_overlapping_tiles`, `web_mercator_lnglat_to_world_pos`) |
@@ -433,6 +687,7 @@ flowchart LR
 | Material drape (one slot per layer) | `crates/navara_tile/src/tile/system.rs` (`update_mesh_material`) |
 | Hillshade request | `crates/navara_tile/src/texture_fragment/helpers.rs` |
 | Plugin / system order | `crates/navara_tile/src/lib.rs` |
+| Terrain exaggeration | `crates/navara_tile_component/src/terrain_exaggeration.rs`, `web/navara_three/src/mesh/tile/terrainExaggeration.ts`, `shaders/glsl/chunks/terrain_exaggeration_pars_vertex.glsl` |
 
 ## WebMercator polar geometry
 

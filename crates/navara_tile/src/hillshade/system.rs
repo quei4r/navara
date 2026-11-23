@@ -20,6 +20,13 @@ use navara_tile_component::{TerrainTileQuadtree, TileTextureFragmentMarker};
 #[derive(Debug, Clone, Copy, Component)]
 pub struct HillshadeTextureMarker;
 
+/// The DEM decoder of the hillshade layer's source, captured when the
+/// hillshade DataRequester is spawned. The normal map must be decoded with it,
+/// not with the terrain's decoder: the hillshade source can differ from the
+/// terrain source, or there may be no DEM terrain at all.
+#[derive(Debug, Clone, Copy, Component)]
+pub struct HillshadeElevationDecoder(pub navara_core::ElevationDecoder);
+
 /// Marker component indicating that HillshadeBackfillEvents have been extracted
 /// Used to delay cleanup until after read_events() has accessed the data
 #[derive(Debug, Clone, Copy, Component)]
@@ -161,7 +168,12 @@ pub fn backfill_hillshade_on_loaded(
     qt: Res<TerrainTileQuadtree>,
     mut events: ResMut<EventStore>,
     query: Query<
-        (Entity, &DataRequester, &TileTextureFragmentMarker),
+        (
+            Entity,
+            &DataRequester,
+            &TileTextureFragmentMarker,
+            Option<&HillshadeElevationDecoder>,
+        ),
         (
             Changed<DataRequester>,
             With<HillshadeTextureMarker>,
@@ -184,11 +196,11 @@ pub fn backfill_hillshade_on_loaded(
     // Collect all successfully loaded hillshade entities in this frame for deduplication
     let newly_loaded_entities: std::collections::HashSet<Entity> = query
         .iter()
-        .filter(|(_, data_req, _)| data_req.is_succeeded())
-        .map(|(entity, _, _)| entity)
+        .filter(|(_, data_req, _, _)| data_req.is_succeeded())
+        .map(|(entity, _, _, _)| entity)
         .collect();
 
-    for (entity, data_req, marker) in query.iter() {
+    for (entity, data_req, marker, decoder) in query.iter() {
         // Only process successfully loaded hillshade DataRequesters
         if !data_req.is_succeeded() {
             continue;
@@ -207,6 +219,7 @@ pub fn backfill_hillshade_on_loaded(
                 original_handle: Some(data_req.handle),
                 target_entity: None,
                 edge_direction: 255,
+                elevation_decoder: decoder.map(|d| d.0),
             });
 
             extract_edges_on_first_load(&buf, data_req)
@@ -266,6 +279,7 @@ pub fn backfill_hillshade_on_loaded(
                 original_handle: None,
                 target_entity: Some(target_entity),
                 edge_direction: edge_dir,
+                elevation_decoder: None,
             });
         }
 
@@ -291,11 +305,33 @@ pub fn backfill_hillshade_on_loaded(
 /// The marker is a one-shot — consumed on emit — so no separate "already
 /// emitted" guard is needed. Texture/render-target teardown is left to
 /// `texture_fragment_removed`; this event only cancels in-flight backfill data.
+///
+/// Runs after `backfill_hillshade_on_loaded` in the same frame, so it also
+/// drops this frame's backfills aimed at a cancelled entity (the target of an
+/// edge update, the source otherwise) and frees their edge buffers: the
+/// frontend never sees them.
 pub fn emit_hillshade_canceled(
     mut commands: Commands,
     mut events: ResMut<EventStore>,
+    mut buf: ResMut<BufferStore>,
     query: Query<Entity, With<HillshadeCancelRequested>>,
+    mut backfills: Query<&mut HillshadeBackfillEvents>,
 ) {
+    if query.is_empty() {
+        return;
+    }
+    for &source in &events.hillshade_backfilled {
+        let Ok(mut backfill) = backfills.get_mut(source) else {
+            continue;
+        };
+        backfill.events.retain(|data| {
+            let stale = query.contains(data.target_entity.unwrap_or(source));
+            if stale && data.edge_data_handle >= 0 {
+                buf.remove(&data.edge_data_handle);
+            }
+            !stale
+        });
+    }
     for entity in query.iter() {
         events.hillshade_canceled.push(entity);
         commands.entity(entity).remove::<HillshadeCancelRequested>();
@@ -1051,6 +1087,7 @@ mod tests {
                         original_handle: Some(42),
                         target_entity: None,
                         edge_direction: 255,
+                        elevation_decoder: None,
                     },
                     HillshadeBackfillEventData {
                         tile_handle: 0,
@@ -1058,6 +1095,7 @@ mod tests {
                         original_handle: None,
                         target_entity: None,
                         edge_direction: 0,
+                        elevation_decoder: None,
                     },
                     HillshadeBackfillEventData {
                         tile_handle: 0,
@@ -1065,6 +1103,7 @@ mod tests {
                         original_handle: None,
                         target_entity: None,
                         edge_direction: 1,
+                        elevation_decoder: None,
                     },
                 ],
             })
@@ -1104,6 +1143,7 @@ mod tests {
 
         let mut app = App::new();
         app.init_resource::<EventStore>();
+        app.init_resource::<BufferStore>();
 
         // Marked: should emit and have the marker drained.
         let marked = app
@@ -1140,6 +1180,78 @@ mod tests {
         app.update();
         let events = app.world().resource::<EventStore>();
         assert!(events.hillshade_canceled.is_empty());
+    }
+
+    /// A backfill emitted earlier in the frame is dropped when it targets an
+    /// entity cancelled in the same frame; one targeting a live entity stays.
+    #[test]
+    fn emit_hillshade_canceled_drops_same_frame_backfills_for_cancelled_entities() {
+        use bevy_app::App;
+        use bevy_app::Update;
+
+        let mut app = App::new();
+        app.init_resource::<EventStore>();
+        app.init_resource::<BufferStore>();
+
+        let cancelled = app
+            .world_mut()
+            .spawn((Deleted, HillshadeTextureMarker, HillshadeCancelRequested))
+            .id();
+        let live = app.world_mut().spawn(HillshadeTextureMarker).id();
+        let (to_cancelled, to_live) = {
+            let mut buf = app.world_mut().resource_mut::<BufferStore>();
+            (buf.new_u8(vec![1]), buf.new_u8(vec![2]))
+        };
+        let edge = |handle, target| HillshadeBackfillEventData {
+            tile_handle: 0,
+            edge_data_handle: handle,
+            original_handle: None,
+            target_entity: Some(target),
+            edge_direction: 0,
+            elevation_decoder: None,
+        };
+        let initial = HillshadeBackfillEventData {
+            tile_handle: 0,
+            edge_data_handle: -1,
+            original_handle: Some(7),
+            target_entity: None,
+            edge_direction: 255,
+            elevation_decoder: None,
+        };
+        // `live` loaded this frame and sent an edge to each neighbor.
+        app.world_mut()
+            .entity_mut(live)
+            .insert(HillshadeBackfillEvents {
+                events: vec![edge(to_cancelled, cancelled), edge(to_live, live)],
+            });
+        // `cancelled` loaded this frame too, then was destroyed.
+        app.world_mut()
+            .entity_mut(cancelled)
+            .insert(HillshadeBackfillEvents {
+                events: vec![initial],
+            });
+        app.world_mut()
+            .resource_mut::<EventStore>()
+            .hillshade_backfilled
+            .extend([live, cancelled]);
+
+        app.add_systems(Update, emit_hillshade_canceled);
+        app.update();
+
+        let world = app.world();
+        let kept = &world.get::<HillshadeBackfillEvents>(live).unwrap().events;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].edge_data_handle, to_live);
+        assert!(
+            world
+                .get::<HillshadeBackfillEvents>(cancelled)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let buf = world.resource::<BufferStore>();
+        assert!(!buf.contains(&to_cancelled));
+        assert!(buf.contains(&to_live));
     }
 }
 

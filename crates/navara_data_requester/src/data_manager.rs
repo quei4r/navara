@@ -7,7 +7,7 @@
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::Resource;
 use navara_buffer_store::{BufferStore, Handle};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Identity of a shared fetch: a URL plus an optional HTTP byte range.
 ///
@@ -33,18 +33,32 @@ pub struct DataManager {
     url_registry: FxHashMap<RequestKey, ResourceEntry>,
     /// Maps entity to its request key for cleanup lookup
     entity_to_url: FxHashMap<Entity, RequestKey>,
+    /// Keys whose fetch leader was removed while other consumers remained;
+    /// drained by [`DataManager::promote_orphaned_leaders`].
+    orphaned: FxHashSet<RequestKey>,
 }
 
 /// Information about a shared resource.
 pub struct ResourceEntry {
     /// BufferStore handle for the shared data
     pub handle: Handle,
-    /// Number of active consumers
-    pub reference_count: usize,
-    /// Whether a fetch has been enqueued for this URL.
-    /// This prevents duplicate fetches when multiple consumers share a handle.
-    /// Reset to false if all consumers are removed before fetch completes.
-    pub fetch_enqueued: bool,
+    /// Entities currently sharing the handle.
+    pub consumers: FxHashSet<Entity>,
+    /// The consumer whose entity the fetch was dispatched for, while that
+    /// fetch is in flight. Other consumers wait on the same handle; when the
+    /// leader is removed one of them is promoted (see
+    /// [`DataManager::promote_orphaned_leaders`]). `None` once the fetch
+    /// settled or failed, so a new consumer can dispatch again.
+    pub leader: Option<Entity>,
+}
+
+/// Outcome of [`DataManager::unregister_consumer`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unregistered {
+    pub url: String,
+    pub handle: Handle,
+    /// This was the last consumer: the shared buffer can be freed.
+    pub last_consumer: bool,
 }
 
 impl DataManager {
@@ -81,39 +95,80 @@ impl DataManager {
             .entry(key.clone())
             .or_insert_with(|| ResourceEntry {
                 handle: buf.new_handle(),
-                reference_count: 0,
-                fetch_enqueued: false,
+                consumers: FxHashSet::default(),
+                leader: None,
             });
 
-        let fetch_already_enqueued = entry.fetch_enqueued;
-        entry.reference_count += 1;
+        let fetch_already_enqueued = entry.leader.is_some();
+        entry.consumers.insert(entity);
         self.entity_to_url.insert(entity, key);
 
         (entry.handle, is_new, fetch_already_enqueued)
     }
 
-    /// Unregister a consumer.
-    ///
-    /// Returns:
-    /// - `Some((url, handle, should_delete))` if the entity was registered
-    /// - `None` if the entity was not found
-    ///
-    /// The `should_delete` flag is true when this was the last consumer,
-    /// indicating the BufferStore data should be removed.
-    pub fn unregister_consumer(&mut self, entity: Entity) -> Option<(String, Handle, bool)> {
+    /// Unregister a consumer; `None` if the entity was not registered.
+    pub fn unregister_consumer(&mut self, entity: Entity) -> Option<Unregistered> {
         let key = self.entity_to_url.remove(&entity)?;
         let entry = self.url_registry.get_mut(&key)?;
 
-        entry.reference_count = entry.reference_count.saturating_sub(1);
-
+        entry.consumers.remove(&entity);
         let handle = entry.handle;
 
-        if entry.reference_count == 0 {
+        if entry.consumers.is_empty() {
             self.url_registry.remove(&key);
-            Some((key.url, handle, true))
-        } else {
-            Some((key.url, handle, false))
+            self.orphaned.remove(&key);
+            return Some(Unregistered {
+                url: key.url,
+                handle,
+                last_consumer: true,
+            });
         }
+
+        if entry.leader == Some(entity) {
+            entry.leader = None;
+            self.orphaned.insert(key.clone());
+        }
+        Some(Unregistered {
+            url: key.url,
+            handle,
+            last_consumer: false,
+        })
+    }
+
+    /// Re-elect a leader for every key whose leader was removed while other
+    /// consumers remained, and return the new leaders: each must dispatch the
+    /// fetch again. `urgency` is `None` for a consumer that is not eligible
+    /// (gone, or no longer pending on the shared fetch); among the eligible,
+    /// the smallest urgency (most urgent) wins. A key with no eligible
+    /// consumer is dropped, since a later consumer finds no leader and
+    /// dispatches by itself.
+    pub fn promote_orphaned_leaders<K: Ord>(
+        &mut self,
+        mut urgency: impl FnMut(Entity) -> Option<K>,
+    ) -> Vec<Entity> {
+        let mut promoted = Vec::new();
+        for key in self.orphaned.drain() {
+            let Some(entry) = self.url_registry.get_mut(&key) else {
+                continue;
+            };
+            if entry.leader.is_some() {
+                continue;
+            }
+            let mut next: Option<(K, Entity)> = None;
+            for &consumer in entry.consumers.iter() {
+                let Some(u) = urgency(consumer) else {
+                    continue;
+                };
+                if next.as_ref().is_none_or(|(best, _)| u < *best) {
+                    next = Some((u, consumer));
+                }
+            }
+            if let Some((_, next)) = next {
+                entry.leader = Some(next);
+                promoted.push(next);
+            }
+        }
+        promoted
     }
 
     /// Get the reference count for a URL + byte range.
@@ -124,7 +179,7 @@ impl DataManager {
         };
         self.url_registry
             .get(&key)
-            .map(|e| e.reference_count)
+            .map(|e| e.consumers.len())
             .unwrap_or(0)
     }
 
@@ -138,51 +193,36 @@ impl DataManager {
         self.url_registry.is_empty()
     }
 
-    /// Try to mark that a fetch has been enqueued for an entity's URL.
-    /// Returns true if this is the first fetch for this URL (caller should push event).
-    /// Returns false if a fetch was already enqueued (caller should skip pushing event).
-    /// This prevents duplicate fetches when multiple consumers for the same URL
-    /// are spawned in the same frame.
+    /// Make `entity` the fetch leader of its URL. Returns true if the caller
+    /// should dispatch the fetch, false if another consumer already leads it.
     ///
     /// For entities not registered in DataManager (unmanaged DataRequesters),
-    /// returns true to allow the event (fallback for tests and legacy code).
+    /// returns true to allow the event.
     pub fn try_mark_fetch_enqueued(&mut self, entity: Entity) -> bool {
         if let Some(entry) = self
             .entity_to_url
             .get(&entity)
             .and_then(|key| self.url_registry.get_mut(key))
         {
-            if entry.fetch_enqueued {
-                return false; // Already enqueued by another consumer
+            if entry.leader.is_some() {
+                return false;
             }
-            entry.fetch_enqueued = true;
-            return true; // Successfully marked as first fetch
+            entry.leader = Some(entity);
+            return true;
         }
-        // Entity not in registry - allow event (for unmanaged DataRequesters)
         true
     }
 
-    /// Reset the fetch_enqueued flag for an entity's URL.
-    /// This is called when a fetch fails, allowing future consumers to retry.
+    /// Clear the fetch leader of an entity's URL once its fetch succeeded or
+    /// failed, so a future consumer can dispatch again.
     pub fn reset_fetch_enqueued(&mut self, entity: Entity) {
         if let Some(entry) = self
             .entity_to_url
             .get(&entity)
             .and_then(|key| self.url_registry.get_mut(key))
         {
-            entry.fetch_enqueued = false;
+            entry.leader = None;
         }
-    }
-
-    /// Get the handle associated with an entity.
-    /// This works even if the entity component was deleted, as long as
-    /// the entity is still registered in DataManager. Useful for failure
-    /// broadcasting when the fetch leader might be gone.
-    pub fn get_handle_for_entity(&self, entity: Entity) -> Option<Handle> {
-        self.entity_to_url
-            .get(&entity)
-            .and_then(|key| self.url_registry.get(key))
-            .map(|entry| entry.handle)
     }
 }
 
@@ -248,12 +288,12 @@ mod tests {
         let _ = manager.register_consumer(url.clone(), None, entity2, &mut buf);
 
         // Unregister first consumer
-        let result = manager.unregister_consumer(entity1);
-        assert!(result.is_some());
-        let (returned_url, _handle, should_delete) = result.unwrap();
-        assert_eq!(returned_url, url);
-        assert!(!should_delete); // Still has one consumer
+        let result = manager.unregister_consumer(entity1).unwrap();
+        assert_eq!(result.url, url);
+        assert!(!result.last_consumer); // Still has one consumer
         assert_eq!(manager.get_ref_count(&url, None), 1);
+        // No fetch was led, so nobody is promoted.
+        assert!(manager.promote_orphaned_leaders(|_| Some(0)).is_empty());
     }
 
     #[test]
@@ -267,13 +307,126 @@ mod tests {
         let (handle, _, _) = manager.register_consumer(url.clone(), None, entity, &mut buf);
 
         // Unregister only consumer
-        let result = manager.unregister_consumer(entity);
-        assert!(result.is_some());
-        let (returned_url, returned_handle, should_delete) = result.unwrap();
-        assert_eq!(returned_url, url);
-        assert_eq!(returned_handle, handle);
-        assert!(should_delete); // Should delete
+        let result = manager.unregister_consumer(entity).unwrap();
+        assert_eq!(result.url, url);
+        assert_eq!(result.handle, handle);
+        assert!(result.last_consumer);
         assert_eq!(manager.len(), 0); // Entry removed
+    }
+
+    #[test]
+    fn test_unregister_leader_promotes_a_waiting_follower() {
+        let mut world = World::new();
+        let leader = world.spawn_empty().id();
+        let gone = world.spawn_empty().id();
+        let follower = world.spawn_empty().id();
+        let mut buf = BufferStore::default();
+        let mut manager = DataManager::new();
+
+        let url = "https://example.com/tile.png".to_string();
+        let _ = manager.register_consumer(url.clone(), None, leader, &mut buf);
+        assert!(manager.try_mark_fetch_enqueued(leader));
+        let (_, _, enqueued) = manager.register_consumer(url.clone(), None, gone, &mut buf);
+        assert!(enqueued);
+        let _ = manager.register_consumer(url.clone(), None, follower, &mut buf);
+        assert!(!manager.try_mark_fetch_enqueued(follower));
+
+        let result = manager.unregister_consumer(leader).unwrap();
+        assert!(!result.last_consumer);
+
+        // A consumer that is no longer waiting (e.g. being despawned) is
+        // never chosen, whatever the set's iteration order.
+        assert_eq!(
+            manager.promote_orphaned_leaders(|e| (e == follower).then_some(0)),
+            vec![follower]
+        );
+        assert!(!manager.try_mark_fetch_enqueued(gone));
+        // Drained: a second pass promotes nobody.
+        assert!(manager.promote_orphaned_leaders(|_| Some(0)).is_empty());
+    }
+
+    #[test]
+    fn test_promotion_prefers_the_most_urgent_consumer() {
+        let mut world = World::new();
+        let leader = world.spawn_empty().id();
+        let urgent = world.spawn_empty().id();
+        let mut buf = BufferStore::default();
+        let mut manager = DataManager::new();
+
+        let url = "https://example.com/tile.png".to_string();
+        let _ = manager.register_consumer(url.clone(), None, leader, &mut buf);
+        assert!(manager.try_mark_fetch_enqueued(leader));
+        let mut lazy = Vec::new();
+        for _ in 0..8 {
+            let e = world.spawn_empty().id();
+            let _ = manager.register_consumer(url.clone(), None, e, &mut buf);
+            lazy.push(e);
+        }
+        let _ = manager.register_consumer(url.clone(), None, urgent, &mut buf);
+        let _ = manager.unregister_consumer(leader);
+
+        assert_eq!(
+            manager.promote_orphaned_leaders(|e| Some(if e == urgent { 0 } else { 4 })),
+            vec![urgent]
+        );
+    }
+
+    #[test]
+    fn test_orphan_without_waiting_consumer_is_dropped() {
+        let mut world = World::new();
+        let leader = world.spawn_empty().id();
+        let settled = world.spawn_empty().id();
+        let next = world.spawn_empty().id();
+        let mut buf = BufferStore::default();
+        let mut manager = DataManager::new();
+
+        let url = "https://example.com/tile.png".to_string();
+        let _ = manager.register_consumer(url.clone(), None, leader, &mut buf);
+        assert!(manager.try_mark_fetch_enqueued(leader));
+        let _ = manager.register_consumer(url.clone(), None, settled, &mut buf);
+        let _ = manager.unregister_consumer(leader);
+
+        assert!(manager.promote_orphaned_leaders(|_| None::<u8>).is_empty());
+        // The key is leaderless, so a later consumer dispatches by itself.
+        let (_, _, enqueued) = manager.register_consumer(url.clone(), None, next, &mut buf);
+        assert!(!enqueued);
+        assert!(manager.try_mark_fetch_enqueued(next));
+    }
+
+    #[test]
+    fn test_orphan_with_new_leader_is_not_promoted_twice() {
+        let mut world = World::new();
+        let leader = world.spawn_empty().id();
+        let follower = world.spawn_empty().id();
+        let mut buf = BufferStore::default();
+        let mut manager = DataManager::new();
+
+        let url = "https://example.com/tile.png".to_string();
+        let _ = manager.register_consumer(url.clone(), None, leader, &mut buf);
+        assert!(manager.try_mark_fetch_enqueued(leader));
+        let _ = manager.register_consumer(url.clone(), None, follower, &mut buf);
+        let _ = manager.unregister_consumer(leader);
+
+        // A newly sent consumer took the lead before promotion ran.
+        assert!(manager.try_mark_fetch_enqueued(follower));
+        assert!(manager.promote_orphaned_leaders(|_| Some(0)).is_empty());
+    }
+
+    #[test]
+    fn test_reset_clears_the_leader() {
+        let mut world = World::new();
+        let leader = world.spawn_empty().id();
+        let next = world.spawn_empty().id();
+        let mut buf = BufferStore::default();
+        let mut manager = DataManager::new();
+
+        let url = "https://example.com/tile.png".to_string();
+        let _ = manager.register_consumer(url.clone(), None, leader, &mut buf);
+        assert!(manager.try_mark_fetch_enqueued(leader));
+        manager.reset_fetch_enqueued(leader);
+        let (_, _, enqueued) = manager.register_consumer(url.clone(), None, next, &mut buf);
+        assert!(!enqueued);
+        assert!(manager.try_mark_fetch_enqueued(next));
     }
 
     #[test]

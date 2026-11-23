@@ -1,5 +1,5 @@
 import {
-  generate_id_from_entity,
+  type JobHandler,
   PolygonMaterialLike,
   TransferablePolygonBatchedFeatureLike,
   TransferableRasterDEMDataLike,
@@ -47,11 +47,31 @@ import { runDelegatedWorkerTask } from "./workerTaskSettlement";
 
 import type { EventContext } from ".";
 
+/**
+ * Delegated worker tasks have no product: the result goes back to the engine
+ * through `triggerWorkerTaskCompleted`, and a removal only cancels the pool
+ * promise through the job's abort signal.
+ */
+export const workerTaskJobHandler = (
+  ctx: EventContext,
+): JobHandler<WorkerTaskDelegatedEvent, never, EntityEvent, undefined> => ({
+  name: "worker task",
+  events: {
+    requested: "worker_task_delegated",
+    removed: "worker_task_removed",
+  },
+  start: async (ev, abort) => {
+    await processWorkerTaskDelegatedEvent(ctx, ev, abort);
+    return undefined;
+  },
+  teardown: () => {},
+});
+
 export async function processWorkerTaskDelegatedEvent(
   ctx: EventContext,
   event: WorkerTaskDelegatedEvent,
+  abort: AbortController,
 ) {
-  const id = generate_id_from_entity(event);
   // Every wasm-bindgen getter access allocates a NEW owned wrapper (reading
   // `event.task.<kind>` twice would leak one copy), so read `task` and each
   // params object exactly once and free whatever this dispatch does not
@@ -63,7 +83,7 @@ export async function processWorkerTaskDelegatedEvent(
     if (constructTerrainMesh) {
       return await processConstructTerrainMesh(
         ctx,
-        id,
+        abort,
         event.bits,
         constructTerrainMesh,
         task.delegator_id,
@@ -73,7 +93,7 @@ export async function processWorkerTaskDelegatedEvent(
     if (upsampleTerrainMesh) {
       return await processUpsampleTerrainMesh(
         ctx,
-        id,
+        abort,
         event.bits,
         upsampleTerrainMesh,
         task.delegator_id,
@@ -83,7 +103,7 @@ export async function processWorkerTaskDelegatedEvent(
     if (constructPolygon) {
       return await processConstructPolygonBatchedFeature(
         ctx,
-        id,
+        abort,
         event.bits,
         constructPolygon,
         task.delegator_id,
@@ -93,7 +113,7 @@ export async function processWorkerTaskDelegatedEvent(
     if (constructPolyline) {
       return await processConstructPolylineBatchedFeature(
         ctx,
-        id,
+        abort,
         event.bits,
         constructPolyline,
         task.delegator_id,
@@ -103,7 +123,7 @@ export async function processWorkerTaskDelegatedEvent(
     if (parseMvt) {
       return await processParseMvtTile(
         ctx,
-        id,
+        abort,
         event.bits,
         parseMvt,
         task.delegator_id,
@@ -111,22 +131,6 @@ export async function processWorkerTaskDelegatedEvent(
     }
   } finally {
     task.free();
-  }
-}
-
-export function processWorkerTaskRemovedEvent(
-  ctx: EventContext,
-  event: EntityEvent,
-) {
-  const id = generate_id_from_entity(event);
-  const promise = ctx.workerPoolPromises.get(id);
-  if (promise) {
-    ctx.workerPoolPromises.delete(id);
-    // `cancel()` rejects the promise (CancellationError) and returns it; the
-    // rejection is observed and classified by the dispatch-side
-    // `settleWorkerTask`, so it must NOT be awaited here — awaiting would
-    // rethrow the cancellation into the event pipeline.
-    promise.cancel();
   }
 }
 
@@ -219,6 +223,9 @@ function buildTerrainTransferableGeometry(
     const skirtNormals = result.skirt_normals
       ? bufHandler.adoptF32(result.skirt_normals)
       : undefined;
+    const skirtHeights = result.skirt_heights
+      ? bufHandler.adoptF32(result.skirt_heights)
+      : undefined;
 
     if (skirtVertices != null) {
       geometry.skirt_vertices = skirtVertices;
@@ -232,6 +239,9 @@ function buildTerrainTransferableGeometry(
     if (skirtNormals != null) {
       geometry.skirt_normals = skirtNormals;
     }
+    if (skirtHeights != null) {
+      geometry.skirt_heights = skirtHeights;
+    }
   }
 
   return { geometry, heights };
@@ -239,7 +249,7 @@ function buildTerrainTransferableGeometry(
 
 async function processConstructTerrainMesh(
   ctx: EventContext,
-  id: string,
+  abort: AbortController,
   bits: bigint,
   params: ConstructTerrainMeshParameters,
   delegator_id: ReconstructableEntity,
@@ -247,7 +257,7 @@ async function processConstructTerrainMesh(
   const { buf: bufHandler, tileHandler, workerTaskHandler } = ctx;
   await runDelegatedWorkerTask(
     ctx,
-    id,
+    abort,
     bits,
     "construct terrain mesh",
     params,
@@ -261,10 +271,14 @@ async function processConstructTerrainMesh(
         return;
       }
 
+      // `getTile` hands out an owned wasm object; copy it into a plain Like
+      // and free it.
       const tile = tileHandler.getTile(params.tile_handle);
       if (!tile) {
         return;
       }
+      const tileLike = new TransferableTileLike(tile);
+      tile.free();
 
       let promise: ReturnType<
         typeof constructQuantizedMeshTerrainMesh | typeof constructTerrainMesh
@@ -272,7 +286,7 @@ async function processConstructTerrainMesh(
       if (params.isQuantizedMesh) {
         promise = constructQuantizedMeshTerrainMesh(
           bytes,
-          new TransferableTileLike(tile),
+          tileLike,
           params.skirt,
           params.skirtExaggeration,
           params.poleNorth,
@@ -289,7 +303,7 @@ async function processConstructTerrainMesh(
         }
         promise = constructTerrainMesh(
           bytes,
-          new TransferableTileLike(tile),
+          tileLike,
           new TransferableRasterDEMDataLike(elevationDecoder),
           params.tile_size,
           params.skirt,
@@ -336,9 +350,22 @@ async function processConstructTerrainMesh(
   );
 }
 
+/** Whether `ancestor` is a strict ancestor of `tile` in the quadtree. */
+function isStrictAncestor(
+  ancestor: { x: number; y: number; z: number },
+  tile: { x: number; y: number; z: number },
+): boolean {
+  const depth = tile.z - ancestor.z;
+  if (depth <= 0) return false;
+  return (
+    Math.floor(tile.x / 2 ** depth) === ancestor.x &&
+    Math.floor(tile.y / 2 ** depth) === ancestor.y
+  );
+}
+
 async function processUpsampleTerrainMesh(
   ctx: EventContext,
-  id: string,
+  abort: AbortController,
   bits: bigint,
   params: UpsampleTerrainMeshParameters,
   delegator_id: ReconstructableEntity,
@@ -346,64 +373,76 @@ async function processUpsampleTerrainMesh(
   const { buf: bufHandler, tileHandler, workerTaskHandler } = ctx;
   await runDelegatedWorkerTask(
     ctx,
-    id,
+    abort,
     bits,
     "upsample terrain mesh",
     params,
     delegator_id,
     async (task) => {
+      // `getTile` hands out owned wasm objects; copy them into plain Likes
+      // and free them.
       const tile = tileHandler.getTile(params.tile_handle);
       if (!tile) {
         return;
       }
-      const parentTile = tileHandler.getParentTile(params.tile_handle);
-      if (!parentTile) {
+      const tileLike = new TransferableTileLike(tile);
+      tile.free();
+      // The source is the nearest ready ancestor (not necessarily the
+      // parent); Rust walks the quadrant path from it down to the tile.
+      const sourceTile = tileHandler.getTile(params.source_tile_handle);
+      if (!sourceTile) {
         return;
       }
-
-      const cachedMeshHandle = parentTile.cached_mesh_handle;
-      if (!cachedMeshHandle || !cachedMeshHandle.heights) {
+      const sourceLike = new TransferableTileLike(sourceTile);
+      sourceTile.free();
+      if (!isStrictAncestor(sourceLike.coords, tileLike.coords)) {
+        // The tiling was rebuilt after the task was queued (a terrain source
+        // switch): the handle now names some unrelated tile.
         return;
       }
-
-      // buf.* return short-lived views into WASM memory; copy them since the
-      // parent geometry is sent to the worker (a view's buffer is the whole
-      // WASM memory and is not transferable).
-      const parentUvs = bufHandler.f32(cachedMeshHandle.uvs)?.slice();
-      const parentIndices = bufHandler.u32(cachedMeshHandle.indices)?.slice();
-      const parentHeights = bufHandler.f32(cachedMeshHandle.heights)?.slice();
-      if (!parentUvs || !parentIndices || !parentHeights) {
-        return;
-      }
-
-      const parentNormalsHandle = cachedMeshHandle.normals;
-      const parentNormals =
-        parentNormalsHandle != null
-          ? bufHandler.f32(parentNormalsHandle)?.slice()
-          : undefined;
-
-      const parentWatermaskHandle = cachedMeshHandle.watermask;
-      const parentWatermask =
-        parentWatermaskHandle != null
-          ? bufHandler.u8(parentWatermaskHandle)?.slice()
-          : undefined;
-
-      const upsamplableTerrainGeometry = new UpsamplableTerrainGeometryLike(
-        parentUvs,
-        parentIndices,
-        parentHeights,
-        parentNormals,
-        parentWatermask,
-      );
 
       let promise: ReturnType<
         typeof upsampleQuantizedMeshTerrainMesh | typeof upsampleTerrainMesh
       >;
       if (params.isQuantizedMesh) {
+        // Quantized mesh: clip the source's TIN down to the tile.
+        const cachedMeshHandle = sourceLike.cached_mesh_handle;
+        if (!cachedMeshHandle || cachedMeshHandle.heights == null) {
+          return;
+        }
+
+        // buf.* return short-lived views into WASM memory; copy them since the
+        // source geometry is sent to the worker (a view's buffer is the whole
+        // WASM memory and is not transferable).
+        const sourceUvs = bufHandler.f32(cachedMeshHandle.uvs)?.slice();
+        const sourceIndices = bufHandler.u32(cachedMeshHandle.indices)?.slice();
+        const sourceHeights = bufHandler.f32(cachedMeshHandle.heights)?.slice();
+        if (!sourceUvs || !sourceIndices || !sourceHeights) {
+          return;
+        }
+
+        const sourceNormalsHandle = cachedMeshHandle.normals;
+        const sourceNormals =
+          sourceNormalsHandle != null
+            ? bufHandler.f32(sourceNormalsHandle)?.slice()
+            : undefined;
+
+        const sourceWatermaskHandle = cachedMeshHandle.watermask;
+        const sourceWatermask =
+          sourceWatermaskHandle != null
+            ? bufHandler.u8(sourceWatermaskHandle)?.slice()
+            : undefined;
+
         promise = upsampleQuantizedMeshTerrainMesh(
-          new TransferableTileLike(tile),
-          new TransferableTileLike(parentTile),
-          upsamplableTerrainGeometry,
+          tileLike,
+          sourceLike,
+          new UpsamplableTerrainGeometryLike(
+            sourceUvs,
+            sourceIndices,
+            sourceHeights,
+            sourceNormals,
+            sourceWatermask,
+          ),
           params.skirt,
           params.skirtExaggeration,
           params.poleNorth,
@@ -412,17 +451,33 @@ async function processUpsampleTerrainMesh(
           params.tms,
         );
       } else {
+        // Raster DEM: resample the source's DEM pixels instead of clipping
+        // its simplified mesh, so the tile meshes at its own error tolerance
+        // and looks like a lower-resolution real tile rather than a coarser
+        // one. The source is always a real-DEM ancestor (see
+        // `TerrainTile::find_upsample_source`).
         const elevationDecoder = tileHandler.getTileElevationDecoder(
           params.tile_handle,
         );
         if (!elevationDecoder) {
           return;
         }
+        const bytesHandle = tileHandler.getTerrainDemBytes(
+          params.source_tile_handle,
+        );
+        // buf.u8 is a short-lived view into WASM memory; copy it since the
+        // bytes are transferred to the worker.
+        const sourceBytes =
+          bytesHandle != null ? bufHandler.u8(bytesHandle)?.slice() : undefined;
+        if (!sourceBytes) {
+          return;
+        }
         promise = upsampleTerrainMesh(
-          new TransferableTileLike(tile),
-          new TransferableTileLike(parentTile),
+          tileLike,
+          sourceLike,
           new TransferableRasterDEMDataLike(elevationDecoder),
-          upsamplableTerrainGeometry,
+          sourceBytes,
+          params.tile_size,
           params.skirt,
           params.skirtExaggeration,
           params.poleNorth,
@@ -469,7 +524,7 @@ async function processUpsampleTerrainMesh(
 
 async function processConstructPolygonBatchedFeature(
   ctx: EventContext,
-  id: string,
+  abort: AbortController,
   bits: bigint,
   params: ConstructPolygonBatchedFeatureParameters,
   delegator_id: ReconstructableEntity,
@@ -477,7 +532,7 @@ async function processConstructPolygonBatchedFeature(
   const { buf: bufHandler, featureHandler, workerTaskHandler } = ctx;
   await runDelegatedWorkerTask(
     ctx,
-    id,
+    abort,
     bits,
     "construct polygon batched feature",
     params,
@@ -690,7 +745,7 @@ async function processConstructPolygonBatchedFeature(
 
 async function processConstructPolylineBatchedFeature(
   ctx: EventContext,
-  id: string,
+  abort: AbortController,
   bits: bigint,
   params: ConstructPolylineBatchedFeatureParameters,
   delegator_id: ReconstructableEntity,
@@ -698,7 +753,7 @@ async function processConstructPolylineBatchedFeature(
   const { buf: bufHandler, featureHandler, workerTaskHandler } = ctx;
   await runDelegatedWorkerTask(
     ctx,
-    id,
+    abort,
     bits,
     "construct polyline batched feature",
     params,
@@ -764,8 +819,10 @@ async function processConstructPolylineBatchedFeature(
       const startLow = result.start_low
         ? registered.register(bufHandler.adoptF32(result.start_low))
         : undefined;
-      const startNormals = result.start_normals
-        ? registered.register(bufHandler.adoptF32(result.start_normals))
+      const startNormals = result.start_normal_and_length_high
+        ? registered.register(
+            bufHandler.adoptF32(result.start_normal_and_length_high),
+          )
         : undefined;
       const forwardOffset = result.forward_offset
         ? registered.register(bufHandler.adoptF32(result.forward_offset))
@@ -776,29 +833,32 @@ async function processConstructPolylineBatchedFeature(
       const endLow = result.end_low
         ? registered.register(bufHandler.adoptF32(result.end_low))
         : undefined;
-      const endNormalAndTextureCoordinateNormalizationX =
-        result.end_normal_and_texture_coordinate_normalization_x
-          ? registered.register(
-              bufHandler.adoptF32(
-                result.end_normal_and_texture_coordinate_normalization_x,
-              ),
-            )
-          : undefined;
-      const rightNormalAndTextureCoordinateNormalizationY = registered.register(
-        bufHandler.adoptF32(
-          result.right_normal_and_texture_coordinate_normalization_y,
-        ),
+      const endNormalAndSegmentLength = result.end_normal_and_segment_length
+        ? registered.register(
+            bufHandler.adoptF32(result.end_normal_and_segment_length),
+          )
+        : undefined;
+      const rightNormalAndLineLength = registered.register(
+        bufHandler.adoptF32(result.right_normal_and_line_length),
       );
       const batchId = registered.register(bufHandler.newF32(result.batch_id));
       const batchIndex = registered.register(
         bufHandler.adoptU32(result.batch_index),
       );
       const indices = registered.register(bufHandler.adoptU32(result.indices));
+      const lineSegments = result.line_segments
+        ? registered.register(bufHandler.adoptF32(result.line_segments))
+        : undefined;
+      const lineDistanceAndEnds = result.line_distance_and_ends
+        ? registered.register(
+            bufHandler.adoptF32(result.line_distance_and_ends),
+          )
+        : undefined;
       if (
         !batchId ||
         !batchIndex ||
         !position ||
-        !rightNormalAndTextureCoordinateNormalizationY ||
+        !rightNormalAndLineLength ||
         !indices
       ) {
         registered.free();
@@ -847,7 +907,7 @@ async function processConstructPolylineBatchedFeature(
       const transferableStartNormals = startNormals
         ? new TransferableFloatAttribute(
             startNormals,
-            result.start_normals_size ?? 0,
+            result.start_normal_and_length_high_size ?? 0,
           )
         : undefined;
       const transferableForwardOffset = forwardOffset
@@ -856,18 +916,16 @@ async function processConstructPolylineBatchedFeature(
             result.forward_offset_size ?? 0,
           )
         : undefined;
-      const transferableEndNormalAndTextureCoordinateNormalizationX =
-        endNormalAndTextureCoordinateNormalizationX
-          ? new TransferableFloatAttribute(
-              endNormalAndTextureCoordinateNormalizationX,
-              result.end_normal_and_texture_coordinate_normalization_x_size ??
-                0,
-            )
-          : undefined;
-      const transferableRightNormalAndTextureCoordinateNormalizationY =
+      const transferableEndNormalAndSegmentLength = endNormalAndSegmentLength
+        ? new TransferableFloatAttribute(
+            endNormalAndSegmentLength,
+            result.end_normal_and_segment_length_size ?? 0,
+          )
+        : undefined;
+      const transferableRightNormalAndLineLength =
         new TransferableFloatAttribute(
-          rightNormalAndTextureCoordinateNormalizationY,
-          result.right_normal_and_texture_coordinate_normalization_y_size,
+          rightNormalAndLineLength,
+          result.right_normal_and_line_length_size,
         );
 
       const geometry = new TransferablePolylineGeometry(
@@ -881,11 +939,17 @@ async function processConstructPolylineBatchedFeature(
         transferableEndHigh,
         transferableEndLow,
         transferableStartNormals,
-        transferableEndNormalAndTextureCoordinateNormalizationX,
-        transferableRightNormalAndTextureCoordinateNormalizationY,
+        transferableEndNormalAndSegmentLength,
+        transferableRightNormalAndLineLength,
         transferableBatchId,
         transferableBatchIndex,
         indices,
+        lineSegments
+          ? new TransferableFloatAttribute(lineSegments, 4)
+          : undefined,
+        lineDistanceAndEnds
+          ? new TransferableFloatAttribute(lineDistanceAndEnds, 4)
+          : undefined,
       );
 
       const extent = result.extent;
@@ -914,7 +978,7 @@ async function processConstructPolylineBatchedFeature(
 
 async function processParseMvtTile(
   ctx: EventContext,
-  id: string,
+  abort: AbortController,
   bits: bigint,
   params: ParseMvtTileParameters,
   delegator_id: ReconstructableEntity,
@@ -922,7 +986,7 @@ async function processParseMvtTile(
   const { buf: bufHandler, workerTaskHandler } = ctx;
   await runDelegatedWorkerTask(
     ctx,
-    id,
+    abort,
     bits,
     "parse MVT tile",
     params,

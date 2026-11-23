@@ -1,10 +1,6 @@
-import { Color } from "three";
+import { Color, MathUtils } from "three";
 
-import {
-  sdfRadiusFor,
-  type SdfTextBaseProps,
-  type SdfTextBaseState,
-} from "./types";
+import type { SdfTextBaseProps, SdfTextBaseState } from "./types";
 
 const hexToColor = (hex: number): Color => {
   return new Color().setHex(hex);
@@ -15,12 +11,17 @@ export const DEFAULT_BASE_PROPS: Required<
 > = {
   useRTE: false,
   useMsdf: false,
-  center: [0.5, 0.0],
+  linePlacement: false,
+  pathSamples: 0,
+  flatFacing: false,
+  rotateWithCamera: true,
+  rotation: 0,
   sizeInMeters: true,
+  lineOffset: 0,
+  translate: [0, 0],
+  translateViewport: false,
+  spreadGlyphs: false,
   offsetDepth: true,
-  outlineWidth: 0,
-  outlineColor: 0x000000,
-  outlineOpacity: 1.0,
   showBackground: false,
   backgroundColor: 0xff0000,
   backgroundOutlineColor: 0xff0000,
@@ -30,6 +31,7 @@ export const DEFAULT_BASE_PROPS: Required<
   emissiveColor: 0,
   emissiveIntensity: 0,
   depthTest: true,
+  backfaceCulling: false,
   transparent: true,
 };
 
@@ -37,13 +39,17 @@ export const DEFAULT_BASE_PROPS: Required<
 export const DEFAULT_BASE_STATE: SdfTextBaseState = {
   useRTE: DEFAULT_BASE_PROPS.useRTE,
   useMsdf: DEFAULT_BASE_PROPS.useMsdf,
-  center: DEFAULT_BASE_PROPS.center,
+  linePlacement: DEFAULT_BASE_PROPS.linePlacement,
+  pathSamples: DEFAULT_BASE_PROPS.pathSamples,
+  flatFacing: DEFAULT_BASE_PROPS.flatFacing,
+  rotateWithCamera: DEFAULT_BASE_PROPS.rotateWithCamera,
+  rotation: DEFAULT_BASE_PROPS.rotation * MathUtils.DEG2RAD,
   sizeInMeters: DEFAULT_BASE_PROPS.sizeInMeters,
+  lineOffset: DEFAULT_BASE_PROPS.lineOffset,
+  translate: DEFAULT_BASE_PROPS.translate,
+  translateViewport: DEFAULT_BASE_PROPS.translateViewport,
+  spreadGlyphs: DEFAULT_BASE_PROPS.spreadGlyphs,
   offsetDepth: DEFAULT_BASE_PROPS.offsetDepth,
-  outlineWidth:
-    DEFAULT_BASE_PROPS.outlineWidth / sdfRadiusFor(DEFAULT_BASE_PROPS.useMsdf),
-  outlineColor: hexToColor(DEFAULT_BASE_PROPS.outlineColor),
-  outlineOpacity: DEFAULT_BASE_PROPS.outlineOpacity,
   showBackground: DEFAULT_BASE_PROPS.showBackground,
   backgroundColor: hexToColor(DEFAULT_BASE_PROPS.backgroundColor),
   backgroundOutlineColor: hexToColor(DEFAULT_BASE_PROPS.backgroundOutlineColor),
@@ -53,6 +59,7 @@ export const DEFAULT_BASE_STATE: SdfTextBaseState = {
   emissiveColor: DEFAULT_BASE_PROPS.emissiveColor,
   emissiveIntensity: DEFAULT_BASE_PROPS.emissiveIntensity,
   depthTest: DEFAULT_BASE_PROPS.depthTest,
+  backfaceCulling: DEFAULT_BASE_PROPS.backfaceCulling,
   transparent: DEFAULT_BASE_PROPS.transparent,
 };
 
@@ -69,19 +76,22 @@ export const updateState = (
     // Immutable after mount
     useRTE: currentState.useRTE,
     useMsdf: currentState.useMsdf,
+    linePlacement: currentState.linePlacement,
+    pathSamples: currentState.pathSamples,
     // Mutable
-    center: props.center ?? currentState.center,
+    flatFacing: props.flatFacing ?? currentState.flatFacing,
+    rotateWithCamera: props.rotateWithCamera ?? currentState.rotateWithCamera,
+    rotation:
+      props.rotation !== undefined
+        ? props.rotation * MathUtils.DEG2RAD
+        : currentState.rotation,
     sizeInMeters: props.sizeInMeters ?? currentState.sizeInMeters,
+    lineOffset: props.lineOffset ?? currentState.lineOffset,
+    translate: props.translate ?? currentState.translate,
+    translateViewport:
+      props.translateViewport ?? currentState.translateViewport,
+    spreadGlyphs: props.spreadGlyphs ?? currentState.spreadGlyphs,
     offsetDepth: props.offsetDepth ?? currentState.offsetDepth,
-    outlineWidth:
-      props.outlineWidth !== undefined
-        ? props.outlineWidth / sdfRadiusFor(currentState.useMsdf)
-        : currentState.outlineWidth,
-    outlineColor:
-      props.outlineColor !== undefined
-        ? hexToColor(props.outlineColor)
-        : currentState.outlineColor,
-    outlineOpacity: props.outlineOpacity ?? currentState.outlineOpacity,
     showBackground: props.showBackground ?? currentState.showBackground,
     backgroundColor:
       props.backgroundColor !== undefined
@@ -99,6 +109,7 @@ export const updateState = (
     emissiveIntensity:
       props.emissiveIntensity ?? currentState.emissiveIntensity,
     depthTest: props.depthTest ?? currentState.depthTest,
+    backfaceCulling: props.backfaceCulling ?? currentState.backfaceCulling,
     transparent: props.transparent ?? currentState.transparent,
   };
 };

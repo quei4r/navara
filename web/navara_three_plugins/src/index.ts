@@ -40,3 +40,39 @@ export {
   type TileJsonLoadedEvent,
   type TileJsonPluginEventMap,
 } from "./TileJsonPlugin";
+
+// The schema itself is @navaramap/material-schema.
+export {
+  MaterialSchemaPlugin,
+  type FieldState,
+  type LayerStyle,
+  type MaterialState,
+} from "./MaterialSchemaPlugin";
+
+// Development-only tools (tweakpane panels); see the README.
+export * from "./devtools";
+export {
+  StreetLightsPlugin,
+  isRoadClass,
+  type StreetLightsConfig,
+  type StreetLightsRoads,
+  type StreetLightsBuildings,
+  type StreetLightsStartOptions,
+  type StreetLightsSource,
+  type StreetLightsPart,
+  type StreetLightsUpdate,
+  type Oneway,
+  type RoadClass,
+  type RoadReader,
+  type RoadsReading,
+  type BuildingReader,
+} from "./StreetLightsPlugin";
+
+export {
+  StreetTrafficMeshDesc,
+  type StreetTrafficData,
+  type StreetTrafficOptions,
+  type StreetTrafficMeshConfig,
+  type StreetTrafficMeshUpdate,
+  type StreetTrafficDescriptions,
+} from "./StreetLightsPlugin/StreetTrafficMeshDesc";

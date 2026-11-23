@@ -1,0 +1,38 @@
+{
+  "name": "@navaramap/maplibre-style-integration-test",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Render tests comparing MapLibreStylePlugin output against maplibre-gl-js render test fixtures",
+  "scripts": {
+    "dev": "vite",
+    "test:maplibre": "playwright test",
+    "report": "tsx render/report.ts",
+    "build": "pnpm type-check",
+    "type-check": "tsc",
+    "lint": "eslint . --fix",
+    "lint:check": "eslint .",
+    "format": "prettier --write --ignore-path ../../../.gitignore --ignore-path ../../../.prettierignore --ignore-path .gitignore .",
+    "format:check": "prettier --check --ignore-path ../../../.gitignore --ignore-path ../../../.prettierignore --ignore-path .gitignore ."
+  },
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {
+    "@navaramap/engine": "workspace:*",
+    "@navaramap/engine-api": "workspace:*",
+    "@navaramap/engine-worker": "workspace:*",
+    "@navaramap/maplibre-style": "workspace:*",
+    "@navaramap/three": "workspace:*",
+    "@navaramap/three-default-plugin": "workspace:*",
+    "postprocessing": "6.39.6",
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@maplibre/maplibre-gl-style-spec": "26.6.0",
+    "@playwright/test": "1.65.0",
+    "@types/node": "26.6.6",
+    "@types/three": "0.187.0",
+    "pixelmatch": "8.0.0",
+    "sharp": "0.35.5",
+    "tsx": "4.23.15"
+  }
+}

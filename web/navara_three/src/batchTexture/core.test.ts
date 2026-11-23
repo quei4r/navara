@@ -4,9 +4,11 @@ import { describe, expect, test } from "vitest";
 import {
   flushBatchTextureUpdates,
   getBatchDataTexture,
+  packOrientation,
   packShowOpacity,
   readBatchScalar,
   readBatchShowOpacity,
+  unpackOrientation,
   unpackShowOpacity,
   updateBatchAttribute,
 } from "./core";
@@ -205,6 +207,18 @@ describe("lazy allocation", () => {
     expect(data[batchBaseIndex(6, 1, 5, 0) + 1]).toBe(-1);
   });
 
+  test("lineDash leaves untouched batches on the solid row", () => {
+    const { material } = setupBatchMaterial(6, ["lineDash"]);
+    updateBatchAttribute(material, 2, "lineDash", 3);
+
+    expect(material.userData.defines.USE_BATCH_LINE_DASH).toBeDefined();
+    const texture = getBatchDataTexture(material);
+    invariant(texture);
+    const data = texture.image.data as Float32Array;
+    expect(data[batchBaseIndex(6, 1, 2, 0)]).toBe(3);
+    expect(data[batchBaseIndex(6, 1, 5, 0)]).toBe(0);
+  });
+
   test("ignores scalars outside the capability list and leaves the define unset", () => {
     // Polyline-style capabilities: no extrudedHeight. Setting the attribute
     // must be a no-op — enabling USE_BATCH_EXTRUDED_HEIGHT would reference
@@ -295,6 +309,82 @@ describe("emissive", () => {
 
     expect(getBatchDataTexture(material)).toBeUndefined();
     expect(material.userData.defines?.USE_BATCH_EMISSIVE).toBeUndefined();
+  });
+});
+
+describe("outline", () => {
+  const readOutline = (
+    data: Float32Array,
+    defines: Record<string, string>,
+    batchId: number,
+  ) => {
+    const scalar = (suffix: string) =>
+      data[
+        batchBaseIndex(
+          4,
+          1,
+          batchId,
+          Number(defines[`BATCHED_TEXTURE_ROW_OUTLINE_${suffix}`]),
+        ) + Number(defines[`BATCHED_TEXTURE_COMP_OUTLINE_${suffix}`])
+      ];
+    const colorBase = batchBaseIndex(
+      4,
+      1,
+      batchId,
+      Number(defines.BATCHED_TEXTURE_ROW_OUTLINE_COLOR),
+    );
+    return [
+      data[colorBase],
+      data[colorBase + 1],
+      data[colorBase + 2],
+      scalar("OPACITY"),
+      scalar("WIDTH"),
+      scalar("BLUR"),
+    ];
+  };
+
+  test("one write allocates the color row and its three scalars together", () => {
+    const { material } = setupBatchMaterial(4, [], ["color", "outlineColor"]);
+    updateBatchAttribute(material, 1, "outline", [1, 0.5, 0, 0.8, 0.2, 0.1]);
+
+    const texture = getBatchDataTexture(material);
+    invariant(texture);
+    // color rgb + opacity fill one row; width and blur open a second.
+    expect(texture.image.height).toBe(2);
+    const defines = material.userData.defines;
+    expect(defines.USE_BATCH_OUTLINE).toBe(true);
+
+    const data = texture.image.data as Float32Array;
+    const written = readOutline(data, defines, 1);
+    expect(written.map((v) => Math.fround(v))).toEqual(
+      [1, 0.5, 0, 0.8, 0.2, 0.1].map(Math.fround),
+    );
+    // Untouched features draw no outline: black, opaque, zero width and blur.
+    expect(readOutline(data, defines, 3)).toEqual([0, 0, 0, 1, 0, 0]);
+  });
+
+  test("non-finite components fall back to the defaults", () => {
+    const { material } = setupBatchMaterial(4, [], ["color", "outlineColor"]);
+    updateBatchAttribute(material, 0, "outline", [NaN, 0, 0, NaN, NaN, NaN]);
+
+    const texture = getBatchDataTexture(material);
+    invariant(texture);
+    expect(
+      readOutline(
+        texture.image.data as Float32Array,
+        material.userData.defines,
+        0,
+      ),
+    ).toEqual([0, 0, 0, 1, 0, 0]);
+  });
+
+  test("is ignored for mesh types without the capability", () => {
+    const { material } = setupBatchMaterial(4, [], ["color", "emissive"]);
+    expect(
+      updateBatchAttribute(material, 1, "outline", [1, 1, 1, 1, 1, 1]),
+    ).toBe(false);
+    expect(getBatchDataTexture(material)).toBeUndefined();
+    expect(material.userData.defines?.USE_BATCH_OUTLINE).toBeUndefined();
   });
 });
 
@@ -470,5 +560,190 @@ describe("flushBatchTextureUpdates", () => {
     updateBatchAttribute(material, 1, "height", 2);
     updateBatchAttribute(material, 2, "height", 3);
     expect(texture.version).toBe(versionBefore);
+  });
+});
+
+describe("packOrientation / unpackOrientation", () => {
+  test("round-trips all eight combinations", () => {
+    for (const flatFacing of [false, true]) {
+      for (const rotateWithCamera of [false, true]) {
+        for (const spreadGlyphs of [false, true]) {
+          expect(
+            unpackOrientation(
+              packOrientation(flatFacing, rotateWithCamera, spreadGlyphs),
+            ),
+          ).toEqual({ flatFacing, rotateWithCamera, spreadGlyphs });
+        }
+      }
+    }
+  });
+
+  test("packs to exact floats so the thresholds are never borderline", () => {
+    expect(packOrientation(false, false)).toBe(0);
+    expect(packOrientation(false, true)).toBe(1);
+    expect(packOrientation(true, false)).toBe(2);
+    expect(packOrientation(true, true)).toBe(3);
+    expect(packOrientation(true, true, true)).toBe(7);
+  });
+});
+
+describe("orientation and rotation attributes", () => {
+  const SPRITE_SCALARS = ["height", "size", "rotation", "orientation"] as const;
+
+  test("the two orientation booleans share one component", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    updateBatchAttribute(material, 1, "flatFacing", true);
+    updateBatchAttribute(material, 1, "rotateWithCamera", false);
+
+    const texture = getBatchDataTexture(material);
+    invariant(texture);
+    // One attribute row, not two: the pair packs into a single component.
+    expect(texture.image.height).toBe(1);
+
+    const defines = material.userData.defines;
+    expect(defines.USE_BATCH_ORIENTATION).toBe(true);
+    expect(readBatchScalar(material, 1, "orientation")).toBe(
+      packOrientation(true, false),
+    );
+  });
+
+  test("writing one boolean preserves the other", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    updateBatchAttribute(material, 0, "rotateWithCamera", false);
+    updateBatchAttribute(material, 0, "flatFacing", true);
+
+    const { flatFacing, rotateWithCamera } = unpackOrientation(
+      readBatchScalar(material, 0, "orientation") ?? NaN,
+    );
+    expect(flatFacing).toBe(true);
+    expect(rotateWithCamera).toBe(false);
+  });
+
+  test("spreadGlyphs shares the component and preserves the other two", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    updateBatchAttribute(material, 0, "flatFacing", true);
+    updateBatchAttribute(material, 0, "rotateWithCamera", false);
+    updateBatchAttribute(material, 0, "spreadGlyphs", true);
+    updateBatchAttribute(material, 0, "flatFacing", false);
+
+    expect(
+      unpackOrientation(readBatchScalar(material, 0, "orientation") ?? NaN),
+    ).toEqual({
+      flatFacing: false,
+      rotateWithCamera: false,
+      spreadGlyphs: true,
+    });
+    // A new slot backfills the material's value for features nobody styled.
+    const { material: other } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    updateBatchAttribute(other, 0, "spreadGlyphs", false, {
+      rotation: 0,
+      flatFacing: false,
+      rotateWithCamera: true,
+      spreadGlyphs: true,
+    });
+    expect(
+      unpackOrientation(readBatchScalar(other, 1, "orientation") ?? NaN)
+        .spreadGlyphs,
+    ).toBe(true);
+  });
+
+  test("rotation stores per-feature radians independently", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    updateBatchAttribute(material, 0, "rotation", Math.PI / 2);
+    updateBatchAttribute(material, 3, "rotation", Math.PI);
+
+    expect(readBatchScalar(material, 0, "rotation")).toBeCloseTo(Math.PI / 2);
+    expect(readBatchScalar(material, 3, "rotation")).toBeCloseTo(Math.PI);
+    // Untouched features keep the backfilled material default.
+    expect(readBatchScalar(material, 1, "rotation")).toBe(0);
+  });
+
+  test("a new slot backfills the material defaults the mesh passes", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    const defaults = {
+      rotation: Math.PI / 4,
+      flatFacing: true,
+      rotateWithCamera: false,
+    };
+    updateBatchAttribute(material, 0, "rotation", Math.PI, defaults);
+    updateBatchAttribute(material, 0, "flatFacing", false, defaults);
+
+    // Untouched features hold the material values, not the fixed defaults.
+    expect(readBatchScalar(material, 2, "rotation")).toBeCloseTo(Math.PI / 4);
+    expect(readBatchScalar(material, 2, "orientation")).toBe(
+      packOrientation(true, false),
+    );
+    // The written feature keeps its own value, the other boolean backfilled.
+    expect(readBatchScalar(material, 0, "rotation")).toBeCloseTo(Math.PI);
+    expect(readBatchScalar(material, 0, "orientation")).toBe(
+      packOrientation(false, false),
+    );
+  });
+
+  test("a mesh type that declares no support ignores the write", () => {
+    // Polygon capabilities: no rotation / orientation receivers in its shaders.
+    const { material } = setupBatchMaterial(4);
+    expect(updateBatchAttribute(material, 0, "rotation", 1)).toBe(false);
+    expect(updateBatchAttribute(material, 0, "flatFacing", true)).toBe(false);
+    // Rejected before any allocation, so no texture and no defines exist.
+    expect(getBatchDataTexture(material)).toBeUndefined();
+    expect(material.userData.defines).toBeUndefined();
+  });
+});
+
+describe("anchor and offset attributes", () => {
+  const SPRITE_SCALARS = [
+    "height",
+    "size",
+    "rotation",
+    "orientation",
+    "anchor",
+    "offsetX",
+    "offsetY",
+  ] as const;
+  const defaults = {
+    rotation: 0,
+    flatFacing: false,
+    rotateWithCamera: true,
+    anchor: 7,
+    offset: [3, -4] as const,
+  };
+
+  test("a new anchor slot backfills the material's anchor code", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    expect(updateBatchAttribute(material, 1, "anchor", 0, defaults)).toBe(true);
+
+    expect(material.userData.defines.USE_BATCH_ANCHOR).toBe(true);
+    expect(readBatchScalar(material, 1, "anchor")).toBe(0);
+    expect(readBatchScalar(material, 2, "anchor")).toBe(7);
+  });
+
+  test("the offset halves are allocated and backfilled together", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    updateBatchAttribute(material, 0, "offset", [10, 20], defaults);
+
+    expect(material.userData.defines.USE_BATCH_OFFSET).toBe(true);
+    expect(readBatchScalar(material, 0, "offsetX")).toBe(10);
+    expect(readBatchScalar(material, 0, "offsetY")).toBe(20);
+    expect(readBatchScalar(material, 3, "offsetX")).toBe(3);
+    expect(readBatchScalar(material, 3, "offsetY")).toBe(-4);
+  });
+
+  test("a non-finite offset component falls back to zero", () => {
+    const { material } = setupBatchMaterial(4, [...SPRITE_SCALARS]);
+    updateBatchAttribute(material, 0, "offset", [Number.NaN, 5]);
+    expect(readBatchScalar(material, 0, "offsetX")).toBe(0);
+    expect(readBatchScalar(material, 0, "offsetY")).toBe(5);
+  });
+
+  test("text does not declare the slots, so the write is ignored", () => {
+    const { material } = setupBatchMaterial(4, [
+      "height",
+      "size",
+      "rotation",
+      "orientation",
+    ]);
+    expect(updateBatchAttribute(material, 0, "anchor", 0)).toBe(false);
+    expect(updateBatchAttribute(material, 0, "offset", [1, 1])).toBe(false);
   });
 });

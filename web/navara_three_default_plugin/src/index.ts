@@ -20,10 +20,15 @@ import {
   PlaneMeshDesc,
   GLTFModelDesc,
   SplatMeshDesc,
+  Text3DMeshDesc,
   AxesHelperDesc,
   ArrowHelperDesc,
   ArclineMeshDesc,
   SmoothLineMeshDesc,
+  PolygonMeshDesc,
+  PolylineMeshDesc,
+  type PolygonMeshConfig,
+  type PolylineMeshConfig,
   type RainMeshConfig,
   type SnowMeshConfig,
   type SkyMeshConfig,
@@ -37,6 +42,7 @@ import {
   type PlaneMeshConfig,
   type GLTFModelConfig,
   type SplatMeshConfig,
+  type Text3DMeshConfig,
   type AxesHelperConfig,
   type ArrowHelperConfig,
   type ArclineMeshConfig,
@@ -52,6 +58,7 @@ import {
   InstancedGltfModelMeshDesc,
   type InstancedGltfModelMeshConfig,
   AerialPerspectiveEffectDesc,
+  BuildingWindowsEffectDesc,
   CloudsEffectDesc,
   ColorGradingLUTEffectDesc,
   DepthOfFieldEffectDesc,
@@ -66,6 +73,7 @@ import {
   SSREffectDesc,
   ToneMappingEffectDesc,
   type AerialPerspectiveConfig,
+  type BuildingWindowsConfig,
   type CloudsConfig,
   type ColorGradingLUTConfig,
   type DepthOfFieldConfig,
@@ -112,9 +120,12 @@ export class DefaultPlugin extends Plugin<
     view.registerMesh("plane", PlaneMeshDesc);
     view.registerMesh("gltfModel", GLTFModelDesc);
     view.registerMesh("splat", SplatMeshDesc);
+    view.registerMesh("text3D", Text3DMeshDesc);
     view.registerMesh("axesHelper", AxesHelperDesc);
     view.registerMesh("arrowHelper", ArrowHelperDesc);
     view.registerMesh("arcLines", ArclineMeshDesc);
+    view.registerMesh("polygon", PolygonMeshDesc);
+    view.registerMesh("polyline", PolylineMeshDesc);
     view.registerMesh("smoothLines", SmoothLineMeshDesc);
     view.registerMesh("boxes", InstancedBoxMeshDesc);
     view.registerMesh("spheres", InstancedSphereMeshDesc);
@@ -130,6 +141,7 @@ export class DefaultPlugin extends Plugin<
 
     // Register effects
     view.registerEffect("aerialPerspective", AerialPerspectiveEffectDesc);
+    view.registerEffect("buildingWindows", BuildingWindowsEffectDesc);
     view.registerEffect("rainDrop", RainDropEffectDesc);
     view.registerEffect("selectiveBloom", SelectiveBloomEffectDesc);
     view.registerEffect("selectiveOutline", SelectiveOutlineEffectDesc);
@@ -148,8 +160,21 @@ export class DefaultPlugin extends Plugin<
   /**
    * Add default descriptors automatically to make the photorealistic scene.
    * This method must be invoked after `view.init()`.
+   *
+   * `deferredLighting` lights the scene from the atmosphere in post: it sets
+   * `aerialPerspective.irradiance` and `view.lit = false` together, since the
+   * forward pass would otherwise apply lighting as well. `shadow` and
+   * `specular` enable the sun's shadows and its specular highlight in that
+   * lighting through the aerial perspective's options of the same name. Both
+   * are off by default because either allocates the shadow G-buffer, and
+   * both are inert without `deferredLighting`. Toggle any of them later via
+   * the returned handle and `view.lit`.
    */
-  addDefaultPhotorealScene(): {
+  addDefaultPhotorealScene(options?: {
+    deferredLighting?: boolean;
+    shadow?: boolean;
+    specular?: boolean;
+  }): {
     sky: MeshHandle<SkyMeshDesc>;
     stars: MeshHandle<StarsDesc>;
     skyLightProbe: LightHandle<SkyLightProbeDesc>;
@@ -186,8 +211,15 @@ export class DefaultPlugin extends Plugin<
 
     // Effects
     const aerialPerspective = view.addEffect<AerialPerspectiveEffectDesc>({
-      aerialPerspective: {},
+      aerialPerspective: {
+        ...(options?.deferredLighting ? { irradiance: true } : {}),
+        ...(options?.shadow ? { shadow: true } : {}),
+        ...(options?.specular ? { specular: true } : {}),
+      },
     });
+    if (options?.deferredLighting) {
+      view.lit = false;
+    }
 
     // Skip lens flare on mobile - expensive effect with limited benefit
     const lensFlare = mobile
@@ -233,6 +265,7 @@ export type DefaultLightDescription =
 
 export type DefaultEffectDescription =
   | AerialPerspectiveConfig
+  | BuildingWindowsConfig
   | CloudsConfig
   | ColorGradingLUTConfig
   | DepthOfFieldConfig
@@ -248,6 +281,8 @@ export type DefaultEffectDescription =
   | ToneMappingConfig;
 
 export type DefaultMeshDescription =
+  | PolygonMeshConfig
+  | PolylineMeshConfig
   | RainMeshConfig
   | SnowMeshConfig
   | SkyMeshConfig
@@ -261,6 +296,7 @@ export type DefaultMeshDescription =
   | PlaneMeshConfig
   | GLTFModelConfig
   | SplatMeshConfig
+  | Text3DMeshConfig
   | AxesHelperConfig
   | ArrowHelperConfig
   | ArclineMeshConfig

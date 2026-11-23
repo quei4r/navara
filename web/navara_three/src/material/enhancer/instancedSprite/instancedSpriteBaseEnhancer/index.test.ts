@@ -1,4 +1,4 @@
-import { ShaderMaterial } from "three";
+import { DoubleSide, FrontSide, ShaderMaterial } from "three";
 import type { Texture } from "three";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -74,7 +74,7 @@ describe("instancedSpriteBaseEnhancer", () => {
     it("should initialize state on mount", () => {
       const props: InstancedSpriteBaseProps = {
         scale: 50,
-        center: [0.5, 0.5],
+        anchor: [0.5, 0.5],
         pickable: true,
       };
 
@@ -82,7 +82,7 @@ describe("instancedSpriteBaseEnhancer", () => {
 
       const state = enhancer.states();
       expect(state.scale).toBe(50);
-      expect(state.center).toEqual([0.5, 0.5]);
+      expect(state.anchor).toEqual([0.5, 0.5]);
       expect(state.pickable).toBe(true);
       expect(state.useRTE).toBe(false);
       expect(state.billboard).toBe(false);
@@ -115,7 +115,8 @@ describe("instancedSpriteBaseEnhancer", () => {
 
       // Should have assigned uniforms
       expect(shader.uniforms.uScale).toBeDefined();
-      expect(shader.uniforms.uCenter).toBeDefined();
+      expect(shader.uniforms.uAnchor).toBeDefined();
+      expect(shader.uniforms.uOffset).toBeDefined();
       expect(shader.uniforms.nvr_uPickable).toBeDefined();
     });
 
@@ -126,6 +127,15 @@ describe("instancedSpriteBaseEnhancer", () => {
 
       expect(material.transparent).toBe(false);
       expect(material.depthTest).toBe(false);
+    });
+
+    it("draws both sides unless backfaceCulling is on", () => {
+      const material = new ShaderMaterial();
+      const e = createInstancedSpriteBaseEnhancer(material);
+      e.mount({});
+      expect(material.side).toBe(DoubleSide);
+      e.update({ backfaceCulling: true });
+      expect(material.side).toBe(FrontSide);
     });
 
     it("should update material properties on update", () => {
@@ -185,8 +195,27 @@ describe("instancedSpriteBaseEnhancer", () => {
       expect(parsed).toEqual({
         useRTE: true,
         billboard: true,
+        instanceBearing: false,
         userDataDefines: undefined,
       });
+    });
+
+    it("distinguishes bearing-carrying geometry", () => {
+      // USE_INSTANCE_BEARING declares an attribute the straight program does
+      // not have, so the two must not share a compiled program.
+      enhancer.mount({ useRTE: true, billboard: true });
+      const without = enhancer.programCacheKey();
+
+      const withBearing = createInstancedSpriteBaseEnhancer(
+        new ShaderMaterial(),
+      );
+      withBearing.mount({
+        useRTE: true,
+        billboard: true,
+        instanceBearing: true,
+      });
+
+      expect(withBearing.programCacheKey()).not.toBe(without);
     });
 
     it("should return different cache keys for different shader-affecting states", () => {

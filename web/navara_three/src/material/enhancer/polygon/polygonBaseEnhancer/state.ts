@@ -1,3 +1,5 @@
+import { GBUFFER_PHONG_ROUGHNESS } from "../../../gbufferLayout";
+
 import type { PolygonBaseProps, PolygonBaseState } from "./types";
 
 export const DEFAULT_BASE_PROPS: Required<
@@ -9,12 +11,13 @@ export const DEFAULT_BASE_PROPS: Required<
   wireframe: false,
   addExtrudedHeight: 0,
   addHeight: 0,
+  shadeSidesAsSurface: false,
   clampToGround: false,
   isTexturized: false,
   pickable: false,
   effectIdsMask: 0,
   reflectivity: 0,
-  roughness: 0,
+  roughness: GBUFFER_PHONG_ROUGHNESS,
   emissiveColor: 0,
   emissiveIntensity: 0,
   useRTE: false,
@@ -33,6 +36,7 @@ export const DEFAULT_BASE_STATE: PolygonBaseState = {
   minMaxHeight: undefined,
   addExtrudedHeight: DEFAULT_BASE_PROPS.addExtrudedHeight,
   addHeight: DEFAULT_BASE_PROPS.addHeight,
+  shadeSidesAsSurface: DEFAULT_BASE_PROPS.shadeSidesAsSurface,
   reflectivity: DEFAULT_BASE_PROPS.reflectivity,
   roughness: DEFAULT_BASE_PROPS.roughness,
   batchColorEnabled: DEFAULT_BASE_PROPS.batchColorEnabled,
@@ -66,6 +70,8 @@ export const updateState = (
     addExtrudedHeight:
       props.addExtrudedHeight ?? currentState.addExtrudedHeight,
     addHeight: props.addHeight ?? currentState.addHeight,
+    shadeSidesAsSurface:
+      props.shadeSidesAsSurface ?? currentState.shadeSidesAsSurface,
     reflectivity: props.reflectivity ?? currentState.reflectivity,
     roughness: props.roughness ?? currentState.roughness,
     batchColorEnabled:

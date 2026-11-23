@@ -183,6 +183,7 @@ function processInitialHillshadeTexture(
   const hillshadeConfig = hillshadeContext.getHillshadeConfig(
     tileHandler,
     tileHandleBigInt,
+    event.elevation_decoder,
   );
 
   const contentWidth = paddedSize - 2;
@@ -357,13 +358,10 @@ function processHillshadeEdgeUpdate(
 /**
  * Handle a hillshade_canceled event.
  *
- * Two responsibilities, both scoped to "the canceled entity":
- * 1. Pre-empt any pending `hillshade_backfilled` events in the EventManager
- *    stack whose effect would target this entity, so they never run. Matched
- *    via `resolveHillshadeEntityId` so an edge update X→Y (keyed by target Y)
- *    survives a cancel of source X — Y still wants that edge data.
- * 2. Drop in-flight backfill state that earlier events created — queued
- *    neighbor edges and the in-progress DEM assembly entry.
+ * Drops in-flight backfill state that earlier events created for the
+ * canceled entity — queued neighbor edges and the in-progress DEM assembly
+ * entry. Backfills of the same tick aimed at it never arrive: the engine
+ * drops them when it emits the cancel.
  *
  * Does NOT dispose render targets or `loadedTexs` textures: those belong to
  * the texture-fragment lifecycle and are released by
@@ -378,26 +376,10 @@ export function processHillshadeCanceled(
 ) {
   if (!event) return;
 
-  const { hillshadeContext, eventManager } = ctx;
+  const { hillshadeContext } = ctx;
   if (!hillshadeContext) return;
 
   const entityId = generate_id_from_entity(event);
-
-  const backfillStack = eventManager.stacks
-    .hillshade_backfilled as HillshadeBackfilledEvent[];
-  if (backfillStack.length > 0) {
-    const kept: HillshadeBackfilledEvent[] = [];
-    for (const bf of backfillStack) {
-      if (resolveHillshadeEntityId(bf) === entityId) {
-        if (bf && "free" in bf && typeof bf.free === "function") {
-          bf.free();
-        }
-      } else {
-        kept.push(bf);
-      }
-    }
-    eventManager.stacks.hillshade_backfilled = kept;
-  }
 
   hillshadeContext.pendingEdges.delete(entityId);
   hillshadeContext.clearTempDem(entityId);

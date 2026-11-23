@@ -159,12 +159,17 @@ This document provides detailed documentation for all 40+ Rust crates in the Nav
 - **Key Features**: Zero-copy transfers, buffer management
 - **Used by**: WASM modules for performance-critical data exchange
 
-## Background Processing (1 crate)
+## Background Processing (2 crates)
 
 ### **`navara_worker`**
 - **Purpose**: Background task coordination and CPU-intensive operations
 - **Key Features**: Task queuing, thread management, work distribution
 - **Used by**: Main engine for offloading heavy computations
+
+### **`navara_worker_component`**
+- **Purpose**: Worker pool types shared outside `navara_worker`
+- **Key Features**: `WorkerLimits` (worker intake cap, external pool load and pause flag)
+- **Used by**: `navara_worker`, `navara_data_requester` (holds back image fetches while paused), `navara_feature`
 
 ## Support & Utilities (11 crates)
 

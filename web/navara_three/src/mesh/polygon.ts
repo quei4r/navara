@@ -1,4 +1,3 @@
-import type { TileHandle } from "@navaramap/core";
 import {
   PolygonMesh as NavaraPolygonMesh,
   PolygonMaterial,
@@ -9,7 +8,6 @@ import {
   Matrix4,
   MeshBasicMaterial,
   MeshLambertMaterial,
-  RGBADepthPacking,
   Sphere,
   SphereGeometry,
   Mesh as ThreeMesh,
@@ -27,17 +25,24 @@ import {
   type BatchTextureSupport,
 } from "../batchTexture";
 import type { EventContext } from "../event/context";
-import { applyLitOption } from "../material";
+import { applyLitOption, createShadowDepthMaterial } from "../material";
 import type { PolygonMaterialProps } from "../material/enhancer/polygon";
 import { createPolygonMaterialEnhancer } from "../material/enhancer/polygon/polygonMaterialEnhancer";
 import { getWebGPU } from "../utils";
+import type { DrapeBakedMesh } from "../tileTexture/types";
+import { boundingSphereOfRte } from "../utils";
+import type { WaterWaves } from "../water/waterState";
 
 import {
   BatchedFeatureMesh,
   type BatchedFeatureAttributes,
 } from "./batchedFeature";
 import { GEOMETRY_TYPES } from "./constants";
-import { releaseGeometryArraysAfterUpload } from "./releaseGeometryArrays";
+import { DepthPrePassMesh } from "./depthPrePass";
+import {
+  canDrawWireframe,
+  releaseGeometryArraysAfterUpload,
+} from "./releaseGeometryArrays";
 import { setupRTECallback } from "./rtcRteHelper";
 import {
   createWebgpuBatchSampler,
@@ -83,16 +88,21 @@ type Attributes = BatchedFeatureAttributes<{
   attrBatchId: BufferAttribute;
 }>;
 
-export class PolygonMesh extends BatchedFeatureMesh<
-  BufferGeometry<Attributes>,
-  MeshLambertMaterial
-> {
+export class PolygonMesh
+  extends BatchedFeatureMesh<BufferGeometry<Attributes>, MeshLambertMaterial>
+  implements DrapeBakedMesh
+{
   outline?: PolygonOutlineMesh;
+  /** See {@link DrapeBakedMesh}. */
+  drapeTransparent = false;
 
-  private _baseBoundingSphere?: {
-    surfaceCenter: Vector3; // Center point on ellipsoid surface (without height)
-    aabbRadius: number; // Horizontal extent radius from AABB
-  };
+  /** Bounds of the geometry before the shader offsets its caps. */
+  private _baseBoundingSphere?: Sphere;
+  /**
+   * Direction the caps' offsets move the bounds: the up vector at the
+   * extent's center, or zero for a tile (RTC) mesh in its local frame.
+   */
+  private _baseUp = new Vector3();
 
   /** Debug wireframe mesh visualizing the bounding sphere */
   private _debugBoundingSphereMesh?: ThreeMesh;
@@ -115,6 +125,9 @@ export class PolygonMesh extends BatchedFeatureMesh<
   /** Enhanced material with encapsulated state */
   private _enhancedMaterial?: ReturnType<typeof createPolygonMaterialEnhancer>;
 
+  /** Present while `depthPrePass` applies. */
+  private _depthPrePass?: DepthPrePassMesh;
+
   constructor(ctx: EventContext, layerId: string) {
     super(new BufferGeometry<Attributes>(), new MeshLambertMaterial());
 
@@ -131,7 +144,7 @@ export class PolygonMesh extends BatchedFeatureMesh<
    */
   readonly geometryType = GEOMETRY_TYPES.Polygon;
 
-  init(mesh: NavaraPolygonMesh, tileHandle: TileHandle | undefined) {
+  init(mesh: NavaraPolygonMesh) {
     this.batchLength = mesh.batch_length;
     // Register cleanup listener first (before any potential early returns)
     // This ensures dispose() is called even if geometry initialization fails
@@ -144,19 +157,25 @@ export class PolygonMesh extends BatchedFeatureMesh<
       console.warn("PolygonMesh.init: geometry initialization failed");
       return this;
     }
-    this.initMaterial(mesh, tileHandle, useRTE);
+    this.initMaterial(mesh, useRTE);
     this.initDepthMaterial();
 
     if (mesh.bounding_sphere) {
       const bs = mesh.bounding_sphere;
 
-      this._baseBoundingSphere = {
+      // The extent's sphere lies on the ellipsoid, so the vertices' own bounds
+      // add the heights of per-position-height positions.
+      this._baseBoundingSphere = new Sphere(
         // If this mesh is tile based, RTC is used. In this case, this mesh is transformed through matrixWorld.
-        surfaceCenter: useRTE
+        useRTE
           ? new Vector3(bs.center_x, bs.center_y, bs.center_z)
           : new Vector3(),
-        aabbRadius: bs.radius,
-      };
+        bs.radius,
+      );
+      this._baseUp.copy(this._baseBoundingSphere.center).normalize();
+      if (this.geometry.boundingSphere) {
+        this._baseBoundingSphere.union(this.geometry.boundingSphere);
+      }
 
       this._recalculateBoundingSphere();
     }
@@ -266,15 +285,25 @@ export class PolygonMesh extends BatchedFeatureMesh<
     geometry.setIndex(new BufferAttribute(indices, 1));
 
     // Ensure a bounding sphere exists before we drop the CPU arrays. When
-    // `mesh.bounding_sphere` is provided, init() overwrites this from the
-    // WASM AABB (`_baseBoundingSphere`); otherwise this eager compute prevents
+    // `mesh.bounding_sphere` is provided, init() widens the WASM AABB
+    // (`_baseBoundingSphere`) by it; otherwise this eager compute prevents
     // Three.js from lazily calling computeBoundingSphere() on a nulled array
-    // during frustum culling. Batch-id attributes are consumed on the GPU
-    // (batch data texture), so no other CPU read survives the first upload.
+    // during frustum culling. Only the RTE attributes hold positions in RTE
+    // mode. Batch-id attributes are consumed on the GPU (batch data texture),
+    // so no other CPU read survives the first upload.
     // Drop the JS-heap copies to keep a single resident (GPU) copy — see
     // releaseGeometryArraysAfterUpload for the context-loss trade-off.
-    geometry.computeBoundingSphere();
-    releaseGeometryArraysAfterUpload(geometry);
+    if (position_3d_high && position_3d_low) {
+      geometry.boundingSphere = boundingSphereOfRte(
+        position_3d_high,
+        position_3d_low,
+      );
+    } else {
+      geometry.computeBoundingSphere();
+    }
+    if (!this.ctx.viewContext.retainGeometryArrays) {
+      releaseGeometryArraysAfterUpload(geometry);
+    }
 
     return { success: true, useRTE };
   }
@@ -290,36 +319,7 @@ export class PolygonMesh extends BatchedFeatureMesh<
     return this._enhancedMaterial;
   }
 
-  private enableWater() {
-    if (!this._enhancedMaterial) return;
-
-    const { base, water } = this._enhancedMaterial.states();
-
-    // Disable water normal map if water is off or texturized
-    if (!water.useWater || base.isTexturized) {
-      this._enhancedMaterial.update({ water: { waterNormalMap: null } });
-      return;
-    }
-
-    // Skip if not visible or already has water texture
-    if (!this.visible || water.waterNormalMap) {
-      return;
-    }
-
-    // Use shared water texture from CommonUniforms (must be enabled via Options.waterTexture.enabled)
-    if (this.ctx.uniforms?.waterTexture.value) {
-      this._enhancedMaterial.update({
-        water: { waterNormalMap: this.ctx.uniforms.waterTexture.value },
-      });
-      this.material.needsUpdate = true;
-    }
-  }
-
-  private initMaterial(
-    mesh: NavaraPolygonMesh,
-    tileHandle: TileHandle | undefined,
-    useRTE: boolean,
-  ) {
+  private initMaterial(mesh: NavaraPolygonMesh, useRTE: boolean) {
     const uniforms = this.ctx.uniforms;
     const meshMaterial = mesh.material;
     const mcolor = meshMaterial.color;
@@ -328,9 +328,7 @@ export class PolygonMesh extends BatchedFeatureMesh<
     this.receiveShadow = !!meshMaterial.receiveShadow;
     applyLitOption(this.material, meshMaterial.lit);
 
-    // This mesh is texturized if it has a tile handle (terrain attachment).
-    // `!= null`, not truthiness: the root vector tile's handle is 0.
-    const isTexturized = tileHandle != null;
+    const isTexturized = mesh.should_be_texturized;
     const material = this.material;
 
     material.vertexColors = false;
@@ -355,8 +353,14 @@ export class PolygonMesh extends BatchedFeatureMesh<
         color: mcolor,
         opacity: meshMaterial.opacity,
         transparent: meshMaterial.transparent,
-        wireframe: meshMaterial.wireframe,
+        wireframe:
+          !!meshMaterial.wireframe &&
+          canDrawWireframe(
+            this.geometry,
+            this.ctx.viewContext.retainGeometryArrays,
+          ),
         minMaxHeight,
+        shadeSidesAsSurface: meshMaterial.shadeSidesAsSurface,
         clampToGround: meshMaterial.clampToGround,
         isTexturized,
         reflectivity: meshMaterial.reflectivity,
@@ -367,15 +371,16 @@ export class PolygonMesh extends BatchedFeatureMesh<
       },
       water: {
         water: meshMaterial.water,
-        waterScaleNormal: meshMaterial.waterScaleNormal,
-        waterSpeed: meshMaterial.waterSpeed,
+        waveExaggeration: meshMaterial.waveExaggeration,
+        waterScale: meshMaterial.waterScale,
+        waveStrength: meshMaterial.waveStrength,
+        waveDirection: meshMaterial.waveDirection,
+        flowSpeed: meshMaterial.flowSpeed,
         shininess: meshMaterial.shininess,
         specularStrength: meshMaterial.specularStrength,
-        applyWaterNormal: meshMaterial.applyWaterNormal,
         specular: meshMaterial.specular,
         ior: meshMaterial.ior,
-        timeUniform: uniforms.time as { value: number },
-        skyEnvMap: uniforms.tSkyEnvMap.value,
+        getWaterState: () => uniforms.water,
       },
     };
 
@@ -418,8 +423,6 @@ export class PolygonMesh extends BatchedFeatureMesh<
       this.syncWebgpuHandles();
       rteCallback?.(renderer, scene, camera, geometry, material, group);
     };
-
-    this.enableWater();
 
     if (this.isWebGPUBackend()) {
       // The GLSL enhancer pipeline (onBeforeCompile) never runs on the WebGPU
@@ -710,29 +713,7 @@ export class PolygonMesh extends BatchedFeatureMesh<
    * Override a material that is used to generate a shadow map.
    */
   private initDepthMaterial() {
-    this.customDepthMaterial = this.material.clone();
-    this.customDepthMaterial.needsUpdate = true;
-
-    const origin = this.material;
-
-    // Attach to the batch texture state so layout allocations bump this
-    // clone's needsUpdate too — its compiled defines come from the origin, so
-    // it must recompile whenever they change.
-    attachBatchedMaterial(origin, this.customDepthMaterial);
-    // The clone's compiled defines come from the origin, so key its program on
-    // the origin's key (which includes the per-instance batch layout defines);
-    // the prefix separates it from the origin's own program.
-    this.customDepthMaterial.customProgramCacheKey = () =>
-      `nvr-depth:${origin.customProgramCacheKey()}`;
-
-    this.customDepthMaterial.onBeforeCompile = (shader, renderer) => {
-      origin.onBeforeCompile(shader, renderer);
-
-      shader.defines ??= {};
-      Object.assign(shader.defines, origin.userData.defines || {});
-      shader.defines["USE_SHADOWMAP_DEPTH"] = 1;
-      shader.defines["DEPTH_PACKING"] = RGBADepthPacking;
-    };
+    this.customDepthMaterial = createShadowDepthMaterial(this.material);
   }
 
   _update(material: PolygonMaterial, active: boolean, isTexturized: boolean) {
@@ -752,6 +733,7 @@ export class PolygonMesh extends BatchedFeatureMesh<
     }
     this.castShadow = !!material.castShadow;
     this.receiveShadow = !!material.receiveShadow;
+    this.drapeTransparent = !!material.transparent;
     applyLitOption(this.material, material.lit);
 
     const { base } = enhancer.states();
@@ -765,11 +747,17 @@ export class PolygonMesh extends BatchedFeatureMesh<
         color: base.batchColorEnabled ? undefined : material.color,
         opacity: material.opacity,
         transparent: !!material.transparent,
-        wireframe: !!material.wireframe,
+        wireframe:
+          !!material.wireframe &&
+          canDrawWireframe(
+            this.geometry,
+            this.ctx.viewContext.retainGeometryArrays,
+          ),
         minMaxHeight:
           minMaxHeights !== undefined
             ? [minMaxHeights[0], minMaxHeights[1]]
             : undefined,
+        shadeSidesAsSurface: !!material.shadeSidesAsSurface,
         clampToGround: !!material.clampToGround,
         isTexturized,
         reflectivity: material.reflectivity,
@@ -783,11 +771,13 @@ export class PolygonMesh extends BatchedFeatureMesh<
       },
       water: {
         water: !!material.water,
-        waterScaleNormal: material.waterScaleNormal,
-        waterSpeed: material.waterSpeed,
+        waveExaggeration: material.waveExaggeration,
+        waterScale: material.waterScale,
+        waveStrength: material.waveStrength,
+        waveDirection: material.waveDirection,
+        flowSpeed: material.flowSpeed,
         shininess: material.shininess,
         specularStrength: material.specularStrength,
-        applyWaterNormal: material.applyWaterNormal,
         specular: material.specular,
         ior: material.ior,
       },
@@ -797,8 +787,22 @@ export class PolygonMesh extends BatchedFeatureMesh<
     enhancer.update(updateProps);
 
     // Post-update actions
-    this.enableWater();
+    this._updateDepthPrePass(
+      !isTexturized && !!material.transparent && !!material.depthPrePass,
+    );
     this._recalculateBoundingSphere();
+  }
+
+  private _updateDepthPrePass(enabled: boolean) {
+    if (enabled === !!this._depthPrePass) return;
+    if (this._depthPrePass) {
+      this.remove(this._depthPrePass);
+      this._depthPrePass.dispose();
+      this._depthPrePass = undefined;
+      return;
+    }
+    this._depthPrePass = new DepthPrePassMesh(this);
+    this.add(this._depthPrePass);
   }
 
   private _recalculateBoundingSphere() {
@@ -815,10 +819,7 @@ export class PolygonMesh extends BatchedFeatureMesh<
     const { base } = this._enhancedMaterial.states();
 
     if (base.clampToGround) {
-      this.geometry.boundingSphere?.set(
-        baseBounds.surfaceCenter,
-        baseBounds.aabbRadius,
-      );
+      this.geometry.boundingSphere?.copy(baseBounds);
       return;
     }
 
@@ -839,18 +840,14 @@ export class PolygonMesh extends BatchedFeatureMesh<
     const heightOffset = (maxHeight - minHeight) / 2.0;
     const centerHeight = (maxHeight + minHeight) / 2.0;
 
-    // Get surface normal from surface center
-    const surfaceNormal = baseBounds.surfaceCenter.clone().normalize();
-
     // Calculate new center by elevating along surface normal
-    const center = baseBounds.surfaceCenter
+    const center = baseBounds.center
       .clone()
-      .add(surfaceNormal.multiplyScalar(centerHeight));
+      .addScaledVector(this._baseUp, centerHeight);
 
     // Calculate new radius using Pythagorean theorem
     const radius = Math.sqrt(
-      baseBounds.aabbRadius * baseBounds.aabbRadius +
-        heightOffset * heightOffset,
+      baseBounds.radius * baseBounds.radius + heightOffset * heightOffset,
     );
 
     // Update geometry bounding sphere
@@ -969,20 +966,18 @@ export class PolygonMesh extends BatchedFeatureMesh<
   }
 
   /** Properties for material state used by TileMesh for texturized scene rendering */
-  get waterScaleNormal(): number {
-    return this.getEnhancer().states().water.waterScaleNormal;
+  get waveExaggeration(): number {
+    return this.getEnhancer().states().water.waveExaggeration;
   }
-  get waterSpeed(): number {
-    return this.getEnhancer().states().water.waterSpeed;
+  /** The surface's waves; undefined unless it is water. */
+  get waterWaves(): WaterWaves | undefined {
+    return this.getEnhancer().mutates().water.waves();
   }
   get shininess(): number {
     return this.getEnhancer().states().water.shininess;
   }
   get specularStrength(): number {
     return this.getEnhancer().states().water.specularStrength;
-  }
-  get applyWaterNormal(): boolean {
-    return this.getEnhancer().states().water.applyWaterNormal;
   }
   get specular(): boolean {
     return this.getEnhancer().states().water.specular;
@@ -1014,7 +1009,10 @@ export class PolygonMesh extends BatchedFeatureMesh<
       this._debugBoundingSphereMesh = undefined;
     }
 
+    this._updateDepthPrePass(false);
+
     this.ctx.viewContext.removeShadowMaterial(this.material);
     this.customDepthMaterial?.dispose();
+    this._enhancedMaterial?.mutates().water.dispose();
   }
 }

@@ -63,6 +63,18 @@ pub enum DelegatedWorkerTasksParameters {
     // Polyline(...),
 }
 
+impl DelegatedWorkerTasksParameters {
+    pub fn delegator_id(&self) -> Entity {
+        match self {
+            Self::ConstructTerrainMesh(t) => t.delegator_id,
+            Self::UpsampleTerrainMesh(t) => t.delegator_id,
+            Self::ConstructPolygonBatchedFeature(t) => t.delegator_id,
+            Self::ConstructPolylineBatchedFeature(t) => t.delegator_id,
+            Self::ParseMvtTile(t) => t.delegator_id,
+        }
+    }
+}
+
 #[derive(Bundle)]
 pub struct DelegatedWorkerTasksParametersBundle<M: Component> {
     pub worker_task_marker: DelegatedWorkerTaskMarker,

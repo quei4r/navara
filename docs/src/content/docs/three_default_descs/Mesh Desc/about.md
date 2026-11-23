@@ -24,6 +24,8 @@ The following MeshDescriptor types are available in navara_three:
 | [InstancedGltfModelMeshDesc](../instanced-gltf-model-mesh-desc) | A GPU-instanced Descriptor that renders multiple copies of a GLTF/GLB model |
 | [GlowGlobeMeshDesc](../glow-globe-mesh-desc) | A Descriptor that displays a Fresnel-effect glow around the globe |
 | [PlaneMeshDesc](../plane-mesh-desc) | A Descriptor that draws plane geometry |
+| [PolygonMeshDesc](../polygon-mesh-desc) | A Descriptor that draws a single polygon from positions, flat or extruded, or clamped to the terrain |
+| [PolylineMeshDesc](../polyline-mesh-desc) | A Descriptor that draws a single polyline from positions, at a height or clamped to the terrain |
 | [InstancedPlaneMeshDesc](../instanced-plane-mesh-desc) | A GPU-instanced Descriptor that renders multiple planes in a single draw call |
 | [RainMeshDesc](../rain-mesh-desc) | A Descriptor that displays rain particle effects |
 | [SkyBoxMeshDesc](../sky-box-mesh-desc) | A Descriptor that draws a simple skybox |
@@ -34,6 +36,7 @@ The following MeshDescriptor types are available in navara_three:
 | [SplatMeshDesc](../splat-mesh-desc) | A Descriptor that renders 3D Gaussian Splat assets via SparkJS |
 | [InstancedSphereMeshDesc](../instanced-sphere-mesh-desc) | A GPU-instanced Descriptor that renders multiple spheres in a single draw call |
 | [StarsDesc](../stars-desc) | A Descriptor that draws a starry sky |
+| [Text3DMeshDesc](../text-3d-mesh-desc) | A Descriptor that draws extruded 3D text from a font file :since[0.3.2] |
 | [TubeMeshDesc](../tube-mesh-desc) | A Descriptor that draws tube geometry |
 | [AxesHelperDesc](../axes-helper-desc) | A debug helper Descriptor that visualizes the 3 axes |
 | [ArrowHelperDesc](../arrow-helper-desc) | A debug helper Descriptor that visualizes vector directions |

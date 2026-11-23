@@ -26,10 +26,19 @@
  * layers match every sublayer of the source, which is the case a single-layer
  * parse would collapse: the source must be decoded once and still emit
  * features for each layer, with its own batch ids and evaluator.
+ *
+ * The `text` and `billboard` folders cover placement on top of the same
+ * derivation: `placement: "line"` resamples line-strings and polygon rings into
+ * anchors spaced `spacing` screen pixels apart (turned to the tangent, and for
+ * text bent along it), while `"point"` labels each polygon once, inside it.
+ * Opting all three source kinds in at once mixes along-line anchors and plain
+ * points in one batch, which is the case worth watching here.
  */
 import ThreeView, {
   Color,
+  type Facing,
   type FeatureInfo,
+  fetchFontFamilyFromCss,
   type Layer,
   type LayerDescription,
 } from "@navaramap/three";
@@ -42,10 +51,36 @@ import { Pane } from "tweakpane";
 import { MVT_DATASETS } from "../../../helpers/constants";
 
 type SourceGeometryType = "point" | "line" | "polygon";
+type Placement = "point" | "line" | "line-center";
+
+const PLACEMENT_OPTIONS = {
+  "along the line": "line",
+  "line midpoint": "line-center",
+  "line start / once per polygon (markers: per vertex)": "point",
+};
+
+/** An arrow pointing up, i.e. along the line once turned to its tangent. */
+const ARROW =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">
+       <polygon points="32,4 58,58 32,44 6,58" fill="#ffffff" stroke="#111318" stroke-width="5"/>
+     </svg>`,
+  );
+
+/** Noto Sans JP covers both the Latin GeoJSON names and the Japanese MVT ones. */
+const LABEL_FONT = "GeometryTypesLabels";
 
 const view = new ThreeView<DefaultDescriptions>({ debug: true });
 view.addPlugin(new DefaultPlugin());
 await view.init();
+
+view.addFontFamily(
+  await fetchFontFamilyFromCss(
+    LABEL_FONT,
+    "https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@700",
+  ),
+);
 
 // Non-clamped polylines render through a lit shader; without a light they
 // draw black. An ambient light keeps every combination visible.
@@ -201,6 +236,39 @@ const state = {
     clampToGround: true,
     color: "#2d6a4f",
   },
+  // Placement on derived geometry. `placement` and `spacing` resolve when the
+  // features are built, so like `geometryTypes` they need a rebuild.
+  text: {
+    enabled: false,
+    fromPoint: true,
+    fromLine: true,
+    fromPolygon: true,
+    placement: "line" as Placement,
+    spacing: 250,
+    maxAngle: 45,
+    keepUpright: true,
+    textFacing: "upright" as Facing,
+    size: 16,
+    color: "#ffffff",
+    declutter: false,
+  },
+  billboard: {
+    enabled: false,
+    fromPoint: true,
+    fromLine: true,
+    fromPolygon: true,
+    placement: "line" as Placement,
+    spacing: 60,
+    rotateToLine: true,
+    // Flat and frozen in the anchor's east-north-up frame, the arrow's
+    // rotation reads as a compass bearing the line tangent is added to.
+    billboardFacing: "flat" as Facing,
+    rotateWithCamera: false,
+    rotation: 0,
+    size: 20,
+    color: "#ffd166",
+    declutter: false,
+  },
   // A second layer on the same source, drawn underneath with a wider
   // point/line so the main layer reads as an outlined symbol. The color is
   // deliberately unlike the main materials and the globe, so a missing
@@ -253,6 +321,42 @@ const buildMaterials = () => ({
     polygon: {
       color: new Color().setStyle(state.polygon.color),
       clampToGround: state.polygon.clampToGround,
+    },
+  }),
+  // The label string comes from the evaluator, per feature.
+  ...(state.text.enabled && {
+    text: {
+      font: LABEL_FONT,
+      geometryTypes: geometryTypes(state.text),
+      placement: state.text.placement,
+      spacing: state.text.spacing,
+      maxAngle: state.text.maxAngle,
+      keepUpright: state.text.keepUpright,
+      textFacing: state.text.textFacing,
+      size: state.text.size,
+      sizeInMeters: false,
+      clampToGround: true,
+      color: new Color().setStyle(state.text.color),
+      outlineColor: new Color().setStyle("#111318"),
+      outlineWidth: 3,
+      declutter: state.text.declutter,
+    },
+  }),
+  ...(state.billboard.enabled && {
+    billboard: {
+      url: ARROW,
+      geometryTypes: geometryTypes(state.billboard),
+      placement: state.billboard.placement,
+      spacing: state.billboard.spacing,
+      rotateToLine: state.billboard.rotateToLine,
+      billboardFacing: state.billboard.billboardFacing,
+      rotateWithCamera: state.billboard.rotateWithCamera,
+      rotation: state.billboard.rotation,
+      size: state.billboard.size,
+      sizeInMeters: false,
+      clampToGround: true,
+      transparent: true,
+      declutter: state.billboard.declutter,
     },
   }),
 });
@@ -350,8 +454,16 @@ const PICK_HIGHLIGHT = "#ff00ff";
 const materialColorFor = (meshGeomType: string | undefined): string => {
   if (meshGeomType === "point") return state.point.color;
   if (meshGeomType === "polyline") return state.polyline.color;
+  if (meshGeomType === "text") return state.text.color;
+  if (meshGeomType === "billboard") return state.billboard.color;
   return state.polygon.color;
 };
+
+/** Label string: the GeoJSON `name`, or the MVT district's `urf_function`. */
+const labelFor = (info: FeatureInfo): string =>
+  (info.properties?.["name"] ??
+    info.properties?.["urf_function"] ??
+    "") as string;
 
 const attachEvaluator = (
   layer: Layer,
@@ -364,6 +476,7 @@ const attachEvaluator = (
         color: new Color().setStyle(
           isPickedFeature(info) ? PICK_HIGHLIGHT : paletteColor(info),
         ),
+        ...(info.meshGeomType === "text" && { text: labelFor(info) }),
       }),
       { filters },
     );
@@ -448,6 +561,59 @@ const polygonFolder = pane.addFolder({ title: "polygon" });
 polygonFolder.addBinding(state.polygon, "enabled");
 polygonFolder.addBinding(state.polygon, "clampToGround");
 polygonFolder.addBinding(state.polygon, "color");
+
+const textFolder = pane.addFolder({ title: "text (line placement)" });
+textFolder.addBinding(state.text, "enabled");
+textFolder.addBinding(state.text, "fromPoint");
+textFolder.addBinding(state.text, "fromLine");
+textFolder.addBinding(state.text, "fromPolygon");
+textFolder.addBinding(state.text, "placement", { options: PLACEMENT_OPTIONS });
+textFolder.addBinding(state.text, "spacing", {
+  label: "spacing (px)",
+  min: 20,
+  max: 1000,
+  step: 10,
+});
+textFolder.addBinding(state.text, "maxAngle", { min: 5, max: 180, step: 5 });
+textFolder.addBinding(state.text, "keepUpright");
+textFolder.addBinding(state.text, "textFacing", {
+  options: { upright: "upright", flat: "flat" },
+});
+textFolder.addBinding(state.text, "size", { min: 6, max: 64, step: 1 });
+textFolder.addBinding(state.text, "color");
+textFolder.addBinding(state.text, "declutter");
+
+const billboardFolder = pane.addFolder({ title: "billboard (line placement)" });
+billboardFolder.addBinding(state.billboard, "enabled");
+billboardFolder.addBinding(state.billboard, "fromPoint");
+billboardFolder.addBinding(state.billboard, "fromLine");
+billboardFolder.addBinding(state.billboard, "fromPolygon");
+billboardFolder.addBinding(state.billboard, "placement", {
+  options: PLACEMENT_OPTIONS,
+});
+billboardFolder.addBinding(state.billboard, "spacing", {
+  label: "spacing (px)",
+  min: 10,
+  max: 500,
+  step: 5,
+});
+billboardFolder.addBinding(state.billboard, "rotateToLine");
+billboardFolder.addBinding(state.billboard, "billboardFacing", {
+  options: { upright: "upright", flat: "flat" },
+});
+billboardFolder.addBinding(state.billboard, "rotateWithCamera");
+billboardFolder.addBinding(state.billboard, "rotation", {
+  min: -180,
+  max: 180,
+  step: 1,
+});
+billboardFolder.addBinding(state.billboard, "size", {
+  min: 6,
+  max: 64,
+  step: 1,
+});
+billboardFolder.addBinding(state.billboard, "color");
+billboardFolder.addBinding(state.billboard, "declutter");
 
 const stackFolder = pane.addFolder({ title: "stack (2 layers, 1 source)" });
 stackFolder.addBinding(state.stack, "enabled");

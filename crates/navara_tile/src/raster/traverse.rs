@@ -11,8 +11,8 @@ use navara_memory::SseDegrade;
 use navara_occluder::ellipsoidal_occluder::EllipsoidalOccluder;
 use navara_source::SourceStore;
 use navara_tile_component::{
-    RasterTile, RasterTileQuadtree, TerrainTileQuadtree, Tile, TileHandle,
-    TileTextureFragmentQuery, terrain_height_for_extent,
+    RasterTile, RasterTileQuadtree, TerrainExaggeration, TerrainTileQuadtree, Tile, TileHandle,
+    TileTextureFragmentQuery, terrain_height_for_tile,
 };
 use navara_window::Window;
 
@@ -42,6 +42,7 @@ pub fn traverse_raster(
     qt: &mut RasterTileQuadtree,
     tc: &mut RasterTileCacheManager,
     terrain_qt: &TerrainTileQuadtree,
+    terrain_exaggeration: &TerrainExaggeration,
     frame: &FrameManager,
     camera: &Transform,
     frustum: &CameraFrustum,
@@ -55,16 +56,15 @@ pub fn traverse_raster(
     degrade: SseDegrade,
     terrain_present: bool,
 ) {
-    let extent = match qt.qt.get(handle) {
-        Some(tile) => tile.extent,
+    let coords = match qt.qt.get(handle) {
+        Some(tile) => tile.coords,
         None => return,
     };
 
-    // Borrow the terrain elevation (by extent, so it works on any terrain scheme
-    // including quantized-mesh/Geographic) so the SSE matches the terrain's
+    // Borrow the terrain elevation so the SSE matches the terrain's
     // subdivision depth instead of treating the tile as flat at sea level.
     let (max_height, min_height) =
-        terrain_height_for_extent(terrain_qt, &extent).unwrap_or((0., 0.));
+        terrain_height_for_tile(terrain_qt, terrain_exaggeration, coords);
 
     let tile = qt.qt.get_mut(handle).unwrap();
     tile.update_heights(max_height, min_height);
@@ -72,10 +72,7 @@ pub fn traverse_raster(
     tile.update_tile_occludee_point(ellipsoid, occluder);
     tc.active_handles.insert(handle);
 
-    let is_culled_by_occlusion = !tile
-        .occludee_point_in_scaled_space
-        .map(|p| occluder.is_scaled_space_point_visible(p))
-        .unwrap_or(true);
+    let is_culled_by_occlusion = tile.is_occluded_by_horizon(occluder);
     if is_culled_by_occlusion {
         return;
     }
@@ -125,8 +122,7 @@ pub fn traverse_raster(
         );
     }
 
-    let meets_sse =
-        sse <= degrade.effective_max_sse(max_sse, distance_from_camera) && is_over_min_z;
+    let meets_error = sse <= degrade.effective_max_sse(max_sse, distance_from_camera);
 
     // Once the screen-space error is satisfied, stop: no need for finer tiles.
     // Beyond max zoom, the layer overscales (parent texture stretched), so we
@@ -135,13 +131,19 @@ pub fn traverse_raster(
         .iter()
         .filter(|(t, _)| t.hillshade_config.is_none())
         .filter_map(|(t, _)| t.source_id.as_deref().and_then(|id| source_store.get(id)))
-        .any(|s| !s.is_over_max_zoom(coords_z));
-    if meets_sse || !any_under_max {
+        .any(|s| !s.is_over_max_zoom(coords_z + 1));
+    if (meets_error && is_over_min_z) || !any_under_max {
         return;
     }
 
     // Frustum-culled tiles do not descend.
     if is_culled_by_frustum {
+        return;
+    }
+
+    // Below every layer's min zoom a tile descends whatever its error, until
+    // the traversal's budget is spent.
+    if meets_error && !tc.min_zoom_descent.try_spend() {
         return;
     }
 
@@ -155,6 +157,7 @@ pub fn traverse_raster(
                 qt,
                 tc,
                 terrain_qt,
+                terrain_exaggeration,
                 frame,
                 camera,
                 frustum,
@@ -184,10 +187,10 @@ mod tests {
     use navara_math::Vec3;
     use navara_mesh::CachedMeshHandle;
     use navara_texture_fragment::TextureFragment;
-    use navara_tile_component::{TerrainTile, TileTextureFragmentMarker};
+    use navara_tile_component::{MinZoomDescentBudget, TerrainTile, TileTextureFragmentMarker};
 
     /// A terrain quadtree whose WebMercator root tile carries the given heights
-    /// and a (dummy) cached mesh, so `terrain_height_for_extent` resolves it.
+    /// and a (dummy) cached mesh, so `terrain_height_for_tile` resolves it.
     fn terrain_qt_with_root_height(max_height: f64, min_height: f64) -> TerrainTileQuadtree {
         let mut qt = TerrainTileQuadtree::new_with_linear_qt();
         qt.qt.initialize_zero(&|(x, y, z)| {
@@ -256,6 +259,7 @@ mod tests {
             &mut qt,
             &mut tc,
             &terrain_qt,
+            &TerrainExaggeration::default(),
             &frame,
             &camera,
             &frustum,
@@ -513,6 +517,29 @@ mod tests {
             urls.iter().all(|u| u.starts_with("https://example.com/2/")),
             "no fetch below min zoom; got {urls:?}"
         );
+    }
+
+    #[test]
+    fn traverse_raster_stops_descending_toward_min_zoom_once_the_budget_is_spent() {
+        let (mut app, handle) = app_with_root(TerrainTileQuadtree::new_with_linear_qt());
+        app.insert_resource(TargetHandle(handle));
+        spawn_layer(&mut app, raster_layer("a", 2, 20), Order(0));
+        // Enough for the root only: its z=1 children stay undivided.
+        app.world_mut()
+            .resource_mut::<RasterTileCacheManager>()
+            .min_zoom_descent = MinZoomDescentBudget::with_limit(1);
+
+        app.add_systems(Update, run_traverse_system);
+        app.update();
+
+        let qt = app.world().resource::<RasterTileQuadtree>();
+        assert!(qt.qt.leaf((0, 0, 1)).is_some(), "the root should subdivide");
+        for x in 0..4 {
+            for y in 0..4 {
+                assert!(qt.qt.leaf((x, y, 2)).is_none(), "z=1 must not subdivide");
+            }
+        }
+        assert!(requested_urls(&mut app).is_empty());
     }
 
     // ----- screen-space error & max zoom subdivision --------------------------

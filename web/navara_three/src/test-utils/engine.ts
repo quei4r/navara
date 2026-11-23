@@ -47,7 +47,6 @@ export function createTestTileHandler(): TileHandler {
   initTestEngine();
   return createTileHandler({
     getCore: () => getTestCore(),
-    getVectorRevision: () => 0,
     getRasterRevision: () => 0,
   });
 }

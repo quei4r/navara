@@ -34,6 +34,160 @@ fn parse_geometry_types(
 fn geometry_type_names(value: &[navara_material::SourceGeometryType]) -> Vec<String> {
     value.iter().map(|t| t.as_str().to_string()).collect()
 }
+
+/// Parse a JS-facing extrusion base, warning on an unknown value so the caller
+/// keeps the material's current value.
+fn parse_extrusion_base(value: &Option<String>) -> Option<navara_geometry::ExtrusionBase> {
+    let name = value.as_ref()?;
+    let base = navara_geometry::ExtrusionBase::parse(name);
+    if base.is_none() {
+        bevy_log::warn!(
+            "extrusionBase: unknown value {name:?} (expected \"position\" or \"ellipsoid\")"
+        );
+    }
+    base
+}
+
+/// Parse a JS-facing facing name, warning on an unknown value so the caller
+/// keeps the material's current value. `field` is the JS property name
+/// (`textFacing` / `pointFacing` / `billboardFacing`) so the warning points at
+/// the property the caller actually set.
+fn parse_facing(field: &str, value: &Option<String>) -> Option<navara_material::Facing> {
+    let name = value.as_ref()?;
+    match navara_material::Facing::parse(name) {
+        Some(f) => Some(f),
+        None => {
+            bevy_log::warn!("{field}: unknown value {name:?} (expected \"upright\" or \"flat\")");
+            None
+        }
+    }
+}
+
+/// Parse a JS-facing water scale name, warning on an unknown value so the
+/// caller keeps the material's current value.
+fn parse_water_scale(value: &Option<String>) -> Option<navara_material::WaterScale> {
+    let name = value.as_ref()?;
+    match navara_material::WaterScale::parse(name) {
+        Some(scale) => Some(scale),
+        None => {
+            bevy_log::warn!(
+                "waterScale: unknown value {name:?} (expected \"ocean\", \"large\", \"medium\" or \"small\")"
+            );
+            None
+        }
+    }
+}
+
+/// Parse a JS-facing line cap name, warning on an unknown value so the caller
+/// keeps the material's current value.
+fn parse_line_cap(value: &Option<String>) -> Option<navara_material::LineCap> {
+    let name = value.as_ref()?;
+    match navara_material::LineCap::parse(name) {
+        Some(cap) => Some(cap),
+        None => {
+            bevy_log::warn!(
+                "cap: unknown value {name:?} (expected \"butt\", \"round\" or \"square\")"
+            );
+            None
+        }
+    }
+}
+
+/// Parse a JS-facing placement name, warning on an unknown value so the caller
+/// keeps the material's current value.
+fn parse_placement(value: &Option<String>) -> Option<navara_material::Placement> {
+    let name = value.as_ref()?;
+    match navara_material::Placement::parse(name) {
+        Some(p) => Some(p),
+        None => {
+            bevy_log::warn!(
+                "placement: unknown value {name:?} (expected \"point\", \"line\" or \"line-center\")"
+            );
+            None
+        }
+    }
+}
+
+/// Expand a JS-facing padding list of one to four values the CSS way into
+/// `[top, right, bottom, left]`, warning on any other length so the caller
+/// keeps the material's current value.
+fn parse_padding(value: &Option<Vec<f32>>) -> Option<[f32; 4]> {
+    match value.as_deref()? {
+        &[all] => Some([all; 4]),
+        &[vertical, horizontal] => Some([vertical, horizontal, vertical, horizontal]),
+        &[top, horizontal, bottom] => Some([top, horizontal, bottom, horizontal]),
+        &[top, right, bottom, left] => Some([top, right, bottom, left]),
+        list => {
+            bevy_log::warn!("declutterPadding: expected 1 to 4 values, got {list:?}");
+            None
+        }
+    }
+}
+
+/// Parse a JS-facing overlap name, warning on an unknown value so the caller
+/// keeps the material's current value.
+fn parse_overlap(value: &Option<String>) -> Option<navara_material::Overlap> {
+    let name = value.as_ref()?;
+    match navara_material::Overlap::parse(name) {
+        Some(o) => Some(o),
+        None => {
+            bevy_log::warn!(
+                "overlap: unknown value {name:?} (expected \"never\", \"always\" or \"cooperative\")"
+            );
+            None
+        }
+    }
+}
+
+/// Parse a JS-facing anchor name, warning on an unknown value so the caller
+/// keeps the material's current value.
+fn parse_anchor(value: &Option<String>) -> Option<navara_material::Anchor> {
+    let name = value.as_ref()?;
+    match navara_material::Anchor::parse(name) {
+        Some(a) => Some(a),
+        None => {
+            bevy_log::warn!(
+                "anchor: unknown value {name:?} (expected \"center\", \"left\", \"right\", \"top\", \"bottom\", \"top-left\", \"top-right\", \"bottom-left\" or \"bottom-right\")"
+            );
+            None
+        }
+    }
+}
+
+/// Convert JS-facing variable anchors, dropping (with a warning from
+/// [`parse_anchor`]) any entry whose anchor is unknown.
+fn parse_variable_anchors(
+    value: &Option<Vec<VariableAnchor>>,
+) -> Option<Vec<navara_material::VariableAnchor>> {
+    let entries = value.as_ref()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                Some(navara_material::VariableAnchor {
+                    anchor: parse_anchor(&Some(entry.anchor.clone()))?,
+                    offset: entry.offset.map_or(navara_math::Vec2::ZERO, Into::into),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Parse a JS-facing translate frame name, warning on an unknown value so the
+/// caller keeps the material's current value.
+fn parse_translate_anchor(value: &Option<String>) -> Option<navara_material::TranslateAnchor> {
+    let name = value.as_ref()?;
+    match navara_material::TranslateAnchor::parse(name) {
+        Some(a) => Some(a),
+        None => {
+            bevy_log::warn!(
+                "translateAnchor: unknown value {name:?} (expected \"map\" or \"viewport\")"
+            );
+            None
+        }
+    }
+}
+
 #[wasm_bindgen]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointMaterial {
@@ -41,9 +195,70 @@ pub struct PointMaterial {
     /// size in pixels/meters (units are determined by `sizeInMeters`).
     pub size: Option<f32>,
     pub color: Option<u32>,
-    /// anchor point of the sprite, range is (-0.5, -0.5) to (0.5, 0.5).
-    /// Default is (0.0, 0.0) which means the center of the sprite.
-    pub center: Option<Vec2>,
+    /// Plane the point lies in: the screen (`"upright"`, never foreshortened)
+    /// or the globe surface around its anchor (`"flat"`), as MapLibre's
+    /// `icon-pitch-alignment` `viewport` and `map`. Pair with
+    /// `rotateWithCamera`. Left unset, it is `"flat"` when `rotateWithCamera`
+    /// resolves to `false` and `"upright"` otherwise, as MapLibre resolves
+    /// `auto`.
+    #[wasm_bindgen(getter_with_clone, js_name = pointFacing)]
+    #[serde(rename = "pointFacing")]
+    pub point_facing: Option<String>,
+    /// Whether the point turns with the camera or with the map, as MapLibre's
+    /// `icon-rotation-alignment` `viewport` and `map`. `true` keeps it reading left to right
+    /// (a screen-aligned billboard, or a flat quad yawed to the camera).
+    /// `false` aligns it with the map: upright, it stays on screen but turns
+    /// with the camera heading so its x-axis points east; flat, it lies
+    /// north-up. Left unset, it is `true` for `placement: "point"` and `false`
+    /// along a line, as MapLibre resolves `auto`.
+    #[wasm_bindgen(js_name = rotateWithCamera)]
+    #[serde(rename = "rotateWithCamera")]
+    pub rotate_with_camera: Option<bool>,
+    /// Rotation of the point within its own plane, about its anchor point, in
+    /// degrees, clockwise seen from the front. `anchor` decides where inside
+    /// the quad the pivot sits. Defaults to `0.0`.
+    pub rotation: Option<f32>,
+    /// How anchors are derived from line and polygon geometry: `"point"` (the
+    /// default) puts one at every line and polygon-ring vertex, `"line"`
+    /// repeats them along the line every `spacing`, `"line-center"` places a
+    /// single one at the line's midpoint. Polygon rings are walked like lines. Requires `geometryTypes`
+    /// to include `"line"` or `"polygon"`.
+    #[wasm_bindgen(getter_with_clone)]
+    pub placement: Option<String>,
+    /// Distance between repeated anchors along a line, in screen pixels, for
+    /// `vector-tile` and `geojson` sources alike. Resolved per anchor as the
+    /// camera moves: anchors thin out as it pulls back and fill in as it
+    /// closes, never moving, so the gap on screen stays between one and two
+    /// times `spacing` across a pitched view. As MapLibre does with
+    /// `symbol-spacing`, a sprite wider than three quarters of the spacing
+    /// spreads its repeats to its width plus a quarter of the spacing, and a
+    /// vector tile places anchors only inside its own bounds. Only used by
+    /// `placement: "line"`. Defaults to `250.0`.
+    pub spacing: Option<f32>,
+    /// Add the line's tangent bearing at the anchor to `rotation`, so the
+    /// sprite turns with the line it sits on. Defaults to `true`.
+    #[wasm_bindgen(js_name = rotateToLine)]
+    #[serde(rename = "rotateToLine")]
+    pub rotate_to_line: Option<bool>,
+    /// Part of the quad placed at the anchor point: `"center"` (default),
+    /// `"left"`, `"right"`, `"top"`, `"bottom"`, `"top-left"`, `"top-right"`,
+    /// `"bottom-left"` or `"bottom-right"`, as MapLibre's `icon-anchor`.
+    #[wasm_bindgen(getter_with_clone)]
+    pub anchor: Option<String>,
+    /// Shift from the anchor point, x right and y down, in the unit of `size`
+    /// (meters when `sizeInMeters`, pixels otherwise). Lies in the quad's own
+    /// plane, so it turns with `rotation`. Defaults to `(0, 0)`.
+    pub offset: Option<Vec2>,
+    /// Screen-pixel shift of the drawn quad, x right and y down, applied after
+    /// projection so it stays the same number of pixels at any distance, as
+    /// MapLibre's `icon-translate`. Defaults to `(0, 0)`.
+    pub translate: Option<Vec2>,
+    /// Frame `translate` is measured in: `"map"` (default) turns it with the
+    /// camera heading so +x points east and +y south; `"viewport"` keeps it on
+    /// the screen axes. MapLibre's `icon-translate-anchor`.
+    #[wasm_bindgen(getter_with_clone, js_name = translateAnchor)]
+    #[serde(rename = "translateAnchor")]
+    pub translate_anchor: Option<String>,
     pub height: Option<f32>,
     #[wasm_bindgen(js_name = sizeInMeters)]
     #[serde(rename = "sizeInMeters")]
@@ -55,6 +270,13 @@ pub struct PointMaterial {
     #[wasm_bindgen(js_name = depthTest)]
     #[serde(rename = "depthTest")]
     pub depth_test: Option<bool>,
+    /// Whether faces seen from behind are culled. Default is false. Only a
+    /// flat quad has a back the camera can see: turn it on to hide the parts
+    /// of a large one that wrap over the horizon, which face away from the
+    /// camera.
+    #[wasm_bindgen(js_name = backfaceCulling)]
+    #[serde(rename = "backfaceCulling")]
+    pub backface_culling: Option<bool>,
     /// Avoid overlapping with the globe surface.
     #[wasm_bindgen(js_name = offsetDepth)]
     #[serde(rename = "offsetDepth")]
@@ -65,11 +287,36 @@ pub struct PointMaterial {
     /// on screen, lower-priority ones are hidden. Defaults to `true`; set to
     /// `false` to draw every label unconditionally.
     pub declutter: Option<bool>,
+    /// Coarse placement order for decluttering, compared before
+    /// `declutterPriority`: every label with a higher rank is placed before any
+    /// label with a lower one, whatever their priorities. Only meaningful when
+    /// `declutter` is enabled. Defaults to `0.0`.
+    #[wasm_bindgen(js_name = declutterRank)]
+    #[serde(rename = "declutterRank")]
+    pub declutter_rank: Option<f32>,
     /// Placement priority for decluttering; higher wins. Only meaningful when
     /// `declutter` is enabled. Defaults to `0.0`.
     #[wasm_bindgen(js_name = declutterPriority)]
     #[serde(rename = "declutterPriority")]
     pub declutter_priority: Option<f32>,
+    /// Extra space around the collision box, in screen pixels: one to four
+    /// values, expanded like CSS padding (top, right, bottom, left). Only
+    /// meaningful when `declutter` is enabled. Defaults to `[2]`.
+    #[wasm_bindgen(getter_with_clone, js_name = declutterPadding)]
+    #[serde(rename = "declutterPadding")]
+    pub declutter_padding: Option<Vec<f32>>,
+    /// Whether the label may be drawn over symbols placed before it:
+    /// `"never"` (the default) hides it on any collision, `"always"` never
+    /// does, `"cooperative"` hides it only when it collides with a `"never"`
+    /// symbol. Only meaningful when `declutter` is enabled.
+    #[wasm_bindgen(getter_with_clone)]
+    pub overlap: Option<String>,
+    /// Leave this label's box out of the collision grid, so symbols placed
+    /// after it may overlap it. Only meaningful when `declutter` is enabled.
+    /// Defaults to `false`.
+    #[wasm_bindgen(js_name = ignorePlacement)]
+    #[serde(rename = "ignorePlacement")]
+    pub ignore_placement: Option<bool>,
     /// Source geometry types this appearance consumes: `"point"`, `"line"`,
     /// `"polygon"`. Defaults to `["point"]`; adding `"line"`/`"polygon"` also
     /// emits a point per line-string / polygon-ring vertex.
@@ -97,17 +344,33 @@ impl From<PointMaterial> for navara_material::PointMaterial {
         navara_material::PointMaterial {
             show: val.show.unwrap_or(default.show),
             size: val.size.unwrap_or(default.size),
+            point_facing: parse_facing("pointFacing", &val.point_facing),
+            rotate_with_camera: val.rotate_with_camera,
+            rotation: val.rotation.unwrap_or(default.rotation),
+            placement: parse_placement(&val.placement).unwrap_or(default.placement),
+            spacing: val.spacing.unwrap_or(default.spacing),
+            rotate_to_line: val.rotate_to_line.unwrap_or(default.rotate_to_line),
             color: val.color.unwrap_or(default.color),
-            center: val.center.unwrap_or(default.center.into()).into(),
+            anchor: parse_anchor(&val.anchor).unwrap_or(default.anchor),
+            offset: val.offset.unwrap_or(default.offset.into()).into(),
+            translate: val.translate.unwrap_or(default.translate.into()).into(),
+            translate_anchor: parse_translate_anchor(&val.translate_anchor)
+                .unwrap_or(default.translate_anchor),
             height: val.height.unwrap_or(default.height),
             size_in_meters: val.size_in_meters.unwrap_or(default.size_in_meters),
             clamp_to_ground: val.clamp_to_ground.unwrap_or(default.clamp_to_ground),
             depth_test: val.depth_test.unwrap_or(default.depth_test),
+            backface_culling: val.backface_culling.unwrap_or(default.backface_culling),
             offset_depth: val.offset_depth.unwrap_or(default.offset_depth),
             transparent: val.transparent.unwrap_or(default.transparent),
             opacity: val.opacity.unwrap_or(default.opacity),
             declutter: val.declutter.unwrap_or(default.declutter),
+            declutter_rank: val.declutter_rank.unwrap_or(default.declutter_rank),
             declutter_priority: val.declutter_priority.unwrap_or(default.declutter_priority),
+            declutter_padding: parse_padding(&val.declutter_padding)
+                .unwrap_or(default.declutter_padding),
+            overlap: parse_overlap(&val.overlap).unwrap_or(default.overlap),
+            ignore_placement: val.ignore_placement.unwrap_or(default.ignore_placement),
             geometry_types: parse_geometry_types(&val.geometry_types)
                 .unwrap_or(default.geometry_types),
             effect_ids: val.effect_ids.or(default.effect_ids),
@@ -121,17 +384,31 @@ impl<'a> From<&'a navara_material::PointMaterial> for PointMaterial {
         PointMaterial {
             show: Some(value.show),
             size: Some(value.size),
+            point_facing: value.point_facing.map(|f| f.as_str().to_string()),
+            rotate_with_camera: value.rotate_with_camera,
+            rotation: Some(value.rotation),
+            placement: Some(value.placement.as_str().to_string()),
+            spacing: Some(value.spacing),
+            rotate_to_line: Some(value.rotate_to_line),
             color: Some(value.color),
-            center: Some(value.center.into()),
+            anchor: Some(value.anchor.as_str().to_string()),
+            offset: Some(value.offset.into()),
+            translate: Some(value.translate.into()),
+            translate_anchor: Some(value.translate_anchor.as_str().to_string()),
             height: Some(value.height),
             size_in_meters: Some(value.size_in_meters),
             clamp_to_ground: Some(value.clamp_to_ground),
             depth_test: Some(value.depth_test),
+            backface_culling: Some(value.backface_culling),
             offset_depth: Some(value.offset_depth),
             transparent: Some(value.transparent),
             opacity: Some(value.opacity),
             declutter: Some(value.declutter),
+            declutter_rank: Some(value.declutter_rank),
             declutter_priority: Some(value.declutter_priority),
+            declutter_padding: Some(value.declutter_padding.to_vec()),
+            overlap: Some(value.overlap.as_str().to_string()),
+            ignore_placement: Some(value.ignore_placement),
             geometry_types: Some(geometry_type_names(&value.geometry_types)),
             effect_ids: value.effect_ids.clone(),
             emissive_intensity: value.emissive_intensity,
@@ -146,16 +423,32 @@ impl PointMaterial {
             show: self.show.unwrap_or(other.show),
             size: self.size.unwrap_or(other.size),
             color: self.color.unwrap_or(other.color),
-            center: self.center.unwrap_or(other.center.into()).into(),
+            point_facing: parse_facing("pointFacing", &self.point_facing).or(other.point_facing),
+            rotate_with_camera: self.rotate_with_camera.or(other.rotate_with_camera),
+            rotation: self.rotation.unwrap_or(other.rotation),
+            placement: parse_placement(&self.placement).unwrap_or(other.placement),
+            spacing: self.spacing.unwrap_or(other.spacing),
+            rotate_to_line: self.rotate_to_line.unwrap_or(other.rotate_to_line),
+            anchor: parse_anchor(&self.anchor).unwrap_or(other.anchor),
+            offset: self.offset.unwrap_or(other.offset.into()).into(),
+            translate: self.translate.unwrap_or(other.translate.into()).into(),
+            translate_anchor: parse_translate_anchor(&self.translate_anchor)
+                .unwrap_or(other.translate_anchor),
             height: self.height.unwrap_or(other.height),
             size_in_meters: self.size_in_meters.unwrap_or(other.size_in_meters),
             clamp_to_ground: self.clamp_to_ground.unwrap_or(other.clamp_to_ground),
             depth_test: self.depth_test.unwrap_or(other.depth_test),
+            backface_culling: self.backface_culling.unwrap_or(other.backface_culling),
             offset_depth: self.offset_depth.unwrap_or(other.offset_depth),
             transparent: self.transparent.unwrap_or(other.transparent),
             opacity: self.opacity.unwrap_or(other.opacity),
             declutter: self.declutter.unwrap_or(other.declutter),
+            declutter_rank: self.declutter_rank.unwrap_or(other.declutter_rank),
             declutter_priority: self.declutter_priority.unwrap_or(other.declutter_priority),
+            declutter_padding: parse_padding(&self.declutter_padding)
+                .unwrap_or(other.declutter_padding),
+            overlap: parse_overlap(&self.overlap).unwrap_or(other.overlap),
+            ignore_placement: self.ignore_placement.unwrap_or(other.ignore_placement),
             geometry_types: parse_geometry_types(&self.geometry_types)
                 .unwrap_or_else(|| other.geometry_types.clone()),
             effect_ids: self.effect_ids.clone().or_else(|| other.effect_ids.clone()),
@@ -179,9 +472,71 @@ pub struct BillboardMaterial {
     /// size in pixels/meters (units are determined by `sizeInMeters`).
     pub size: Option<f32>,
     pub color: Option<u32>,
-    /// anchor point of the sprite, range is (-0.5, -0.5) to (0.5, 0.5).
-    /// Default is (0.0, 0.0) which means the center of the sprite.
-    pub center: Option<Vec2>,
+    /// Plane the sprite lies in: the screen (`"upright"`, never foreshortened)
+    /// or the globe surface around its anchor (`"flat"`), as MapLibre's
+    /// `icon-pitch-alignment` `viewport` and `map`. Pair with
+    /// `rotateWithCamera`. Left unset, it is `"flat"` when `rotateWithCamera`
+    /// resolves to `false` and `"upright"` otherwise, as MapLibre resolves
+    /// `auto`.
+    #[wasm_bindgen(getter_with_clone, js_name = billboardFacing)]
+    #[serde(rename = "billboardFacing")]
+    pub billboard_facing: Option<String>,
+    /// Whether the sprite turns with the camera or with the map, as MapLibre's
+    /// `icon-rotation-alignment` `viewport` and `map`. `true` keeps it reading left to right
+    /// (a screen-aligned billboard, or a flat quad yawed to the camera).
+    /// `false` aligns it with the map: upright, it stays on screen but turns
+    /// with the camera heading so its x-axis points east; flat, it lies
+    /// north-up. Left unset, it is `true` for `placement: "point"` and `false`
+    /// along a line, as MapLibre resolves `auto`.
+    #[wasm_bindgen(js_name = rotateWithCamera)]
+    #[serde(rename = "rotateWithCamera")]
+    pub rotate_with_camera: Option<bool>,
+    /// Rotation of the sprite within its own plane, about its anchor point,
+    /// in degrees, clockwise seen from the front. `anchor` decides where
+    /// inside the sprite the pivot sits. Defaults to `0.0`.
+    pub rotation: Option<f32>,
+    /// How anchors are derived from line and polygon geometry: `"point"` (the
+    /// default) puts one per line string, at its first vertex, and one per
+    /// polygon, `"line"` repeats them along the line every `spacing`,
+    /// `"line-center"` places a single one at the line's midpoint. Polygon
+    /// rings are walked like lines. Requires `geometryTypes` to include
+    /// `"line"` or `"polygon"`.
+    #[wasm_bindgen(getter_with_clone)]
+    pub placement: Option<String>,
+    /// Distance between repeated anchors along a line, in screen pixels, for
+    /// `vector-tile` and `geojson` sources alike. Resolved per anchor as the
+    /// camera moves: anchors thin out as it pulls back and fill in as it
+    /// closes, never moving, so the gap on screen stays between one and two
+    /// times `spacing` across a pitched view. As MapLibre does with
+    /// `symbol-spacing`, a sprite wider than three quarters of the spacing
+    /// spreads its repeats to its width plus a quarter of the spacing, and a
+    /// vector tile places anchors only inside its own bounds. Only used by
+    /// `placement: "line"`. Defaults to `250.0`.
+    pub spacing: Option<f32>,
+    /// Add the line's tangent bearing at the anchor to `rotation`, so the
+    /// sprite turns with the line it sits on. Defaults to `true`.
+    #[wasm_bindgen(js_name = rotateToLine)]
+    #[serde(rename = "rotateToLine")]
+    pub rotate_to_line: Option<bool>,
+    /// Part of the quad placed at the anchor point: `"center"` (default),
+    /// `"left"`, `"right"`, `"top"`, `"bottom"`, `"top-left"`, `"top-right"`,
+    /// `"bottom-left"` or `"bottom-right"`, as MapLibre's `icon-anchor`.
+    #[wasm_bindgen(getter_with_clone)]
+    pub anchor: Option<String>,
+    /// Shift from the anchor point, x right and y down, in the unit of `size`
+    /// (meters when `sizeInMeters`, pixels otherwise). Lies in the quad's own
+    /// plane, so it turns with `rotation`. Defaults to `(0, 0)`.
+    pub offset: Option<Vec2>,
+    /// Screen-pixel shift of the drawn quad, x right and y down, applied after
+    /// projection so it stays the same number of pixels at any distance, as
+    /// MapLibre's `icon-translate`. Defaults to `(0, 0)`.
+    pub translate: Option<Vec2>,
+    /// Frame `translate` is measured in: `"map"` (default) turns it with the
+    /// camera heading so +x points east and +y south; `"viewport"` keeps it on
+    /// the screen axes. MapLibre's `icon-translate-anchor`.
+    #[wasm_bindgen(getter_with_clone, js_name = translateAnchor)]
+    #[serde(rename = "translateAnchor")]
+    pub translate_anchor: Option<String>,
     pub height: Option<f32>,
     #[wasm_bindgen(getter_with_clone)]
     pub url: Option<String>,
@@ -189,12 +544,26 @@ pub struct BillboardMaterial {
     #[serde(rename = "sizeInMeters")]
     /// Whether the size is specified in meters. If false, the size is in pixels. Default is true.
     pub size_in_meters: Option<bool>,
+    /// Whether `size` scales the image's own pixel height instead of being the
+    /// quad's height, like MapLibre's `icon-size`: `1` draws the image at its
+    /// natural size. `offset` keeps the unit `sizeInMeters` gives it. Default
+    /// is false.
+    #[wasm_bindgen(js_name = sizeRelativeToImage)]
+    #[serde(rename = "sizeRelativeToImage")]
+    pub size_relative_to_image: Option<bool>,
     #[wasm_bindgen(js_name = clampToGround)]
     #[serde(rename = "clampToGround")]
     pub clamp_to_ground: Option<bool>,
     #[wasm_bindgen(js_name = depthTest)]
     #[serde(rename = "depthTest")]
     pub depth_test: Option<bool>,
+    /// Whether faces seen from behind are culled. Default is false. Only a
+    /// flat quad has a back the camera can see: turn it on to hide the parts
+    /// of a large one that wrap over the horizon, which face away from the
+    /// camera.
+    #[wasm_bindgen(js_name = backfaceCulling)]
+    #[serde(rename = "backfaceCulling")]
+    pub backface_culling: Option<bool>,
     /// Avoid overlapping with the globe surface.
     #[wasm_bindgen(js_name = offsetDepth)]
     #[serde(rename = "offsetDepth")]
@@ -208,14 +577,46 @@ pub struct BillboardMaterial {
     /// on screen, lower-priority ones are hidden. Defaults to `true`; set to
     /// `false` to draw every label unconditionally.
     pub declutter: Option<bool>,
+    /// Coarse placement order for decluttering, compared before
+    /// `declutterPriority`: every label with a higher rank is placed before any
+    /// label with a lower one, whatever their priorities. Only meaningful when
+    /// `declutter` is enabled. Defaults to `0.0`.
+    #[wasm_bindgen(js_name = declutterRank)]
+    #[serde(rename = "declutterRank")]
+    pub declutter_rank: Option<f32>,
     /// Placement priority for decluttering; higher wins. Only meaningful when
     /// `declutter` is enabled. Defaults to `0.0`.
     #[wasm_bindgen(js_name = declutterPriority)]
     #[serde(rename = "declutterPriority")]
     pub declutter_priority: Option<f32>,
+    /// Extra space around the collision box, in screen pixels: one to four
+    /// values, expanded like CSS padding (top, right, bottom, left). Only
+    /// meaningful when `declutter` is enabled. Defaults to `[2]`.
+    #[wasm_bindgen(getter_with_clone, js_name = declutterPadding)]
+    #[serde(rename = "declutterPadding")]
+    pub declutter_padding: Option<Vec<f32>>,
+    /// Whether the label may be drawn over symbols placed before it:
+    /// `"never"` (the default) hides it on any collision, `"always"` never
+    /// does, `"cooperative"` hides it only when it collides with a `"never"`
+    /// symbol. Only meaningful when `declutter` is enabled.
+    #[wasm_bindgen(getter_with_clone)]
+    pub overlap: Option<String>,
+    /// Leave this label's box out of the collision grid, so symbols placed
+    /// after it may overlap it. Only meaningful when `declutter` is enabled.
+    /// Defaults to `false`.
+    #[wasm_bindgen(js_name = ignorePlacement)]
+    #[serde(rename = "ignorePlacement")]
+    pub ignore_placement: Option<bool>,
+    /// Whether this may show while its partner at the same anchor (the
+    /// layer's label for a billboard, its billboard for a label) is hidden.
+    /// With `false` on both, the two are placed together: both show or
+    /// neither does. Only meaningful when `declutter` is enabled. Defaults to
+    /// `true`.
+    pub standalone: Option<bool>,
     /// Source geometry types this appearance consumes: `"point"`, `"line"`,
-    /// `"polygon"`. Defaults to `["point"]`; adding `"line"`/`"polygon"` also
-    /// emits a billboard per line-string / polygon-ring vertex.
+    /// `"polygon"`. Defaults to `["point"]`; adding `"line"` also emits a
+    /// billboard per line string, at its first vertex, and `"polygon"` one per
+    /// polygon.
     #[wasm_bindgen(getter_with_clone, js_name = geometryTypes)]
     #[serde(rename = "geometryTypes")]
     pub geometry_types: Option<Vec<String>>,
@@ -241,18 +642,38 @@ impl From<BillboardMaterial> for navara_material::BillboardMaterial {
             show: val.show.unwrap_or(default.show),
             size: val.size.unwrap_or(default.size),
             color: val.color.unwrap_or(default.color),
-            center: val.center.unwrap_or(default.center.into()).into(),
+            billboard_facing: parse_facing("billboardFacing", &val.billboard_facing),
+            rotate_with_camera: val.rotate_with_camera,
+            rotation: val.rotation.unwrap_or(default.rotation),
+            placement: parse_placement(&val.placement).unwrap_or(default.placement),
+            spacing: val.spacing.unwrap_or(default.spacing),
+            rotate_to_line: val.rotate_to_line.unwrap_or(default.rotate_to_line),
+            anchor: parse_anchor(&val.anchor).unwrap_or(default.anchor),
+            offset: val.offset.unwrap_or(default.offset.into()).into(),
+            translate: val.translate.unwrap_or(default.translate.into()).into(),
+            translate_anchor: parse_translate_anchor(&val.translate_anchor)
+                .unwrap_or(default.translate_anchor),
             height: val.height.unwrap_or(default.height),
             url: val.url.unwrap_or(default.url),
             size_in_meters: val.size_in_meters.unwrap_or(default.size_in_meters),
+            size_relative_to_image: val
+                .size_relative_to_image
+                .unwrap_or(default.size_relative_to_image),
             clamp_to_ground: val.clamp_to_ground.unwrap_or(default.clamp_to_ground),
             depth_test: val.depth_test.unwrap_or(default.depth_test),
+            backface_culling: val.backface_culling.unwrap_or(default.backface_culling),
             offset_depth: val.offset_depth.unwrap_or(default.offset_depth),
             transparent: val.transparent.unwrap_or(default.transparent),
             opacity: val.opacity.unwrap_or(default.opacity),
             alpha_test: val.alpha_test.unwrap_or(default.alpha_test),
             declutter: val.declutter.unwrap_or(default.declutter),
+            declutter_rank: val.declutter_rank.unwrap_or(default.declutter_rank),
             declutter_priority: val.declutter_priority.unwrap_or(default.declutter_priority),
+            declutter_padding: parse_padding(&val.declutter_padding)
+                .unwrap_or(default.declutter_padding),
+            overlap: parse_overlap(&val.overlap).unwrap_or(default.overlap),
+            ignore_placement: val.ignore_placement.unwrap_or(default.ignore_placement),
+            standalone: val.standalone.unwrap_or(default.standalone),
             geometry_types: parse_geometry_types(&val.geometry_types)
                 .unwrap_or(default.geometry_types),
             effect_ids: val.effect_ids.or(default.effect_ids),
@@ -267,18 +688,34 @@ impl<'a> From<&'a navara_material::BillboardMaterial> for BillboardMaterial {
             show: Some(value.show),
             size: Some(value.size),
             color: Some(value.color),
-            center: Some(value.center.into()),
+            anchor: Some(value.anchor.as_str().to_string()),
+            offset: Some(value.offset.into()),
+            translate: Some(value.translate.into()),
+            translate_anchor: Some(value.translate_anchor.as_str().to_string()),
+            billboard_facing: value.billboard_facing.map(|f| f.as_str().to_string()),
+            rotate_with_camera: value.rotate_with_camera,
+            rotation: Some(value.rotation),
+            placement: Some(value.placement.as_str().to_string()),
+            spacing: Some(value.spacing),
+            rotate_to_line: Some(value.rotate_to_line),
             height: Some(value.height),
             url: Some(value.url.clone()),
             size_in_meters: Some(value.size_in_meters),
+            size_relative_to_image: Some(value.size_relative_to_image),
             clamp_to_ground: Some(value.clamp_to_ground),
             depth_test: Some(value.depth_test),
+            backface_culling: Some(value.backface_culling),
             offset_depth: Some(value.offset_depth),
             transparent: Some(value.transparent),
             opacity: Some(value.opacity),
             alpha_test: Some(value.alpha_test),
             declutter: Some(value.declutter),
+            declutter_rank: Some(value.declutter_rank),
             declutter_priority: Some(value.declutter_priority),
+            declutter_padding: Some(value.declutter_padding.to_vec()),
+            overlap: Some(value.overlap.as_str().to_string()),
+            ignore_placement: Some(value.ignore_placement),
+            standalone: Some(value.standalone),
             geometry_types: Some(geometry_type_names(&value.geometry_types)),
             effect_ids: value.effect_ids.clone(),
             emissive_intensity: value.emissive_intensity,
@@ -296,23 +733,66 @@ impl BillboardMaterial {
             show: self.show.unwrap_or(other.show),
             size: self.size.unwrap_or(other.size),
             color: self.color.unwrap_or(other.color),
-            center: self.center.unwrap_or(other.center.into()).into(),
+            billboard_facing: parse_facing("billboardFacing", &self.billboard_facing)
+                .or(other.billboard_facing),
+            rotate_with_camera: self.rotate_with_camera.or(other.rotate_with_camera),
+            rotation: self.rotation.unwrap_or(other.rotation),
+            placement: parse_placement(&self.placement).unwrap_or(other.placement),
+            spacing: self.spacing.unwrap_or(other.spacing),
+            rotate_to_line: self.rotate_to_line.unwrap_or(other.rotate_to_line),
+            anchor: parse_anchor(&self.anchor).unwrap_or(other.anchor),
+            offset: self.offset.unwrap_or(other.offset.into()).into(),
+            translate: self.translate.unwrap_or(other.translate.into()).into(),
+            translate_anchor: parse_translate_anchor(&self.translate_anchor)
+                .unwrap_or(other.translate_anchor),
             height: self.height.unwrap_or(other.height),
             url: self.url.clone().unwrap_or(other.url.clone()),
             size_in_meters: self.size_in_meters.unwrap_or(other.size_in_meters),
+            size_relative_to_image: self
+                .size_relative_to_image
+                .unwrap_or(other.size_relative_to_image),
             clamp_to_ground: self.clamp_to_ground.unwrap_or(other.clamp_to_ground),
             depth_test: self.depth_test.unwrap_or(other.depth_test),
+            backface_culling: self.backface_culling.unwrap_or(other.backface_culling),
             offset_depth: self.offset_depth.unwrap_or(other.offset_depth),
             transparent: self.transparent.unwrap_or(other.transparent),
             opacity: self.opacity.unwrap_or(other.opacity),
             alpha_test: self.alpha_test.unwrap_or(other.alpha_test),
             declutter: self.declutter.unwrap_or(other.declutter),
+            declutter_rank: self.declutter_rank.unwrap_or(other.declutter_rank),
             declutter_priority: self.declutter_priority.unwrap_or(other.declutter_priority),
+            declutter_padding: parse_padding(&self.declutter_padding)
+                .unwrap_or(other.declutter_padding),
+            overlap: parse_overlap(&self.overlap).unwrap_or(other.overlap),
+            ignore_placement: self.ignore_placement.unwrap_or(other.ignore_placement),
+            standalone: self.standalone.unwrap_or(other.standalone),
             geometry_types: parse_geometry_types(&self.geometry_types)
                 .unwrap_or_else(|| other.geometry_types.clone()),
             effect_ids: self.effect_ids.clone().or_else(|| other.effect_ids.clone()),
             emissive_intensity: self.emissive_intensity.or(other.emissive_intensity),
             emissive_color: self.emissive_color.or(other.emissive_color),
+        }
+    }
+}
+
+/// One placement a label may take, as an entry of MapLibre's
+/// `text-variable-anchor-offset`.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariableAnchor {
+    /// Part of the text block placed at the anchor point, as `anchor`.
+    #[wasm_bindgen(getter_with_clone)]
+    pub anchor: String,
+    /// Shift from the anchor point, x right and y down, in ems. Defaults to
+    /// `(0, 0)`.
+    pub offset: Option<Vec2>,
+}
+
+impl From<&navara_material::VariableAnchor> for VariableAnchor {
+    fn from(value: &navara_material::VariableAnchor) -> Self {
+        VariableAnchor {
+            anchor: value.anchor.as_str().to_string(),
+            offset: Some(value.offset.into()),
         }
     }
 }
@@ -324,7 +804,113 @@ pub struct TextMaterial {
     /// size in pixels/meters (units are determined by `sizeInMeters`).
     pub size: Option<f32>,
     pub color: Option<u32>,
-    pub center: Option<Vec2>,
+    /// Part of the text block placed at the anchor point: `"center"`
+    /// (default), `"left"`, `"right"`, `"top"`, `"bottom"`, `"top-left"`,
+    /// `"top-right"`, `"bottom-left"` or `"bottom-right"`, as MapLibre's
+    /// `text-anchor`. The block is as wide as its widest line and one line
+    /// height tall per line.
+    #[wasm_bindgen(getter_with_clone)]
+    pub anchor: Option<String>,
+    /// Shift from the anchor point, x right and y down, in ems (multiples of
+    /// `size`), as MapLibre's `text-offset`. Lies in the label's own plane, so
+    /// it turns with `rotation`. Defaults to `(0, 0)`.
+    pub offset: Option<Vec2>,
+    /// Placements the declutter pass tries in order, keeping the first whose
+    /// box is free, as MapLibre's `text-variable-anchor-offset`. The one in
+    /// use is tried first, so a label only moves when it must. Overrides
+    /// `anchor` and `offset` when not empty, except along a line. Without
+    /// declutter the first is used.
+    #[wasm_bindgen(getter_with_clone, js_name = variableAnchors)]
+    #[serde(rename = "variableAnchors")]
+    pub variable_anchors: Option<Vec<VariableAnchor>>,
+    /// Screen-pixel shift of the drawn label, x right and y down, applied after
+    /// projection so it stays the same number of pixels at any distance, as
+    /// MapLibre's `text-translate`. Defaults to `(0, 0)`.
+    pub translate: Option<Vec2>,
+    /// Frame `translate` is measured in: `"map"` (default) turns it with the
+    /// camera heading so +x points east and +y south; `"viewport"` keeps it on
+    /// the screen axes. MapLibre's `text-translate-anchor`.
+    #[wasm_bindgen(getter_with_clone, js_name = translateAnchor)]
+    #[serde(rename = "translateAnchor")]
+    pub translate_anchor: Option<String>,
+    /// Plane the label lies in: the screen (`"upright"`, never foreshortened)
+    /// or the globe surface around its anchor (`"flat"`), following its
+    /// curvature so it reads as painted on the surface. MapLibre's
+    /// `text-pitch-alignment` `viewport` and `map`. Pair with
+    /// `rotateWithCamera`. Left unset, it is `"flat"` when `rotateWithCamera`
+    /// resolves to `false` and `"upright"` otherwise, as MapLibre resolves
+    /// `auto`.
+    #[wasm_bindgen(getter_with_clone, js_name = textFacing)]
+    #[serde(rename = "textFacing")]
+    pub text_facing: Option<String>,
+    /// Rotation of the label within its own plane, about its anchor point, in
+    /// degrees, clockwise seen from the front. Applied on top of whatever
+    /// orientation `textFacing` and `rotateWithCamera` resolve to: it spins a
+    /// billboard on screen and turns a surface label like a compass bearing.
+    /// `anchor` decides where inside the text the pivot sits. Along a line
+    /// each glyph spins about its own point on the line, as MapLibre's
+    /// `text-rotate` does, except for a straight label (`rotateWithCamera`
+    /// without `spreadGlyphs`), which turns as a whole. Defaults to `0.0`.
+    pub rotation: Option<f32>,
+    /// Whether the label turns with the camera or with the map, as MapLibre's
+    /// `text-rotation-alignment` `viewport` and `map`. `true` keeps it reading
+    /// left to right (a screen-aligned billboard, or a flat label yawed to the
+    /// camera). `false` aligns it with the map: upright, it stays on screen but
+    /// turns with the camera heading so its x-axis points east; flat, it lies
+    /// north-up. Along a line, `false` makes the label follow the line, and
+    /// `true` draws it straight at its anchor unless `spreadGlyphs` is set.
+    /// Left unset, it is `true` for `placement: "point"` and `false` along a
+    /// line, as MapLibre resolves `auto`.
+    #[wasm_bindgen(js_name = rotateWithCamera)]
+    #[serde(rename = "rotateWithCamera")]
+    pub rotate_with_camera: Option<bool>,
+    /// How anchors are derived from line and polygon geometry: `"point"` (the
+    /// default) puts a label per line string, at its first vertex, and one
+    /// per polygon, `"line"` repeats labels along the line every `spacing`
+    /// with the glyphs bending to follow it, `"line-center"` places a single
+    /// label at the line's midpoint. Polygon rings are walked like lines.
+    /// Requires `geometryTypes` to include `"line"` or `"polygon"`.
+    #[wasm_bindgen(getter_with_clone)]
+    pub placement: Option<String>,
+    /// Distance between repeated labels along a line, in screen pixels, for
+    /// `vector-tile` and `geojson` sources alike. Resolved per label as the
+    /// camera moves: labels thin out as it pulls back and fill in as it
+    /// closes, never moving, so the gap on screen stays between one and two
+    /// times `spacing` across a pitched view. As MapLibre does with
+    /// `symbol-spacing`, a label longer than three quarters of the spacing
+    /// spreads its repeats to its own length plus a quarter of the spacing, a
+    /// label within half the spacing of an earlier one with the same text is
+    /// dropped, and a vector tile places labels only inside its own bounds.
+    /// Defaults to `250.0`.
+    pub spacing: Option<f32>,
+    /// Largest turn, in degrees, the line may make under a label within a
+    /// window of about one and a half ems before the label is dropped as
+    /// unreadable. The window slides along the label, so a long gentle curve
+    /// is accepted however far it turns in total. Defaults to `45.0`.
+    #[wasm_bindgen(js_name = maxAngle)]
+    #[serde(rename = "maxAngle")]
+    pub max_angle: Option<f32>,
+    /// Flip a label that would otherwise read right-to-left, so names stay
+    /// legible whichever way the underlying line runs. Defaults to `true`.
+    #[wasm_bindgen(js_name = keepUpright)]
+    #[serde(rename = "keepUpright")]
+    pub keep_upright: Option<bool>,
+    /// Place each glyph of an along-line label on its own instead of each
+    /// word. With `rotateWithCamera: false` each glyph turns with the line
+    /// under it (MapLibre's `symbol-placement: "line"`); with `true`, each
+    /// glyph turns to the camera like a point label and is spaced on the
+    /// screen (MapLibre's `viewport-glyph`). Can be overridden per feature
+    /// from a feature evaluator. Defaults to `false`.
+    #[wasm_bindgen(js_name = spreadGlyphs)]
+    #[serde(rename = "spreadGlyphs")]
+    pub spread_glyphs: Option<bool>,
+    /// Offset perpendicular to the line, in the same units as the font size:
+    /// pixels when `sizeInMeters` is false, metres when it is true. Positive is
+    /// to the left of the direction of travel, which puts the name above the
+    /// line. Defaults to `0.0`.
+    #[wasm_bindgen(js_name = lineOffset)]
+    #[serde(rename = "lineOffset")]
+    pub line_offset: Option<f32>,
     pub height: Option<f32>,
     /// Whether the size is specified in meters. If false, the size is in pixels. Default is true.
     #[wasm_bindgen(js_name = sizeInMeters)]
@@ -336,6 +922,13 @@ pub struct TextMaterial {
     #[wasm_bindgen(js_name = depthTest)]
     #[serde(rename = "depthTest")]
     pub depth_test: Option<bool>,
+    /// Whether faces seen from behind are culled. Default is false. Only a
+    /// flat quad has a back the camera can see: turn it on to hide the parts
+    /// of a large one that wrap over the horizon, which face away from the
+    /// camera.
+    #[wasm_bindgen(js_name = backfaceCulling)]
+    #[serde(rename = "backfaceCulling")]
+    pub backface_culling: Option<bool>,
     /// Avoid overlapping with the globe surface.
     #[wasm_bindgen(js_name = offsetDepth)]
     #[serde(rename = "offsetDepth")]
@@ -372,23 +965,27 @@ pub struct TextMaterial {
     // pub corner_radius: Option<f32>,
     // pub padding: Option<Vec2>,
     // outline
-    // TODO: support outlineBlur and outlineOffset later.
-    /// Outline blur radius in CSS pixels. Defaults to `0.0`.
-    // #[wasm_bindgen(js_name = outlineBlur)]
-    // #[serde(rename = "outlineBlur")]
-    // pub outline_blur: Option<f32>,
+    /// Width over which the outline's outer edge fades out, centered on that
+    /// edge, in the unit of `outlineWidth`. Defaults to `0.0`.
+    #[wasm_bindgen(js_name = outlineBlur)]
+    #[serde(rename = "outlineBlur")]
+    pub outline_blur: Option<f32>,
+    /// Outline color. Defaults to black.
     #[wasm_bindgen(js_name = outlineColor)]
     #[serde(rename = "outlineColor")]
-    pub outline_color: Option<u32>, // outlineColor Defalut:black
+    pub outline_color: Option<u32>,
     // TODO: support outlineOffset later.
-    /// Pixel offset `[x, y]` in CSS pixels. Defaults to `(0.0, 0.0)`.
+    // Pixel offset `[x, y]` in CSS pixels. Defaults to `(0.0, 0.0)`.
     // #[wasm_bindgen(js_name = outlineOffset)]
     // #[serde(rename = "outlineOffset")]
     // pub outline_offset: Option<Vec2>,
+    /// Outline opacity, from 0 to 1. Defaults to `1.0`.
     #[wasm_bindgen(js_name = outlineOpacity)]
     #[serde(rename = "outlineOpacity")]
-    pub outline_opacity: Option<f32>, // outlineOpacity Default:1
-    /// Outline thickness measured in CSS pixels. Defaults to `0.0`.
+    pub outline_opacity: Option<f32>,
+    /// Outline thickness in 1/64 em: pixels of text drawn 64 pixels tall, so
+    /// the outline keeps its proportion to the glyphs at any size. Defaults
+    /// to `0.0`.
     #[wasm_bindgen(js_name = outlineWidth)]
     #[serde(rename = "outlineWidth")]
     pub outline_width: Option<f32>,
@@ -415,29 +1012,69 @@ pub struct TextMaterial {
     #[wasm_bindgen(js_name = maxWidth)]
     #[serde(rename = "maxWidth")]
     pub max_width: Option<f32>,
-    /// Line height as a multiplier of the font's natural line height
-    /// (ascender − descender + line gap). Defaults to `1.0`.
+    /// Distance between the baselines of a multi-line label, in ems
+    /// (multiples of `size`). Defaults to the font's natural line height
+    /// (ascender − descender + line gap).
     #[wasm_bindgen(js_name = lineHeight)]
     #[serde(rename = "lineHeight")]
     pub line_height: Option<f32>,
     /// Horizontal alignment of lines within a multi-line block:
-    /// `"left"`, `"center"` (default), or `"right"`.
+    /// `"left"`, `"center"` (default), `"right"`, or `"auto"`, which aligns
+    /// towards the horizontal side of `anchor` (MapLibre's `text-justify`).
     #[wasm_bindgen(getter_with_clone, js_name = textAlign)]
     #[serde(rename = "textAlign")]
     pub text_align: Option<String>,
+    /// Extra space between characters, in ems (multiples of `size`). Not
+    /// added after the last character; ignored for Arabic-script text.
+    /// Negative values tighten. Defaults to `0.0`.
+    #[wasm_bindgen(js_name = letterSpacing)]
+    #[serde(rename = "letterSpacing")]
+    pub letter_spacing: Option<f32>,
 
     /// Participate in screen-space decluttering: when labels/sprites overlap
     /// on screen, lower-priority ones are hidden. Defaults to `true`; set to
     /// `false` to draw every label unconditionally.
     pub declutter: Option<bool>,
+    /// Coarse placement order for decluttering, compared before
+    /// `declutterPriority`: every label with a higher rank is placed before any
+    /// label with a lower one, whatever their priorities. Only meaningful when
+    /// `declutter` is enabled. Defaults to `0.0`.
+    #[wasm_bindgen(js_name = declutterRank)]
+    #[serde(rename = "declutterRank")]
+    pub declutter_rank: Option<f32>,
     /// Placement priority for decluttering; higher wins. Only meaningful when
     /// `declutter` is enabled. Defaults to `0.0`.
     #[wasm_bindgen(js_name = declutterPriority)]
     #[serde(rename = "declutterPriority")]
     pub declutter_priority: Option<f32>,
+    /// Extra space around the collision box, in screen pixels: one to four
+    /// values, expanded like CSS padding (top, right, bottom, left). Only
+    /// meaningful when `declutter` is enabled. Defaults to `[2]`.
+    #[wasm_bindgen(getter_with_clone, js_name = declutterPadding)]
+    #[serde(rename = "declutterPadding")]
+    pub declutter_padding: Option<Vec<f32>>,
+    /// Whether the label may be drawn over symbols placed before it:
+    /// `"never"` (the default) hides it on any collision, `"always"` never
+    /// does, `"cooperative"` hides it only when it collides with a `"never"`
+    /// symbol. Only meaningful when `declutter` is enabled.
+    #[wasm_bindgen(getter_with_clone)]
+    pub overlap: Option<String>,
+    /// Leave this label's box out of the collision grid, so symbols placed
+    /// after it may overlap it. Only meaningful when `declutter` is enabled.
+    /// Defaults to `false`.
+    #[wasm_bindgen(js_name = ignorePlacement)]
+    #[serde(rename = "ignorePlacement")]
+    pub ignore_placement: Option<bool>,
+    /// Whether this may show while its partner at the same anchor (the
+    /// layer's label for a billboard, its billboard for a label) is hidden.
+    /// With `false` on both, the two are placed together: both show or
+    /// neither does. Only meaningful when `declutter` is enabled. Defaults to
+    /// `true`.
+    pub standalone: Option<bool>,
     /// Source geometry types this appearance consumes: `"point"`, `"line"`,
-    /// `"polygon"`. Defaults to `["point"]`; adding `"line"`/`"polygon"` also
-    /// emits a label per line-string / polygon-ring vertex.
+    /// `"polygon"`. Defaults to `["point"]`; adding `"line"` also emits a
+    /// label per line string, at its first vertex, and `"polygon"` one per
+    /// polygon.
     #[wasm_bindgen(getter_with_clone, js_name = geometryTypes)]
     #[serde(rename = "geometryTypes")]
     pub geometry_types: Option<Vec<String>>,
@@ -463,11 +1100,27 @@ impl From<TextMaterial> for navara_material::TextMaterial {
             show: val.show.unwrap_or(default.show),
             size: val.size.unwrap_or(default.size),
             color: val.color.unwrap_or(default.color),
-            center: val.center.unwrap_or(default.center.into()).into(),
+            anchor: parse_anchor(&val.anchor).unwrap_or(default.anchor),
+            offset: val.offset.unwrap_or(default.offset.into()).into(),
+            variable_anchors: parse_variable_anchors(&val.variable_anchors)
+                .unwrap_or(default.variable_anchors),
+            translate: val.translate.unwrap_or(default.translate.into()).into(),
+            translate_anchor: parse_translate_anchor(&val.translate_anchor)
+                .unwrap_or(default.translate_anchor),
+            text_facing: parse_facing("textFacing", &val.text_facing),
+            rotate_with_camera: val.rotate_with_camera,
+            rotation: val.rotation.unwrap_or(default.rotation),
+            placement: parse_placement(&val.placement).unwrap_or(default.placement),
+            spacing: val.spacing.unwrap_or(default.spacing),
+            max_angle: val.max_angle.unwrap_or(default.max_angle),
+            keep_upright: val.keep_upright.unwrap_or(default.keep_upright),
+            spread_glyphs: val.spread_glyphs.unwrap_or(default.spread_glyphs),
+            line_offset: val.line_offset.unwrap_or(default.line_offset),
             height: val.height.unwrap_or(default.height),
             size_in_meters: val.size_in_meters.unwrap_or(default.size_in_meters),
             clamp_to_ground: val.clamp_to_ground.unwrap_or(default.clamp_to_ground),
             depth_test: val.depth_test.unwrap_or(default.depth_test),
+            backface_culling: val.backface_culling.unwrap_or(default.backface_culling),
             offset_depth: val.offset_depth.unwrap_or(default.offset_depth),
             text: val.text.unwrap_or(default.text),
             font: val.font.unwrap_or(default.font),
@@ -476,7 +1129,7 @@ impl From<TextMaterial> for navara_material::TextMaterial {
             border_width: val.border_width.unwrap_or(default.border_width),
             // corner_radius: val.corner_radius.unwrap_or(default.corner_radius),
             // padding: val.padding.unwrap_or(default.padding.into()).into(),
-            // outline_blur: val.outline_blur.unwrap_or(default.outline_blur),
+            outline_blur: val.outline_blur.unwrap_or(default.outline_blur),
             outline_color: val.outline_color.unwrap_or(default.outline_color),
             // outline_offset: val
             //     .outline_offset
@@ -491,11 +1144,18 @@ impl From<TextMaterial> for navara_material::TextMaterial {
             transparent: val.transparent.unwrap_or(default.transparent),
 
             max_width: val.max_width.unwrap_or(default.max_width),
-            line_height: val.line_height.unwrap_or(default.line_height),
+            line_height: val.line_height.or(default.line_height),
             text_align: val.text_align.unwrap_or(default.text_align),
+            letter_spacing: val.letter_spacing.unwrap_or(default.letter_spacing),
 
             declutter: val.declutter.unwrap_or(default.declutter),
+            declutter_rank: val.declutter_rank.unwrap_or(default.declutter_rank),
             declutter_priority: val.declutter_priority.unwrap_or(default.declutter_priority),
+            declutter_padding: parse_padding(&val.declutter_padding)
+                .unwrap_or(default.declutter_padding),
+            overlap: parse_overlap(&val.overlap).unwrap_or(default.overlap),
+            ignore_placement: val.ignore_placement.unwrap_or(default.ignore_placement),
+            standalone: val.standalone.unwrap_or(default.standalone),
             geometry_types: parse_geometry_types(&val.geometry_types)
                 .unwrap_or(default.geometry_types),
             effect_ids: val.effect_ids.or(default.effect_ids),
@@ -510,11 +1170,25 @@ impl<'a> From<&'a navara_material::TextMaterial> for TextMaterial {
             show: Some(value.show),
             size: Some(value.size),
             color: Some(value.color),
-            center: Some(value.center.into()),
+            anchor: Some(value.anchor.as_str().to_string()),
+            offset: Some(value.offset.into()),
+            variable_anchors: Some(value.variable_anchors.iter().map(Into::into).collect()),
+            translate: Some(value.translate.into()),
+            translate_anchor: Some(value.translate_anchor.as_str().to_string()),
+            text_facing: value.text_facing.map(|f| f.as_str().to_string()),
+            rotate_with_camera: value.rotate_with_camera,
+            rotation: Some(value.rotation),
+            placement: Some(value.placement.as_str().to_string()),
+            spacing: Some(value.spacing),
+            max_angle: Some(value.max_angle),
+            keep_upright: Some(value.keep_upright),
+            spread_glyphs: Some(value.spread_glyphs),
+            line_offset: Some(value.line_offset),
             height: Some(value.height),
             size_in_meters: Some(value.size_in_meters),
             clamp_to_ground: Some(value.clamp_to_ground),
             depth_test: Some(value.depth_test),
+            backface_culling: Some(value.backface_culling),
             offset_depth: Some(value.offset_depth),
             text: Some(value.text.clone()),
             font: Some(value.font.clone()),
@@ -523,7 +1197,7 @@ impl<'a> From<&'a navara_material::TextMaterial> for TextMaterial {
             border_width: Some(value.border_width),
             // corner_radius: Some(value.corner_radius),
             // padding: Some(value.padding.into()),
-            // outline_blur: Some(value.outline_blur),
+            outline_blur: Some(value.outline_blur),
             outline_color: Some(value.outline_color),
             // outline_offset: Some(value.outline_offset.into()),
             outline_opacity: Some(value.outline_opacity),
@@ -535,11 +1209,17 @@ impl<'a> From<&'a navara_material::TextMaterial> for TextMaterial {
             transparent: Some(value.transparent),
 
             max_width: Some(value.max_width),
-            line_height: Some(value.line_height),
+            line_height: value.line_height,
             text_align: Some(value.text_align.clone()),
+            letter_spacing: Some(value.letter_spacing),
 
             declutter: Some(value.declutter),
+            declutter_rank: Some(value.declutter_rank),
             declutter_priority: Some(value.declutter_priority),
+            declutter_padding: Some(value.declutter_padding.to_vec()),
+            overlap: Some(value.overlap.as_str().to_string()),
+            ignore_placement: Some(value.ignore_placement),
+            standalone: Some(value.standalone),
             geometry_types: Some(geometry_type_names(&value.geometry_types)),
             effect_ids: value.effect_ids.clone(),
             emissive_intensity: value.emissive_intensity,
@@ -554,11 +1234,27 @@ impl TextMaterial {
             show: self.show.unwrap_or(other.show),
             size: self.size.unwrap_or(other.size),
             color: self.color.unwrap_or(other.color),
-            center: self.center.unwrap_or(other.center.into()).into(),
+            anchor: parse_anchor(&self.anchor).unwrap_or(other.anchor),
+            offset: self.offset.unwrap_or(other.offset.into()).into(),
+            variable_anchors: parse_variable_anchors(&self.variable_anchors)
+                .unwrap_or_else(|| other.variable_anchors.clone()),
+            translate: self.translate.unwrap_or(other.translate.into()).into(),
+            translate_anchor: parse_translate_anchor(&self.translate_anchor)
+                .unwrap_or(other.translate_anchor),
+            text_facing: parse_facing("textFacing", &self.text_facing).or(other.text_facing),
+            rotate_with_camera: self.rotate_with_camera.or(other.rotate_with_camera),
+            rotation: self.rotation.unwrap_or(other.rotation),
+            placement: parse_placement(&self.placement).unwrap_or(other.placement),
+            spacing: self.spacing.unwrap_or(other.spacing),
+            max_angle: self.max_angle.unwrap_or(other.max_angle),
+            keep_upright: self.keep_upright.unwrap_or(other.keep_upright),
+            spread_glyphs: self.spread_glyphs.unwrap_or(other.spread_glyphs),
+            line_offset: self.line_offset.unwrap_or(other.line_offset),
             height: self.height.unwrap_or(other.height),
             size_in_meters: self.size_in_meters.unwrap_or(other.size_in_meters),
             clamp_to_ground: self.clamp_to_ground.unwrap_or(other.clamp_to_ground),
             depth_test: self.depth_test.unwrap_or(other.depth_test),
+            backface_culling: self.backface_culling.unwrap_or(other.backface_culling),
             offset_depth: self.offset_depth.unwrap_or(other.offset_depth),
             text: self.text.clone().unwrap_or(other.text.clone()),
             font: self.font.clone().unwrap_or(other.font.clone()),
@@ -567,7 +1263,7 @@ impl TextMaterial {
             border_width: self.border_width.unwrap_or(other.border_width),
             // corner_radius: self.corner_radius.unwrap_or(other.corner_radius),
             // padding: self.padding.unwrap_or(other.padding.into()).into(),
-            // outline_blur: self.outline_blur.unwrap_or(other.outline_blur),
+            outline_blur: self.outline_blur.unwrap_or(other.outline_blur),
             outline_color: self.outline_color.unwrap_or(other.outline_color),
             // outline_offset: self
             //     .outline_offset
@@ -582,11 +1278,18 @@ impl TextMaterial {
             transparent: self.transparent.unwrap_or(other.transparent),
 
             max_width: self.max_width.unwrap_or(other.max_width),
-            line_height: self.line_height.unwrap_or(other.line_height),
+            line_height: self.line_height.or(other.line_height),
             text_align: self.text_align.clone().unwrap_or(other.text_align.clone()),
+            letter_spacing: self.letter_spacing.unwrap_or(other.letter_spacing),
 
             declutter: self.declutter.unwrap_or(other.declutter),
+            declutter_rank: self.declutter_rank.unwrap_or(other.declutter_rank),
             declutter_priority: self.declutter_priority.unwrap_or(other.declutter_priority),
+            declutter_padding: parse_padding(&self.declutter_padding)
+                .unwrap_or(other.declutter_padding),
+            overlap: parse_overlap(&self.overlap).unwrap_or(other.overlap),
+            ignore_placement: self.ignore_placement.unwrap_or(other.ignore_placement),
+            standalone: self.standalone.unwrap_or(other.standalone),
             geometry_types: parse_geometry_types(&self.geometry_types)
                 .unwrap_or_else(|| other.geometry_types.clone()),
             effect_ids: self.effect_ids.clone().or_else(|| other.effect_ids.clone()),
@@ -617,6 +1320,20 @@ pub struct PolylineMaterial {
     #[wasm_bindgen(js_name = maxWidth)]
     #[serde(rename = "maxWidth")]
     pub max_width: Option<f32>,
+    /// Alternating dash and gap lengths, in multiples of the line width,
+    /// repeated along the line. The pattern's period is the sum of the
+    /// entries, so an odd-length array ends in a dash that runs into the first
+    /// one. An empty array draws a solid line, which is the default.
+    #[wasm_bindgen(getter_with_clone, js_name = dashArray)]
+    #[serde(rename = "dashArray")]
+    pub dash_array: Option<Vec<f32>>,
+    /// Shape of the ends of the line and of its dashes: `"butt"` (the
+    /// default), `"round"` or `"square"`. `"round"` adds a half circle one
+    /// half line width in radius beyond both ends of the line and of every
+    /// dash, so a zero-length dash becomes a dot. `"square"` extends the ends
+    /// of the line by half a line width and leaves the dashes' ends square.
+    #[wasm_bindgen(getter_with_clone)]
+    pub cap: Option<String>,
     #[wasm_bindgen(js_name = clampToGround)]
     #[serde(rename = "clampToGround")]
     pub clamp_to_ground: Option<bool>,
@@ -628,6 +1345,19 @@ pub struct PolylineMaterial {
     #[wasm_bindgen(js_name = tiled)]
     #[serde(rename = "tiled")]
     pub tiled: Option<bool>,
+    /// Whether edges of the tiled path (`clamp_to_ground` or `tiled`) follow
+    /// the geodesic. Defaults to `true`, which also connects consecutive
+    /// vertices more than 180° apart in longitude the short way, across the
+    /// antimeridian; a closed ring that would then no longer close, such as
+    /// one around a pole, is kept as given. When `false`, edges are straight
+    /// lines in Web Mercator and longitudes are used as given (e.g. 190° is
+    /// east of 180°), as in MapLibre. Ignored outside the tiled path.
+    ///
+    /// Applies to the whole layer: its tiled appearances share one geometry,
+    /// which follows the geodesic unless every one of them sets `false`.
+    /// Read when the layer's tiles are first built; later changes have no
+    /// effect.
+    pub geodesic: Option<bool>,
     pub height: Option<f32>,
     /// Source geometry types this appearance consumes: `"line"`, `"polygon"`.
     /// Defaults to `["line"]`; adding `"polygon"` also renders polygon boundary
@@ -686,9 +1416,12 @@ impl PolylineMaterial {
             color,
             clamp_to_ground,
             tiled,
+            geodesic: None,
             height,
             width,
             max_width,
+            dash_array: None,
+            cap: None,
             geometry_types: None,
             __internal__,
             effect_ids: None,
@@ -714,8 +1447,11 @@ impl PolylineMaterial {
             color: self.color.unwrap_or(other.color),
             width: self.width.unwrap_or(other.width),
             max_width: self.max_width.unwrap_or(other.max_width),
+            dash_array: self.dash_array.clone().or_else(|| other.dash_array.clone()),
+            cap: parse_line_cap(&self.cap).unwrap_or(other.cap),
             clamp_to_ground: self.clamp_to_ground.unwrap_or(other.clamp_to_ground),
             tiled: self.tiled.unwrap_or(other.tiled),
+            geodesic: self.geodesic.unwrap_or(other.geodesic),
             height: self.height.unwrap_or(other.height),
             geometry_types: parse_geometry_types(&self.geometry_types)
                 .unwrap_or_else(|| other.geometry_types.clone()),
@@ -745,8 +1481,11 @@ impl From<PolylineMaterial> for navara_material::PolylineMaterial {
             color: val.color.unwrap_or(default.color),
             width: val.width.unwrap_or(default.width),
             max_width: val.max_width.unwrap_or(default.max_width),
+            cap: parse_line_cap(&val.cap).unwrap_or(default.cap),
+            dash_array: val.dash_array.or(default.dash_array),
             clamp_to_ground: val.clamp_to_ground.unwrap_or(default.clamp_to_ground),
             tiled: val.tiled.unwrap_or(default.tiled),
+            geodesic: val.geodesic.unwrap_or(default.geodesic),
             height: val.height.unwrap_or(default.height),
             geometry_types: parse_geometry_types(&val.geometry_types)
                 .unwrap_or(default.geometry_types),
@@ -770,8 +1509,11 @@ impl<'a> From<&'a navara_material::PolylineMaterial> for PolylineMaterial {
             color: Some(value.color),
             width: Some(value.width),
             max_width: Some(value.max_width),
+            dash_array: value.dash_array.clone(),
+            cap: Some(value.cap.as_str().to_string()),
             clamp_to_ground: Some(value.clamp_to_ground),
             tiled: Some(value.tiled),
+            geodesic: Some(value.geodesic),
             height: Some(value.height),
             geometry_types: Some(geometry_type_names(&value.geometry_types)),
             __internal__: value.internal.as_ref().map(|v| v.into()),
@@ -795,8 +1537,11 @@ impl From<navara_material::PolylineMaterial> for PolylineMaterial {
             color: Some(value.color),
             width: Some(value.width),
             max_width: Some(value.max_width),
+            cap: Some(value.cap.as_str().to_string()),
+            dash_array: value.dash_array,
             clamp_to_ground: Some(value.clamp_to_ground),
             tiled: Some(value.tiled),
+            geodesic: Some(value.geodesic),
             height: Some(value.height),
             geometry_types: Some(geometry_type_names(&value.geometry_types)),
             __internal__: value.internal.map(|v| v.into()),
@@ -868,6 +1613,19 @@ pub struct PolygonMaterial {
     #[wasm_bindgen(js_name = tiled)]
     #[serde(rename = "tiled")]
     pub tiled: Option<bool>,
+    /// Whether edges of the tiled path (`clamp_to_ground` or `tiled`) follow
+    /// the geodesic. Defaults to `true`, which also connects consecutive
+    /// vertices more than 180° apart in longitude the short way, across the
+    /// antimeridian; a closed ring that would then no longer close, such as
+    /// one around a pole, is kept as given. When `false`, edges are straight
+    /// lines in Web Mercator and longitudes are used as given (e.g. 190° is
+    /// east of 180°), as in MapLibre. Ignored outside the tiled path.
+    ///
+    /// Applies to the whole layer: its tiled appearances share one geometry,
+    /// which follows the geodesic unless every one of them sets `false`.
+    /// Read when the layer's tiles are first built; later changes have no
+    /// effect.
+    pub geodesic: Option<bool>,
     pub height: Option<f32>,
     #[wasm_bindgen(js_name = extrudedHeight)]
     #[serde(rename = "extrudedHeight")]
@@ -884,6 +1642,12 @@ pub struct PolygonMaterial {
     #[wasm_bindgen(js_name = perPositionHeight)]
     #[serde(rename = "perPositionHeight")]
     pub per_position_height: Option<bool>,
+    /// What the bottom follows when `perPositionHeight` is set: `"position"`
+    /// keeps both caps at the heights of the positions, `"ellipsoid"` lays the
+    /// bottom flat on the ellipsoid.
+    #[wasm_bindgen(getter_with_clone, js_name = extrusionBase)]
+    #[serde(rename = "extrusionBase")]
+    pub extrusion_base: Option<String>,
     /// Need to enable `transparent`.
     pub opacity: Option<f32>,
     /// Enable `opacity`. It might cause unexpected behavior when you use an effect.
@@ -893,8 +1657,10 @@ pub struct PolygonMaterial {
     #[wasm_bindgen(js_name = surfaceShow)]
     #[serde(rename = "surfaceShow")]
     pub surface_show: Option<bool>,
-    /// Whether to compute outline geometry. Only effective at initial load time.
-    /// When not set, inferred from `outlineShow`.
+    /// Whether to compute outline geometry even while `outlineShow` is
+    /// `false`, so an update can show it later. Showing the outline always
+    /// computes it. Read when geometry is built: tiles already loaded keep
+    /// what they have.
     pub outline: Option<bool>,
     /// Currently, this property is supported only in GeoJSON.
     #[wasm_bindgen(js_name = outlineShow)]
@@ -911,24 +1677,49 @@ pub struct PolygonMaterial {
 
     /// Apply a water material on the polygon. It might slow down the loading of the mesh.
     pub water: Option<bool>,
-    /// Scale water normal. Decreasing this value will make the water surface rough.
-    #[wasm_bindgen(js_name = waterScaleNormal)]
-    #[serde(rename = "waterScaleNormal")]
-    pub water_scale_normal: Option<f32>,
-    /// Water wave speed.
-    #[wasm_bindgen(js_name = waterSpeed)]
-    #[serde(rename = "waterSpeed")]
-    pub water_speed: Option<f32>,
+    /// Scales the water's wave slopes; 0 is a flat mirror.
+    #[wasm_bindgen(js_name = waveExaggeration)]
+    #[serde(rename = "waveExaggeration")]
+    pub wave_exaggeration: Option<f32>,
+    /// Extent of the water body, which bounds how far the wind blows over it
+    /// and so how large its waves grow: `"ocean"` (the default; open sea),
+    /// `"large"` (a bay or a large lake, about 20 km), `"medium"` (a lake or a
+    /// wide river, about 2 km) or `"small"` (a river or a pond, about 200 m).
+    #[wasm_bindgen(js_name = waterScale, getter_with_clone)]
+    #[serde(rename = "waterScale")]
+    pub water_scale: Option<String>,
+    /// Sets the size, steepness and speed of the water's waves: about 1 is a
+    /// calm ripple, 5 moderate and 20 a storm. Default: 5.
+    #[wasm_bindgen(js_name = waveStrength)]
+    #[serde(rename = "waveStrength")]
+    pub wave_strength: Option<f32>,
+    /// Where the water's waves travel, in degrees clockwise from north.
+    /// Default: 0.
+    #[wasm_bindgen(js_name = waveDirection)]
+    #[serde(rename = "waveDirection")]
+    pub wave_direction: Option<f32>,
+    /// Speed in m/s of the current carrying the water's waves
+    /// along `waveDirection`. Default: 0.
+    #[wasm_bindgen(js_name = flowSpeed)]
+    #[serde(rename = "flowSpeed")]
+    pub flow_speed: Option<f32>,
+    /// Phong shininess of the non-water `specular` highlight.
     pub shininess: Option<f32>,
     #[wasm_bindgen(js_name = specularStrength)]
     #[serde(rename = "specularStrength")]
     pub specular_strength: Option<f32>,
-    #[wasm_bindgen(js_name = applyWaterNormal)]
-    #[serde(rename = "applyWaterNormal")]
-    pub apply_water_normal: Option<bool>,
     /// Enabling this value allows using `shininess` and `specular_strength`.
+    /// Has no effect on water.
     pub specular: Option<bool>,
     pub ior: Option<f32>,
+    /// Shade the extruded sides with the surface normal instead of their own.
+    #[wasm_bindgen(js_name = shadeSidesAsSurface)]
+    #[serde(rename = "shadeSidesAsSurface")]
+    pub shade_sides_as_surface: Option<bool>,
+    /// Write depth before blending so a transparent layer blends only its nearest surface.
+    #[wasm_bindgen(js_name = depthPrePass)]
+    #[serde(rename = "depthPrePass")]
+    pub depth_pre_pass: Option<bool>,
     // SelectiveEffect
     /// IDs of selective effects to apply (e.g., "bloom", "outline")
     #[wasm_bindgen(getter_with_clone, js_name = effectIds)]
@@ -960,6 +1751,7 @@ impl PolygonMaterial {
         wireframe: Option<bool>,
         outline: Option<bool>,
         per_position_height: Option<bool>,
+        extrusion_base: Option<String>,
         __internal__: Option<PolygonInternalMaterial>,
     ) -> Self {
         Self {
@@ -970,6 +1762,7 @@ impl PolygonMaterial {
             color,
             clamp_to_ground,
             tiled,
+            geodesic: None,
             height,
             extruded_height,
             wireframe,
@@ -978,6 +1771,7 @@ impl PolygonMaterial {
             __internal__,
 
             per_position_height,
+            extrusion_base,
             opacity: None,
             transparent: None,
 
@@ -989,13 +1783,17 @@ impl PolygonMaterial {
 
             // These are unnecessary for polygon geometry construction.
             water: None,
-            water_scale_normal: None,
-            water_speed: None,
+            wave_exaggeration: None,
+            water_scale: None,
+            wave_strength: None,
+            wave_direction: None,
+            flow_speed: None,
             shininess: None,
             specular_strength: None,
-            apply_water_normal: None,
             specular: None,
             ior: None,
+            shade_sides_as_surface: None,
+            depth_pre_pass: None,
             effect_ids: None,
             emissive_intensity: None,
             emissive_color: None,
@@ -1016,6 +1814,7 @@ impl PolygonMaterial {
             color: self.color.unwrap_or(other.color),
             clamp_to_ground: self.clamp_to_ground.unwrap_or(other.clamp_to_ground),
             tiled: self.tiled.unwrap_or(other.tiled),
+            geodesic: self.geodesic.unwrap_or(other.geodesic),
             height: self.height.unwrap_or(other.height),
             extruded_height: self.extruded_height.or(other.extruded_height),
             wireframe: self.wireframe.unwrap_or(other.wireframe),
@@ -1030,22 +1829,33 @@ impl PolygonMaterial {
             per_position_height: self
                 .per_position_height
                 .unwrap_or(other.per_position_height),
+            extrusion_base: parse_extrusion_base(&self.extrusion_base)
+                .unwrap_or(other.extrusion_base),
             opacity: self.opacity.unwrap_or(other.opacity),
             transparent: self.transparent.unwrap_or(other.transparent),
 
             surface_show: self.surface_show.unwrap_or(other.surface_show),
-            outline: self.outline.unwrap_or(other.outline),
+            // As in `From`: showing the outline asks for its geometry. Hiding
+            // it keeps the geometry, so it can be shown again.
+            outline: self.outline.unwrap_or(other.outline)
+                || self.outline_show.unwrap_or(other.outline_show),
             outline_show: self.outline_show.unwrap_or(other.outline_show),
             outline_color: self.outline_color.unwrap_or(other.outline_color),
             outline_width: self.outline_width.unwrap_or(other.outline_width),
             water: self.water.unwrap_or(other.water),
-            water_scale_normal: self.water_scale_normal.unwrap_or(other.water_scale_normal),
-            water_speed: self.water_speed.unwrap_or(other.water_speed),
+            wave_exaggeration: self.wave_exaggeration.unwrap_or(other.wave_exaggeration),
+            water_scale: parse_water_scale(&self.water_scale).unwrap_or(other.water_scale),
+            wave_strength: self.wave_strength.unwrap_or(other.wave_strength),
+            wave_direction: self.wave_direction.unwrap_or(other.wave_direction),
+            flow_speed: self.flow_speed.unwrap_or(other.flow_speed),
             shininess: self.shininess.unwrap_or(other.shininess),
             specular_strength: self.specular_strength.unwrap_or(other.specular_strength),
-            apply_water_normal: self.apply_water_normal.unwrap_or(other.apply_water_normal),
             specular: self.specular.unwrap_or(other.specular),
             ior: self.ior.unwrap_or(other.ior),
+            shade_sides_as_surface: self
+                .shade_sides_as_surface
+                .unwrap_or(other.shade_sides_as_surface),
+            depth_pre_pass: self.depth_pre_pass.unwrap_or(other.depth_pre_pass),
             effect_ids: self.effect_ids.clone().or_else(|| other.effect_ids.clone()),
             emissive_intensity: self.emissive_intensity.or(other.emissive_intensity),
             emissive_color: self.emissive_color.or(other.emissive_color),
@@ -1064,6 +1874,7 @@ impl From<PolygonMaterial> for navara_material::PolygonMaterial {
             color: val.color.unwrap_or(default.color),
             clamp_to_ground: val.clamp_to_ground.unwrap_or(default.clamp_to_ground),
             tiled: val.tiled.unwrap_or(default.tiled),
+            geodesic: val.geodesic.unwrap_or(default.geodesic),
             height: val.height.unwrap_or(default.height),
             extruded_height: val.extruded_height,
             wireframe: val.wireframe.unwrap_or(default.wireframe),
@@ -1074,24 +1885,31 @@ impl From<PolygonMaterial> for navara_material::PolygonMaterial {
             per_position_height: val
                 .per_position_height
                 .unwrap_or(default.per_position_height),
+            extrusion_base: parse_extrusion_base(&val.extrusion_base)
+                .unwrap_or(default.extrusion_base),
             opacity: val.opacity.unwrap_or(default.opacity),
             transparent: val.transparent.unwrap_or(default.transparent),
 
             surface_show: val.surface_show.unwrap_or(default.surface_show),
-            outline: val
-                .outline
-                .unwrap_or_else(|| val.outline_show.unwrap_or(default.outline)),
+            outline: val.outline.unwrap_or(default.outline)
+                || val.outline_show.unwrap_or(default.outline_show),
             outline_show: val.outline_show.unwrap_or(default.outline_show),
             outline_color: val.outline_color.unwrap_or(default.outline_color),
             outline_width: val.outline_width.unwrap_or(default.outline_width),
             water: val.water.unwrap_or(default.water),
-            water_scale_normal: val.water_scale_normal.unwrap_or(default.water_scale_normal),
-            water_speed: val.water_speed.unwrap_or(default.water_speed),
+            wave_exaggeration: val.wave_exaggeration.unwrap_or(default.wave_exaggeration),
+            water_scale: parse_water_scale(&val.water_scale).unwrap_or(default.water_scale),
+            wave_strength: val.wave_strength.unwrap_or(default.wave_strength),
+            wave_direction: val.wave_direction.unwrap_or(default.wave_direction),
+            flow_speed: val.flow_speed.unwrap_or(default.flow_speed),
             shininess: val.shininess.unwrap_or(default.shininess),
             specular_strength: val.specular_strength.unwrap_or(default.specular_strength),
-            apply_water_normal: val.apply_water_normal.unwrap_or(default.apply_water_normal),
             specular: val.specular.unwrap_or(default.specular),
             ior: val.ior.unwrap_or(default.ior),
+            shade_sides_as_surface: val
+                .shade_sides_as_surface
+                .unwrap_or(default.shade_sides_as_surface),
+            depth_pre_pass: val.depth_pre_pass.unwrap_or(default.depth_pre_pass),
             effect_ids: val.effect_ids.or(default.effect_ids),
             emissive_intensity: val.emissive_intensity.or(default.emissive_intensity),
             emissive_color: val.emissive_color.or(default.emissive_color),
@@ -1108,6 +1926,7 @@ impl<'a> From<&'a navara_material::PolygonMaterial> for PolygonMaterial {
             color: Some(value.color),
             clamp_to_ground: Some(value.clamp_to_ground),
             tiled: Some(value.tiled),
+            geodesic: Some(value.geodesic),
             height: Some(value.height),
             extruded_height: value.extruded_height,
             wireframe: Some(value.wireframe),
@@ -1116,6 +1935,7 @@ impl<'a> From<&'a navara_material::PolygonMaterial> for PolygonMaterial {
             __internal__: value.internal.as_ref().map(|v| v.into()),
 
             per_position_height: Some(value.per_position_height),
+            extrusion_base: Some(value.extrusion_base.as_str().to_owned()),
             opacity: Some(value.opacity),
             transparent: Some(value.transparent),
 
@@ -1125,13 +1945,17 @@ impl<'a> From<&'a navara_material::PolygonMaterial> for PolygonMaterial {
             outline_color: Some(value.outline_color),
             outline_width: Some(value.outline_width),
             water: Some(value.water),
-            water_scale_normal: Some(value.water_scale_normal),
-            water_speed: Some(value.water_speed),
+            wave_exaggeration: Some(value.wave_exaggeration),
+            water_scale: Some(value.water_scale.as_str().to_string()),
+            wave_strength: Some(value.wave_strength),
+            wave_direction: Some(value.wave_direction),
+            flow_speed: Some(value.flow_speed),
             shininess: Some(value.shininess),
             specular_strength: Some(value.specular_strength),
-            apply_water_normal: Some(value.apply_water_normal),
             specular: Some(value.specular),
             ior: Some(value.ior),
+            shade_sides_as_surface: Some(value.shade_sides_as_surface),
+            depth_pre_pass: Some(value.depth_pre_pass),
             effect_ids: value.effect_ids.clone(),
             emissive_intensity: value.emissive_intensity,
             emissive_color: value.emissive_color,
@@ -1148,6 +1972,7 @@ impl From<navara_material::PolygonMaterial> for PolygonMaterial {
             color: Some(value.color),
             clamp_to_ground: Some(value.clamp_to_ground),
             tiled: Some(value.tiled),
+            geodesic: Some(value.geodesic),
             height: Some(value.height),
             extruded_height: value.extruded_height,
             wireframe: Some(value.wireframe),
@@ -1156,6 +1981,7 @@ impl From<navara_material::PolygonMaterial> for PolygonMaterial {
             __internal__: value.internal.map(|v| v.into()),
 
             per_position_height: Some(value.per_position_height),
+            extrusion_base: Some(value.extrusion_base.as_str().to_owned()),
             opacity: Some(value.opacity),
             transparent: Some(value.transparent),
 
@@ -1165,13 +1991,17 @@ impl From<navara_material::PolygonMaterial> for PolygonMaterial {
             outline_color: Some(value.outline_color),
             outline_width: Some(value.outline_width),
             water: Some(value.water),
-            water_scale_normal: Some(value.water_scale_normal),
-            water_speed: Some(value.water_speed),
+            wave_exaggeration: Some(value.wave_exaggeration),
+            water_scale: Some(value.water_scale.as_str().to_string()),
+            wave_strength: Some(value.wave_strength),
+            wave_direction: Some(value.wave_direction),
+            flow_speed: Some(value.flow_speed),
             shininess: Some(value.shininess),
             specular_strength: Some(value.specular_strength),
-            apply_water_normal: Some(value.apply_water_normal),
             specular: Some(value.specular),
             ior: Some(value.ior),
+            shade_sides_as_surface: Some(value.shade_sides_as_surface),
+            depth_pre_pass: Some(value.depth_pre_pass),
             effect_ids: value.effect_ids.clone(),
             emissive_intensity: value.emissive_intensity,
             emissive_color: value.emissive_color,
@@ -1241,22 +2071,39 @@ pub struct ModelMaterial {
     pub reflectivity: Option<f32>,
     /// Apply a water material on the polygon. It might slow down the loading of the mesh.
     pub water: Option<bool>,
-    /// Scale water normal. Decreasing this value will make the water surface rough.
-    #[wasm_bindgen(js_name = waterScaleNormal)]
-    #[serde(rename = "waterScaleNormal")]
-    pub water_scale_normal: Option<f32>,
-    /// Water wave speed.
-    #[wasm_bindgen(js_name = waterSpeed)]
-    #[serde(rename = "waterSpeed")]
-    pub water_speed: Option<f32>,
+    /// Scales the water's wave slopes; 0 is a flat mirror.
+    #[wasm_bindgen(js_name = waveExaggeration)]
+    #[serde(rename = "waveExaggeration")]
+    pub wave_exaggeration: Option<f32>,
+    /// Extent of the water body, which bounds how far the wind blows over it
+    /// and so how large its waves grow: `"ocean"` (the default; open sea),
+    /// `"large"` (a bay or a large lake, about 20 km), `"medium"` (a lake or a
+    /// wide river, about 2 km) or `"small"` (a river or a pond, about 200 m).
+    #[wasm_bindgen(js_name = waterScale, getter_with_clone)]
+    #[serde(rename = "waterScale")]
+    pub water_scale: Option<String>,
+    /// Sets the size, steepness and speed of the water's waves: about 1 is a
+    /// calm ripple, 5 moderate and 20 a storm. Default: 5.
+    #[wasm_bindgen(js_name = waveStrength)]
+    #[serde(rename = "waveStrength")]
+    pub wave_strength: Option<f32>,
+    /// Where the water's waves travel, in degrees clockwise from north.
+    /// Default: 0.
+    #[wasm_bindgen(js_name = waveDirection)]
+    #[serde(rename = "waveDirection")]
+    pub wave_direction: Option<f32>,
+    /// Speed in m/s of the current carrying the water's waves
+    /// along `waveDirection`. Default: 0.
+    #[wasm_bindgen(js_name = flowSpeed)]
+    #[serde(rename = "flowSpeed")]
+    pub flow_speed: Option<f32>,
+    /// Phong shininess of the non-water `specular` highlight.
     pub shininess: Option<f32>,
     #[wasm_bindgen(js_name = specularStrength)]
     #[serde(rename = "specularStrength")]
     pub specular_strength: Option<f32>,
-    #[wasm_bindgen(js_name = applyWaterNormal)]
-    #[serde(rename = "applyWaterNormal")]
-    pub apply_water_normal: Option<bool>,
     /// Enabling this value allows using `shininess` and `specular_strength`.
+    /// Has no effect on water.
     pub specular: Option<bool>,
     pub ior: Option<f32>,
     // animation
@@ -1327,11 +2174,13 @@ impl From<ModelMaterial> for navara_material::ModelMaterial {
             roughness: val.roughness.unwrap_or(default.roughness),
             reflectivity: val.reflectivity.unwrap_or(default.reflectivity),
             water: val.water.unwrap_or(default.water),
-            water_scale_normal: val.water_scale_normal.unwrap_or(default.water_scale_normal),
-            water_speed: val.water_speed.unwrap_or(default.water_speed),
+            wave_exaggeration: val.wave_exaggeration.unwrap_or(default.wave_exaggeration),
+            water_scale: parse_water_scale(&val.water_scale).unwrap_or(default.water_scale),
+            wave_strength: val.wave_strength.unwrap_or(default.wave_strength),
+            wave_direction: val.wave_direction.unwrap_or(default.wave_direction),
+            flow_speed: val.flow_speed.unwrap_or(default.flow_speed),
             shininess: val.shininess.unwrap_or(default.shininess),
             specular_strength: val.specular_strength.unwrap_or(default.specular_strength),
-            apply_water_normal: val.apply_water_normal.unwrap_or(default.apply_water_normal),
             specular: val.specular.unwrap_or(default.specular),
             ior: val.ior.unwrap_or(default.ior),
             // animation
@@ -1369,11 +2218,13 @@ impl<'a> From<&'a navara_material::ModelMaterial> for ModelMaterial {
             roughness: Some(value.roughness),
             reflectivity: Some(value.reflectivity),
             water: Some(value.water),
-            water_scale_normal: Some(value.water_scale_normal),
-            water_speed: Some(value.water_speed),
+            wave_exaggeration: Some(value.wave_exaggeration),
+            water_scale: Some(value.water_scale.as_str().to_string()),
+            wave_strength: Some(value.wave_strength),
+            wave_direction: Some(value.wave_direction),
+            flow_speed: Some(value.flow_speed),
             shininess: Some(value.shininess),
             specular_strength: Some(value.specular_strength),
-            apply_water_normal: Some(value.apply_water_normal),
             specular: Some(value.specular),
             ior: Some(value.ior),
             // animation
@@ -1413,11 +2264,13 @@ impl ModelMaterial {
             roughness: self.roughness.unwrap_or(other.roughness),
             reflectivity: self.reflectivity.unwrap_or(other.reflectivity),
             water: self.water.unwrap_or(other.water),
-            water_scale_normal: self.water_scale_normal.unwrap_or(other.water_scale_normal),
-            water_speed: self.water_speed.unwrap_or(other.water_speed),
+            wave_exaggeration: self.wave_exaggeration.unwrap_or(other.wave_exaggeration),
+            water_scale: parse_water_scale(&self.water_scale).unwrap_or(other.water_scale),
+            wave_strength: self.wave_strength.unwrap_or(other.wave_strength),
+            wave_direction: self.wave_direction.unwrap_or(other.wave_direction),
+            flow_speed: self.flow_speed.unwrap_or(other.flow_speed),
             shininess: self.shininess.unwrap_or(other.shininess),
             specular_strength: self.specular_strength.unwrap_or(other.specular_strength),
-            apply_water_normal: self.apply_water_normal.unwrap_or(other.apply_water_normal),
             specular: self.specular.unwrap_or(other.specular),
             ior: self.ior.unwrap_or(other.ior),
             // animation
@@ -1444,33 +2297,212 @@ impl ModelMaterial {
 #[wasm_bindgen]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInternalMaterial {
-    #[wasm_bindgen(getter_with_clone, js_name = pointCloud)]
+    #[wasm_bindgen(js_name = pointCloud)]
     #[serde(rename = "pointCloud")]
     pub point_cloud: bool,
-    #[wasm_bindgen(getter_with_clone, js_name = dracoCompressed)]
-    #[serde(rename = "dracoCompressed")]
-    pub draco_compressed: bool,
-    #[wasm_bindgen(getter_with_clone, js_name = pointCloudGeodeticNormal)]
+    #[wasm_bindgen(getter_with_clone, js_name = dracoAttributes)]
+    #[serde(rename = "dracoAttributes")]
+    pub draco_attributes: Option<Vec<DracoAttributeId>>,
+    #[wasm_bindgen(js_name = pointCloudGeodeticNormal)]
     #[serde(rename = "pointCloudGeodeticNormal")]
     pub point_cloud_geodetic_normal: WasmVec3,
+    #[wasm_bindgen(getter_with_clone, js_name = pointCloudLayout)]
+    #[serde(rename = "pointCloudLayout")]
+    pub point_cloud_layout: Option<PointCloudLayout>,
 }
 
 impl<'a> From<&'a navara_material::ModelInternalMaterial> for ModelInternalMaterial {
     fn from(value: &'a navara_material::ModelInternalMaterial) -> ModelInternalMaterial {
+        let draco_attributes = value.draco_attributes.as_ref().map(|attributes| {
+            let mut converted = Vec::with_capacity(attributes.len());
+            for attribute in attributes {
+                converted.push(attribute.into());
+            }
+            converted
+        });
         ModelInternalMaterial {
             point_cloud: value.point_cloud,
-            draco_compressed: value.draco_compressed,
+            draco_attributes,
             point_cloud_geodetic_normal: value.point_cloud_geodetic_normal.into(),
+            point_cloud_layout: value.point_cloud_layout.as_ref().map(Into::into),
         }
     }
 }
 
 impl From<ModelInternalMaterial> for navara_material::ModelInternalMaterial {
     fn from(value: ModelInternalMaterial) -> navara_material::ModelInternalMaterial {
+        let draco_attributes = value.draco_attributes.map(|attributes| {
+            let mut converted = Vec::with_capacity(attributes.len());
+            for attribute in attributes {
+                converted.push(attribute.into());
+            }
+            converted
+        });
         navara_material::ModelInternalMaterial {
             point_cloud: value.point_cloud,
-            draco_compressed: value.draco_compressed,
+            draco_attributes,
             point_cloud_geodetic_normal: value.point_cloud_geodetic_normal.into(),
+            point_cloud_layout: value.point_cloud_layout.map(Into::into),
+        }
+    }
+}
+
+/// Where the points of a PNTS tile sit in its bin, which is the whole tile.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointCloudLayout {
+    #[wasm_bindgen(js_name = pointCount)]
+    pub point_count: u32,
+    #[wasm_bindgen(js_name = positionsFormat)]
+    pub positions_format: PointPositionsFormat,
+    #[wasm_bindgen(js_name = positionsByteOffset)]
+    pub positions_byte_offset: u32,
+    #[wasm_bindgen(js_name = positionsByteLength)]
+    pub positions_byte_length: u32,
+    /// Subtracted from every `Float32` position.
+    #[wasm_bindgen(js_name = positionsOrigin)]
+    pub positions_origin: WasmVec3,
+    #[wasm_bindgen(js_name = quantizedVolumeScale)]
+    pub quantized_volume_scale: WasmVec3,
+    /// Byte range of the Draco blob; empty without it.
+    #[wasm_bindgen(js_name = dracoByteOffset)]
+    pub draco_byte_offset: u32,
+    #[wasm_bindgen(js_name = dracoByteLength)]
+    pub draco_byte_length: u32,
+    #[wasm_bindgen(js_name = colorsFormat)]
+    pub colors_format: PointColorsFormat,
+    #[wasm_bindgen(js_name = colorsByteOffset)]
+    pub colors_byte_offset: u32,
+    /// `CONSTANT_RGBA` as `0xRRGGBBAA`.
+    #[wasm_bindgen(js_name = constantColor)]
+    pub constant_color: u32,
+}
+
+impl From<&navara_material::PointCloudLayout> for PointCloudLayout {
+    fn from(value: &navara_material::PointCloudLayout) -> Self {
+        PointCloudLayout {
+            point_count: value.point_count,
+            positions_format: value.positions_format.into(),
+            positions_byte_offset: value.positions_byte_offset,
+            positions_byte_length: value.positions_byte_length,
+            positions_origin: value.positions_origin.into(),
+            quantized_volume_scale: value.quantized_volume_scale.into(),
+            draco_byte_offset: value.draco_byte_offset,
+            draco_byte_length: value.draco_byte_length,
+            colors_format: value.colors_format.into(),
+            colors_byte_offset: value.colors_byte_offset,
+            constant_color: value.constant_color,
+        }
+    }
+}
+
+impl From<PointCloudLayout> for navara_material::PointCloudLayout {
+    fn from(value: PointCloudLayout) -> Self {
+        navara_material::PointCloudLayout {
+            point_count: value.point_count,
+            positions_format: value.positions_format.into(),
+            positions_byte_offset: value.positions_byte_offset,
+            positions_byte_length: value.positions_byte_length,
+            positions_origin: value.positions_origin.into(),
+            quantized_volume_scale: value.quantized_volume_scale.into(),
+            draco_byte_offset: value.draco_byte_offset,
+            draco_byte_length: value.draco_byte_length,
+            colors_format: value.colors_format.into(),
+            colors_byte_offset: value.colors_byte_offset,
+            constant_color: value.constant_color,
+        }
+    }
+}
+
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointPositionsFormat {
+    Float32,
+    Uint16,
+    Draco,
+}
+
+impl From<navara_material::PointPositionsFormat> for PointPositionsFormat {
+    fn from(value: navara_material::PointPositionsFormat) -> Self {
+        match value {
+            navara_material::PointPositionsFormat::Float32 => PointPositionsFormat::Float32,
+            navara_material::PointPositionsFormat::Uint16 => PointPositionsFormat::Uint16,
+            navara_material::PointPositionsFormat::Draco => PointPositionsFormat::Draco,
+        }
+    }
+}
+
+impl From<PointPositionsFormat> for navara_material::PointPositionsFormat {
+    fn from(value: PointPositionsFormat) -> Self {
+        match value {
+            PointPositionsFormat::Float32 => navara_material::PointPositionsFormat::Float32,
+            PointPositionsFormat::Uint16 => navara_material::PointPositionsFormat::Uint16,
+            PointPositionsFormat::Draco => navara_material::PointPositionsFormat::Draco,
+        }
+    }
+}
+
+#[wasm_bindgen]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointColorsFormat {
+    None,
+    Rgba8,
+    Rgb8,
+    Rgb565,
+    Constant,
+}
+
+impl From<navara_material::PointColorsFormat> for PointColorsFormat {
+    fn from(value: navara_material::PointColorsFormat) -> Self {
+        match value {
+            navara_material::PointColorsFormat::None => PointColorsFormat::None,
+            navara_material::PointColorsFormat::Rgba8 => PointColorsFormat::Rgba8,
+            navara_material::PointColorsFormat::Rgb8 => PointColorsFormat::Rgb8,
+            navara_material::PointColorsFormat::Rgb565 => PointColorsFormat::Rgb565,
+            navara_material::PointColorsFormat::Constant => PointColorsFormat::Constant,
+        }
+    }
+}
+
+impl From<PointColorsFormat> for navara_material::PointColorsFormat {
+    fn from(value: PointColorsFormat) -> Self {
+        match value {
+            PointColorsFormat::None => navara_material::PointColorsFormat::None,
+            PointColorsFormat::Rgba8 => navara_material::PointColorsFormat::Rgba8,
+            PointColorsFormat::Rgb8 => navara_material::PointColorsFormat::Rgb8,
+            PointColorsFormat::Rgb565 => navara_material::PointColorsFormat::Rgb565,
+            PointColorsFormat::Constant => navara_material::PointColorsFormat::Constant,
+        }
+    }
+}
+
+/// Maps a 3D Tiles feature table semantic (`POSITION`, `RGB`, ...) to its
+/// Draco unique attribute id.
+#[wasm_bindgen]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DracoAttributeId {
+    #[wasm_bindgen(getter_with_clone)]
+    pub semantic: String,
+    #[wasm_bindgen(js_name = uniqueId)]
+    #[serde(rename = "uniqueId")]
+    pub unique_id: u32,
+}
+
+impl From<&navara_material::DracoAttributeId> for DracoAttributeId {
+    fn from(value: &navara_material::DracoAttributeId) -> Self {
+        DracoAttributeId {
+            semantic: value.semantic.clone(),
+            unique_id: value.unique_id,
+        }
+    }
+}
+
+impl From<DracoAttributeId> for navara_material::DracoAttributeId {
+    fn from(value: DracoAttributeId) -> Self {
+        navara_material::DracoAttributeId {
+            semantic: value.semantic,
+            unique_id: value.unique_id,
         }
     }
 }
@@ -1518,6 +2550,10 @@ impl RasterMaterial {
 #[wasm_bindgen]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RasterTileInternalMaterial {
+    /// Whether the tile mesh is drawn, from the terrain layer's `show`.
+    #[wasm_bindgen(js_name = showMesh)]
+    #[serde(rename = "showMesh")]
+    pub show_mesh: bool,
     #[wasm_bindgen(getter_with_clone)]
     pub shows: Vec<u8>,
     #[wasm_bindgen(getter_with_clone)]
@@ -1538,47 +2574,84 @@ pub struct RasterTileInternalMaterial {
     #[wasm_bindgen(js_name = showBoundingBox)]
     #[serde(rename = "showBoundingBox")]
     pub show_bounding_box: Option<bool>,
+    /// Body color of the watermask's water from the terrain layer; `None`
+    /// keeps the imagery or globe color.
+    #[wasm_bindgen(js_name = waterMaskColor)]
+    #[serde(rename = "waterMaskColor")]
+    pub water_mask_color: Option<u32>,
+    /// Scales the wave slopes on the watermask's water; 0 is a flat mirror.
+    #[wasm_bindgen(js_name = waveExaggeration)]
+    #[serde(rename = "waveExaggeration")]
+    pub wave_exaggeration: f32,
+    /// Sets the size, slope and speed of the waves on the watermask's water, in
+    /// m/s.
+    #[wasm_bindgen(js_name = waveStrength)]
+    #[serde(rename = "waveStrength")]
+    pub wave_strength: f32,
+    /// Where the waves on the watermask's water travel, in degrees clockwise
+    /// from north.
+    #[wasm_bindgen(js_name = waveDirection)]
+    #[serde(rename = "waveDirection")]
+    pub wave_direction: f32,
+    /// Speed in m/s of the current carrying the waves on the watermask's water
+    /// along `waveDirection`.
+    #[wasm_bindgen(js_name = flowSpeed)]
+    #[serde(rename = "flowSpeed")]
+    pub flow_speed: f32,
+    /// Per-slot layer IDs used to look up each layer's colorMap atlas row; an
+    /// empty string for slots without an elevation heatmap.
+    #[wasm_bindgen(getter_with_clone, js_name = colorMapLayerIds)]
+    #[serde(rename = "colorMapLayerIds")]
+    pub color_map_layer_ids: Vec<String>,
 
     // Elevation Heatmap fields
     #[wasm_bindgen(getter_with_clone, js_name = isElevationHeatmaps)]
     #[serde(rename = "isElevationHeatmaps")]
     pub is_elevation_heatmaps: Vec<u8>,
-    // Shared elevation heatmap configuration (all heatmap layers use the same settings)
-    #[wasm_bindgen(js_name = elevationMinHeight)]
-    #[serde(rename = "elevationMinHeight")]
-    pub elevation_min_height: f64,
-    #[wasm_bindgen(js_name = elevationMaxHeight)]
-    #[serde(rename = "elevationMaxHeight")]
-    pub elevation_max_height: f64,
-    #[wasm_bindgen(js_name = elevationRScaler)]
-    #[serde(rename = "elevationRScaler")]
-    pub elevation_r_scaler: f64,
-    #[wasm_bindgen(js_name = elevationGScaler)]
-    #[serde(rename = "elevationGScaler")]
-    pub elevation_g_scaler: f64,
-    #[wasm_bindgen(js_name = elevationBScaler)]
-    #[serde(rename = "elevationBScaler")]
-    pub elevation_b_scaler: f64,
-    #[wasm_bindgen(js_name = elevationBoundary)]
-    #[serde(rename = "elevationBoundary")]
-    pub elevation_boundary: f64,
-    #[wasm_bindgen(js_name = elevationMaxOffset)]
-    #[serde(rename = "elevationMaxOffset")]
-    pub elevation_max_offset: f64,
-    #[wasm_bindgen(js_name = elevationMinOffset)]
-    #[serde(rename = "elevationMinOffset")]
-    pub elevation_min_offset: f64,
-    #[wasm_bindgen(js_name = elevationEpsilon)]
-    #[serde(rename = "elevationEpsilon")]
-    pub elevation_epsilon: f64,
-    #[wasm_bindgen(js_name = elevationOffset)]
-    #[serde(rename = "elevationOffset")]
-    pub elevation_offset: f64,
-
-    pub logarithmic: bool,
-    #[wasm_bindgen(js_name = logBoundary)]
-    #[serde(rename = "logBoundary")]
-    pub log_boundary: f64,
+    /// Per-layer minimum heights for elevation normalization
+    #[wasm_bindgen(getter_with_clone, js_name = elevationMinHeights)]
+    #[serde(rename = "elevationMinHeights")]
+    pub elevation_min_heights: Vec<f64>,
+    /// Per-layer maximum heights for elevation normalization
+    #[wasm_bindgen(getter_with_clone, js_name = elevationMaxHeights)]
+    #[serde(rename = "elevationMaxHeights")]
+    pub elevation_max_heights: Vec<f64>,
+    /// Per-layer filter modes: "linear" or "nearest"
+    #[wasm_bindgen(getter_with_clone, js_name = elevationHeatmapFilters)]
+    #[serde(rename = "elevationHeatmapFilters")]
+    pub elevation_heatmap_filters: Vec<String>,
+    /// Per-layer DEM decoder parameters
+    #[wasm_bindgen(getter_with_clone, js_name = elevationRScalers)]
+    #[serde(rename = "elevationRScalers")]
+    pub elevation_r_scalers: Vec<f64>,
+    #[wasm_bindgen(getter_with_clone, js_name = elevationGScalers)]
+    #[serde(rename = "elevationGScalers")]
+    pub elevation_g_scalers: Vec<f64>,
+    #[wasm_bindgen(getter_with_clone, js_name = elevationBScalers)]
+    #[serde(rename = "elevationBScalers")]
+    pub elevation_b_scalers: Vec<f64>,
+    #[wasm_bindgen(getter_with_clone, js_name = elevationBoundaries)]
+    #[serde(rename = "elevationBoundaries")]
+    pub elevation_boundaries: Vec<f64>,
+    #[wasm_bindgen(getter_with_clone, js_name = elevationMaxOffsets)]
+    #[serde(rename = "elevationMaxOffsets")]
+    pub elevation_max_offsets: Vec<f64>,
+    #[wasm_bindgen(getter_with_clone, js_name = elevationMinOffsets)]
+    #[serde(rename = "elevationMinOffsets")]
+    pub elevation_min_offsets: Vec<f64>,
+    #[wasm_bindgen(getter_with_clone, js_name = elevationEpsilons)]
+    #[serde(rename = "elevationEpsilons")]
+    pub elevation_epsilons: Vec<f64>,
+    #[wasm_bindgen(getter_with_clone, js_name = elevationOffsets)]
+    #[serde(rename = "elevationOffsets")]
+    pub elevation_offsets: Vec<f64>,
+    /// Per-layer logarithmic scaling flags
+    #[wasm_bindgen(getter_with_clone)]
+    pub logarithmics: Vec<u8>,
+    /// Per-layer logarithmic boundaries
+    #[wasm_bindgen(getter_with_clone, js_name = logBoundaries)]
+    #[serde(rename = "logBoundaries")]
+    pub log_boundaries: Vec<f64>,
 
     // Hillshade fields
     #[wasm_bindgen(getter_with_clone, js_name = isHillshades)]
@@ -1649,9 +2722,94 @@ impl RasterTileInternalMaterial {
     }
 }
 
+/// The per-slot elevation heatmap arrays of [`RasterTileInternalMaterial`],
+/// built in a single pass over the material's slots. Slots without an
+/// elevation heatmap get the defaults below.
+struct ElevationHeatmapSlots {
+    color_map_layer_ids: Vec<String>,
+    is_elevation_heatmaps: Vec<u8>,
+    min_heights: Vec<f64>,
+    max_heights: Vec<f64>,
+    filters: Vec<String>,
+    r_scalers: Vec<f64>,
+    g_scalers: Vec<f64>,
+    b_scalers: Vec<f64>,
+    boundaries: Vec<f64>,
+    max_offsets: Vec<f64>,
+    min_offsets: Vec<f64>,
+    epsilons: Vec<f64>,
+    offsets: Vec<f64>,
+    logarithmics: Vec<u8>,
+    log_boundaries: Vec<f64>,
+}
+
+impl ElevationHeatmapSlots {
+    fn new(layers: &[Option<navara_material::ElevationHeatmapLayerData>]) -> Self {
+        let n = layers.len();
+        let mut s = Self {
+            color_map_layer_ids: Vec::with_capacity(n),
+            is_elevation_heatmaps: Vec::with_capacity(n),
+            min_heights: Vec::with_capacity(n),
+            max_heights: Vec::with_capacity(n),
+            filters: Vec::with_capacity(n),
+            r_scalers: Vec::with_capacity(n),
+            g_scalers: Vec::with_capacity(n),
+            b_scalers: Vec::with_capacity(n),
+            boundaries: Vec::with_capacity(n),
+            max_offsets: Vec::with_capacity(n),
+            min_offsets: Vec::with_capacity(n),
+            epsilons: Vec::with_capacity(n),
+            offsets: Vec::with_capacity(n),
+            logarithmics: Vec::with_capacity(n),
+            log_boundaries: Vec::with_capacity(n),
+        };
+        for layer in layers {
+            match layer {
+                Some(l) => {
+                    s.color_map_layer_ids.push(l.layer_id.clone());
+                    s.is_elevation_heatmaps.push(1);
+                    s.min_heights.push(l.config.min_height);
+                    s.max_heights.push(l.config.max_height);
+                    s.filters.push(l.config.filter.clone());
+                    s.r_scalers.push(l.decoder.r_scaler);
+                    s.g_scalers.push(l.decoder.g_scaler);
+                    s.b_scalers.push(l.decoder.b_scaler);
+                    s.boundaries.push(l.decoder.boundary);
+                    s.max_offsets.push(l.decoder.max_offset);
+                    s.min_offsets.push(l.decoder.min_offset);
+                    s.epsilons.push(l.decoder.epsilon);
+                    s.offsets.push(l.decoder.offset);
+                    s.logarithmics.push(u8::from(l.config.logarithmic));
+                    s.log_boundaries.push(l.config.log_boundary);
+                }
+                None => {
+                    s.color_map_layer_ids.push(String::new());
+                    s.is_elevation_heatmaps.push(0);
+                    s.min_heights.push(0.0);
+                    s.max_heights.push(1000.0);
+                    s.filters.push("linear".to_string());
+                    s.r_scalers.push(0.0);
+                    s.g_scalers.push(0.0);
+                    s.b_scalers.push(0.0);
+                    s.boundaries.push(0.0);
+                    s.max_offsets.push(0.0);
+                    s.min_offsets.push(0.0);
+                    s.epsilons.push(1.0);
+                    s.offsets.push(0.0);
+                    s.logarithmics.push(0);
+                    s.log_boundaries.push(10.0);
+                }
+            }
+        }
+        s
+    }
+}
+
 impl<'a> From<&'a navara_material::RasterTileInternalMaterial> for RasterTileInternalMaterial {
     fn from(m: &'a navara_material::RasterTileInternalMaterial) -> Self {
+        let heatmap = ElevationHeatmapSlots::new(&m.elevation_heatmap_layers);
         Self {
+            show_mesh: m.show_mesh,
             shows: m.shows.iter().map(|s| s.to_u8()).collect(),
             colors: m.colors.clone(),
             opacities: m.opacities.clone(),
@@ -1669,70 +2827,29 @@ impl<'a> From<&'a navara_material::RasterTileInternalMaterial> for RasterTileInt
             receive_shadow: m.receive_shadow,
             lit: m.lit,
             show_bounding_box: m.show_bounding_box,
+            water_mask_color: m.water_mask_color,
+            wave_exaggeration: m.wave_exaggeration,
+            wave_strength: m.wave_strength,
+            wave_direction: m.wave_direction,
+            flow_speed: m.flow_speed,
 
             // Elevation Heatmap fields
-            is_elevation_heatmaps: m.is_elevation_heatmaps.iter().map(|b| b.to_u8()).collect(),
-            elevation_min_height: m
-                .elevation_heatmap_config
-                .as_ref()
-                .map(|c| c.min_height)
-                .unwrap_or(0.0),
-            elevation_max_height: m
-                .elevation_heatmap_config
-                .as_ref()
-                .map(|c| c.max_height)
-                .unwrap_or(1000.0),
-            elevation_r_scaler: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.r_scaler)
-                .unwrap_or(0.0),
-            elevation_g_scaler: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.g_scaler)
-                .unwrap_or(0.0),
-            elevation_b_scaler: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.b_scaler)
-                .unwrap_or(0.0),
-            elevation_boundary: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.boundary)
-                .unwrap_or(0.0),
-            elevation_max_offset: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.max_offset)
-                .unwrap_or(0.0),
-            elevation_min_offset: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.min_offset)
-                .unwrap_or(0.0),
-            elevation_epsilon: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.epsilon)
-                .unwrap_or(1.0),
-            elevation_offset: m
-                .heatmap_elevation_decoder
-                .as_ref()
-                .map(|d| d.offset)
-                .unwrap_or(0.0),
-
-            logarithmic: m
-                .elevation_heatmap_config
-                .as_ref()
-                .map(|c| c.logarithmic)
-                .unwrap_or(false),
-            log_boundary: m
-                .elevation_heatmap_config
-                .as_ref()
-                .map(|c| c.log_boundary)
-                .unwrap_or(10.0),
+            color_map_layer_ids: heatmap.color_map_layer_ids,
+            is_elevation_heatmaps: heatmap.is_elevation_heatmaps,
+            elevation_min_heights: heatmap.min_heights,
+            elevation_max_heights: heatmap.max_heights,
+            elevation_heatmap_filters: heatmap.filters,
+            // Per-layer DEM decoder parameters
+            elevation_r_scalers: heatmap.r_scalers,
+            elevation_g_scalers: heatmap.g_scalers,
+            elevation_b_scalers: heatmap.b_scalers,
+            elevation_boundaries: heatmap.boundaries,
+            elevation_max_offsets: heatmap.max_offsets,
+            elevation_min_offsets: heatmap.min_offsets,
+            elevation_epsilons: heatmap.epsilons,
+            elevation_offsets: heatmap.offsets,
+            logarithmics: heatmap.logarithmics,
+            log_boundaries: heatmap.log_boundaries,
 
             // Hillshade fields
             is_hillshades: m.is_hillshades.iter().map(|b| b.to_u8()).collect(),
@@ -1825,6 +2942,74 @@ pub struct TerrainMaterial {
     #[wasm_bindgen(js_name = skirtExaggeration)]
     #[serde(rename = "skirtExaggeration")]
     pub skirt_exaggeration: Option<f32>,
+    /// Vertical exaggeration of the terrain. Terrain heights are scaled by this
+    /// factor around `exaggerationRelativeHeight`. A negative value is treated
+    /// as 0, which flattens the terrain. Default: 1.
+    pub exaggeration: Option<f64>,
+    /// Height in meters that stays in place while the terrain is exaggerated:
+    /// a terrain height `h` is rendered at
+    /// `(h - exaggerationRelativeHeight) * exaggeration + exaggerationRelativeHeight`.
+    /// Default: 0.
+    #[wasm_bindgen(js_name = exaggerationRelativeHeight)]
+    #[serde(rename = "exaggerationRelativeHeight")]
+    pub exaggeration_relative_height: Option<f64>,
+    /// Outer `None`: the update leaves the color as it was. `Some(None)`: the
+    /// update clears it (`null` or an explicit `undefined`).
+    #[wasm_bindgen(skip)]
+    #[serde(
+        rename = "waterMaskColor",
+        default,
+        deserialize_with = "deserialize_clearable"
+    )]
+    pub water_mask_color: Option<Option<u32>>,
+    /// Scales the wave slopes on the watermask's water, keeping their size and
+    /// speed; 0 is a flat mirror. Default: 1.
+    #[wasm_bindgen(js_name = waveExaggeration)]
+    #[serde(rename = "waveExaggeration")]
+    pub wave_exaggeration: Option<f32>,
+    /// Sets the size, steepness and speed of the waves on the watermask's water:
+    /// about 1 is a calm ripple, 5 moderate and 20 a storm. Default: 5.
+    #[wasm_bindgen(js_name = waveStrength)]
+    #[serde(rename = "waveStrength")]
+    pub wave_strength: Option<f32>,
+    /// Where the waves on the watermask's water travel, in degrees clockwise
+    /// from north. Default: 0.
+    #[wasm_bindgen(js_name = waveDirection)]
+    #[serde(rename = "waveDirection")]
+    pub wave_direction: Option<f32>,
+    /// Speed in m/s of the current carrying the waves on the watermask's water
+    /// along `waveDirection`. Default: 0.
+    #[wasm_bindgen(js_name = flowSpeed)]
+    #[serde(rename = "flowSpeed")]
+    pub flow_speed: Option<f32>,
+}
+
+/// Deserializes a field that is present (even as `null`) to `Some`, so a
+/// `#[serde(default)]` absent field (`None`) stays distinguishable from a
+/// cleared one (`Some(None)`).
+fn deserialize_clearable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[wasm_bindgen]
+impl TerrainMaterial {
+    /// Body color of the water the source's watermask marks. The water shows
+    /// this color under its reflections instead of the imagery or globe color
+    /// beneath it. Requires `requestWaterMask` on a quantized-mesh source.
+    /// An update with `undefined` uses that imagery or globe color.
+    #[wasm_bindgen(getter, js_name = waterMaskColor)]
+    pub fn water_mask_color(&self) -> Option<u32> {
+        self.water_mask_color.flatten()
+    }
+
+    #[wasm_bindgen(setter, js_name = waterMaskColor)]
+    pub fn set_water_mask_color(&mut self, color: Option<u32>) {
+        self.water_mask_color = Some(color);
+    }
 }
 
 impl From<TerrainMaterial> for navara_material::TerrainMaterial {
@@ -1846,6 +3031,15 @@ impl TerrainMaterial {
             show_bounding_box: self.show_bounding_box.unwrap_or(other.show_bounding_box),
             skirt: self.skirt.unwrap_or(other.skirt),
             skirt_exaggeration: self.skirt_exaggeration.unwrap_or(other.skirt_exaggeration),
+            exaggeration: self.exaggeration.unwrap_or(other.exaggeration),
+            exaggeration_relative_height: self
+                .exaggeration_relative_height
+                .unwrap_or(other.exaggeration_relative_height),
+            water_mask_color: self.water_mask_color.unwrap_or(other.water_mask_color),
+            wave_exaggeration: self.wave_exaggeration.unwrap_or(other.wave_exaggeration),
+            wave_strength: self.wave_strength.unwrap_or(other.wave_strength),
+            wave_direction: self.wave_direction.unwrap_or(other.wave_direction),
+            flow_speed: self.flow_speed.unwrap_or(other.flow_speed),
         }
     }
 }
@@ -1865,6 +3059,25 @@ pub struct ElevationHeatmapMaterial {
     #[wasm_bindgen(js_name = logBoundary)]
     #[serde(rename = "logBoundary")]
     pub log_boundary: Option<f64>,
+    #[wasm_bindgen(getter_with_clone)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Color map lookup table for this layer's elevation heatmap rendering.
+    /// Flattened RGBA array: [r0,g0,b0,a0, r1,g1,b1,a1, ...], evenly spaced over
+    /// [minHeight, maxHeight]. When None, the elevation renders as grayscale.
+    /// Managed on the web side (ColorMapAtlas); Rust only hashes it to detect
+    /// changes.
+    #[wasm_bindgen(js_name = colorMap, getter_with_clone)]
+    #[serde(rename = "colorMap", skip_serializing_if = "Option::is_none")]
+    pub color_map: Option<Vec<f32>>,
+    /// Optional ascending stop elevations in meters, one per colorMap entry.
+    /// When set, colorMap entry i is placed at elevation colorStops[i] instead
+    /// of being evenly spaced over [minHeight, maxHeight].
+    /// Managed on the web side (ColorMapAtlas); Rust only hashes it to detect
+    /// changes.
+    #[wasm_bindgen(js_name = colorStops, getter_with_clone)]
+    #[serde(rename = "colorStops", skip_serializing_if = "Option::is_none")]
+    pub color_stops: Option<Vec<f32>>,
 }
 
 /// Hillshade render options for a `raster` layer. The elevation decoder is taken
@@ -1878,8 +3091,32 @@ pub struct HillshadeMaterial {
 
 #[cfg(test)]
 mod test {
-    use super::parse_geometry_types;
-    use navara_material::SourceGeometryType;
+    use super::{
+        PolygonMaterial, PolylineMaterial, TextMaterial, VariableAnchor, parse_anchor,
+        parse_facing, parse_geometry_types, parse_padding, parse_translate_anchor,
+        parse_variable_anchors,
+    };
+    use navara_material::{Anchor, Facing, SourceGeometryType};
+
+    #[test]
+    fn parse_padding_expands_like_css() {
+        assert_eq!(parse_padding(&None), None);
+        assert_eq!(parse_padding(&Some(vec![3.0])), Some([3.0; 4]));
+        assert_eq!(
+            parse_padding(&Some(vec![1.0, 2.0])),
+            Some([1.0, 2.0, 1.0, 2.0])
+        );
+        assert_eq!(
+            parse_padding(&Some(vec![1.0, 2.0, 3.0])),
+            Some([1.0, 2.0, 3.0, 2.0])
+        );
+        assert_eq!(
+            parse_padding(&Some(vec![1.0, 2.0, 3.0, 4.0])),
+            Some([1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(parse_padding(&Some(vec![])), None);
+        assert_eq!(parse_padding(&Some(vec![1.0; 5])), None);
+    }
 
     #[test]
     fn parse_geometry_types_keeps_valid_names() {
@@ -1911,5 +3148,175 @@ mod test {
             parse_geometry_types(&Some(vec!["Line".to_string(), "polyline".to_string()])),
             Some(vec![])
         );
+    }
+
+    #[test]
+    fn parse_anchor_round_trips_every_name() {
+        for name in [
+            "center",
+            "left",
+            "right",
+            "top",
+            "bottom",
+            "top-left",
+            "top-right",
+            "bottom-left",
+            "bottom-right",
+        ] {
+            let anchor = parse_anchor(&Some(name.to_string())).unwrap();
+            assert_eq!(anchor.as_str(), name);
+        }
+        assert_eq!(parse_anchor(&Some("middle".to_string())), None);
+        assert_eq!(parse_anchor(&None), None);
+    }
+
+    #[test]
+    fn parse_translate_anchor_reads_the_js_names() {
+        for name in ["map", "viewport"] {
+            let anchor = parse_translate_anchor(&Some(name.to_string())).unwrap();
+            assert_eq!(anchor.as_str(), name);
+        }
+        assert_eq!(parse_translate_anchor(&Some("screen".to_string())), None);
+    }
+
+    #[test]
+    fn parse_variable_anchors_drops_unknown_anchors() {
+        let entry = |anchor: &str, offset| VariableAnchor {
+            anchor: anchor.to_string(),
+            offset,
+        };
+        let parsed = parse_variable_anchors(&Some(vec![
+            entry("top", Some(crate::Vec2 { x: 0.0, y: 1.5 })),
+            entry("middle", None),
+            entry("left", None),
+        ]))
+        .unwrap();
+        let anchors: Vec<_> = parsed.iter().map(|v| (v.anchor, v.offset.y)).collect();
+        assert_eq!(anchors, vec![(Anchor::Top, 1.5), (Anchor::Left, 0.0)]);
+    }
+
+    #[test]
+    fn parse_facing_reads_the_js_names() {
+        assert_eq!(
+            parse_facing("textFacing", &Some("upright".to_string())),
+            Some(Facing::Upright)
+        );
+        assert_eq!(
+            parse_facing("textFacing", &Some("flat".to_string())),
+            Some(Facing::Flat)
+        );
+    }
+
+    /// An absent field and an unrecognized one both read as "unspecified", so
+    /// the caller keeps whatever facing the material already had.
+    #[test]
+    fn parse_facing_falls_back_on_unknown_values() {
+        assert_eq!(parse_facing("textFacing", &None), None);
+        assert_eq!(parse_facing("textFacing", &Some("Flat".to_string())), None);
+    }
+
+    #[test]
+    fn merge_keeps_the_previous_facing_when_unspecified() {
+        let previous = navara_material::TextMaterial {
+            text_facing: Some(Facing::Flat),
+            rotate_with_camera: Some(false),
+            ..Default::default()
+        };
+        let merged = TextMaterial::from(&navara_material::TextMaterial::default()).merge(&previous);
+        assert_eq!(merged.text_facing, Some(Facing::Flat));
+        assert_eq!(merged.rotate_with_camera, Some(false));
+    }
+
+    /// Facing and `rotateWithCamera` resolve from `placement` on the JS side,
+    /// so "unset" must reach it rather than a default baked in here.
+    #[test]
+    fn unset_orientation_stays_unset_through_conversion() {
+        let material = navara_material::TextMaterial::from(TextMaterial::from(
+            &navara_material::TextMaterial::default(),
+        ));
+        assert_eq!(material.text_facing, None);
+        assert_eq!(material.rotate_with_camera, None);
+
+        let js = TextMaterial::from(&material);
+        assert_eq!(js.text_facing, None);
+        assert_eq!(js.rotate_with_camera, None);
+    }
+
+    #[test]
+    fn geodesic_survives_conversion_and_merge() {
+        let off = navara_material::PolygonMaterial {
+            geodesic: false,
+            ..Default::default()
+        };
+        let js = PolygonMaterial::from(&off);
+        assert_eq!(js.geodesic, Some(false));
+        assert!(!navara_material::PolygonMaterial::from(js.clone()).geodesic);
+        assert!(
+            !js.merge(&navara_material::PolygonMaterial::default())
+                .geodesic
+        );
+
+        let mut unset = PolygonMaterial::from(&navara_material::PolygonMaterial::default());
+        unset.geodesic = None;
+        assert!(!unset.merge(&off).geodesic);
+        assert!(navara_material::PolygonMaterial::from(unset).geodesic);
+
+        let off = navara_material::PolylineMaterial {
+            geodesic: false,
+            ..Default::default()
+        };
+        let js = PolylineMaterial::from(&off);
+        assert_eq!(js.geodesic, Some(false));
+        assert!(!navara_material::PolylineMaterial::from(js.clone()).geodesic);
+        assert!(
+            !js.merge(&navara_material::PolylineMaterial::default())
+                .geodesic
+        );
+
+        let mut unset = PolylineMaterial::from(&navara_material::PolylineMaterial::default());
+        unset.geodesic = None;
+        assert!(!unset.merge(&off).geodesic);
+        assert!(navara_material::PolylineMaterial::from(unset).geodesic);
+    }
+
+    /// An update that shows the outline asks for its geometry, as an add does;
+    /// hiding it keeps the geometry so it can be shown again. Update and add
+    /// agree: showing the outline builds it even with `outline: false`.
+    #[test]
+    fn merge_outline_show_requests_outline_geometry() {
+        let patch = |json: &str| serde_json::from_str::<PolygonMaterial>(json).unwrap();
+        let without = navara_material::PolygonMaterial {
+            outline: false,
+            ..Default::default()
+        };
+        let with = navara_material::PolygonMaterial {
+            outline: true,
+            outline_show: true,
+            ..Default::default()
+        };
+
+        let merged = patch(r#"{ "outlineShow": true }"#).merge(&without);
+        assert!(merged.outline);
+        assert!(merged.outline_show);
+
+        assert!(patch(r#"{ "outlineShow": false }"#).merge(&with).outline);
+        assert!(!patch(r#"{ "color": 255 }"#).merge(&without).outline);
+        assert!(
+            patch(r#"{ "outline": false, "outlineShow": true }"#)
+                .merge(&without)
+                .outline
+        );
+        assert!(
+            !patch(r#"{ "outline": false, "outlineShow": false }"#)
+                .merge(&with)
+                .outline
+        );
+
+        // An add with the same description builds the same geometry.
+        let add = |json: &str| navara_material::PolygonMaterial::from(patch(json)).outline;
+        assert!(add(r#"{ "outlineShow": true }"#));
+        assert!(add(r#"{ "outline": false, "outlineShow": true }"#));
+        assert!(add(r#"{ "outline": true, "outlineShow": false }"#));
+        assert!(!add(r#"{ "outlineShow": false }"#));
     }
 }

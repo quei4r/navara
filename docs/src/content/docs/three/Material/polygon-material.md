@@ -9,24 +9,6 @@ sidebar:
 
 ## Properties
 
-### applyWaterNormal
-
-**Type:** `boolean | undefined`
-
-**Description:** Specifies whether to apply a water normal map.
-
-**Default:** `undefined`
-
-**Example:**
-
-```typescript
-{
-  polygon: {
-    applyWaterNormal: false
-  }
-}
-```
-
 ### castShadow
 
 **Type:** `boolean | undefined`
@@ -79,6 +61,26 @@ import { Color } from "@navaramap/three";
 {
   polygon: {
     color: new Color().setHex(0x00cc66)
+  }
+}
+```
+
+### depthPrePass
+
+**Type:** `boolean | undefined`
+
+**Description:** Writes the polygon's depth before any transparent mesh is drawn, so a `transparent` polygon blends only its nearest surface. Without it, faces behind that surface show through and add up, which darkens overlaps such as the sides of extruded polygons. Faces at the same depth, such as a feature that neighboring tiles both contain, are blended once. The written depth also hides any other transparent mesh behind the polygon, so a translucent layer or particle drawn behind it does not show through. Effective when `transparent` is `true` and `clampToGround` is `false`.
+
+**Default:** `undefined`
+
+**Example:**
+
+```typescript
+{
+  polygon: {
+    transparent: true,
+    opacity: 0.8,
+    depthPrePass: true
   }
 }
 ```
@@ -143,7 +145,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the extrusion height. This works when `clampToGround` is false.
+**Description:** Extrudes the polygon upward by this many meters: its top sits at `height + extrudedHeight` above the ellipsoid, or above each position with [`perPositionHeight`](#perpositionheight). With `perPositionHeight` and [`extrusionBase`](#extrusionbase) set to `"ellipsoid"`, the top is this many meters above each position, not raised by `height`. Applies when `clampToGround` is false.
 
 **Default:** `undefined`
 
@@ -157,11 +159,58 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### extrusionBase :since[0.3.2]
+
+**Type:** `"position" | "ellipsoid" | undefined`
+
+**Description:** Sets what the bottom of a polygon with [`perPositionHeight`](#perpositionheight) follows.
+
+- `"position"`: Both the bottom and the top follow the positions. The bottom is [`height`](#height) above each position and the top `height + extrudedHeight` above it, so the polygon has the same thickness everywhere.
+- `"ellipsoid"`: The bottom lies flat at `height` above the ellipsoid, and the top is [`extrudedHeight`](#extrudedheight) above each position, so the polygon fills the space between them. This is how CesiumJS draws a polygon with both `perPositionHeight` and `extrudedHeight`. Where the bottom lies above the top, the polygon is drawn inside out, so keep `height` below the lowest top.
+
+Without `perPositionHeight` the positions lie on the ellipsoid, and both values draw the same polygon. Set it when the layer is added: `layer.update()` does not rebuild the polygons already shown.
+
+**Default:** `"position"`
+
+**Example:**
+
+```typescript
+{
+  polygon: {
+    clampToGround: false,
+    perPositionHeight: true,
+    // A water surface at each position's height, filled down to the ellipsoid
+    extrusionBase: "ellipsoid"
+  }
+}
+```
+
+### geodesic :since[0.3.2]
+
+**Type:** `boolean | undefined`
+
+**Description:** Specifies whether edges drawn through the tiled path (`clampToGround` or `tiled`) of a GeoJSON source follow the geodesic. When `true`, two consecutive vertices more than 180° apart in longitude are also joined the short way, across the antimeridian; a closed ring that would then no longer close, such as one around a pole, is kept as given. When `false`, edges are straight lines in Web Mercator and longitudes are used as given, so a longitude of 190° lies east of 180°, as in MapLibre. Edges outside the tiled path and edges from vector tile sources are not affected.
+
+The option applies to the whole layer: its tiled `polygon` and `polyline` share one geometry, which follows the geodesic unless both set `geodesic: false`. It is read when the layer's tiles are first built, so changing it on an existing layer has no effect.
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  polygon: {
+    clampToGround: true,
+    geodesic: false
+  }
+}
+```
+
 ### height
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the height. This works when `clampToGround` is false. The unit is meters.
+**Description:** Raises the bottom of the polygon by this many meters: above the ellipsoid, or above each position with [`perPositionHeight`](#perpositionheight) unless [`extrusionBase`](#extrusionbase) is `"ellipsoid"`. Works when `clampToGround` is false.
 
 **Default:** `undefined`
 
@@ -179,7 +228,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the Index of Refraction. Affects the refraction of light passing through the material.
+**Description:** Specifies the index of refraction of the `specular` highlight's Fresnel term. Has no effect on water.
 
 **Default:** `undefined`
 
@@ -233,7 +282,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `boolean | undefined`
 
-**Description:** Whether to compute outline geometry. Only effective at initial load time. When not set, inferred from `outlineShow`.
+**Description:** Whether to compute outline geometry even while `outlineShow` is `false`, so an update can show it later. Showing the outline always computes it. Read when geometry is built: tiles already loaded keep what they have.
 
 **Default:** `undefined`
 
@@ -307,7 +356,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `boolean | undefined`
 
-**Description:** Specifies whether to obtain height from the data. When false, the height is a constant value.
+**Description:** Uses the height of each position. When `false`, the positions are placed on the ellipsoid and [`height`](#height) sets the polygon's height. [`extrusionBase`](#extrusionbase) sets where the bottom of such a polygon lies. Set it when the layer is added: `layer.update()` does not rebuild the polygons already shown.
 
 **Default:** `undefined`
 
@@ -343,7 +392,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the reflectivity for post-processing or environment maps.
+**Description:** Specifies the reflectance at normal incidence (F0) that SSR and the aerial perspective's `specular` term read. Water uses `0.02` regardless. Values below `0.01` disable both. It also weights the environment map when one is set.
 
 **Default:** `undefined`
 
@@ -361,9 +410,9 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the roughness for post-processing. Specified in the range of 0.0 to 1.0.
+**Description:** Specifies the roughness for post-processing such as SSR and the aerial perspective's specular term. Specified in the range of 0.0 to 1.0, where 0.0 is a mirror.
 
-**Default:** `undefined`
+**Default:** `0.44`
 
 **Example:**
 
@@ -375,11 +424,30 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### shadeSidesAsSurface
+
+**Type:** `boolean | undefined`
+
+**Description:** Shades the sides of an extruded polygon with the surface's upward normal instead of their own, so they light the same as the top. Use it when the extrusion stands for a continuous surface rather than a solid, for example per-cell water levels whose sides fill the steps between neighboring cells. Effective when `clampToGround` is `false`.
+
+**Default:** `undefined`
+
+**Example:**
+
+```typescript
+{
+  polygon: {
+    extrudedHeight: 2,
+    shadeSidesAsSurface: true
+  }
+}
+```
+
 ### shininess
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the shininess of the material.
+**Description:** Specifies the shininess of the `specular` highlight. Has no effect on water.
 
 **Default:** `undefined`
 
@@ -415,7 +483,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `boolean | undefined`
 
-**Description:** Specifies whether to enable the specular effect. When enabled, the `shininess` and `specularStrength` values are used.
+**Description:** Specifies whether to enable the specular effect. When enabled, the `shininess` and `specularStrength` values are used. Has no effect on water.
 
 **Default:** `undefined`
 
@@ -433,7 +501,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the intensity of specular highlights.
+**Description:** Specifies the intensity of the `specular` highlight. Has no effect on water.
 
 **Default:** `undefined`
 
@@ -505,7 +573,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `boolean | undefined`
 
-**Description:** Specifies whether to apply a water surface material to the polygon. May slow down mesh loading.
+**Description:** Specifies whether to render the polygon as a water surface. Its waves follow [`waveStrength`](#wavestrength) and [`waveDirection`](#wavedirection). They keep their size in meters and are visible up close, and from about 2 km away the surface reads as one uniformly rough plane under the sun's glitter. The surface reflects the sky with a Fresnel term and the sun with its own highlight, so `reflectivity`, `roughness`, `shininess`, `specularStrength`, `specular`, and `ior` have no effect on it. Waves move only while frames render, for example with `ThreeView.animation` on.
 
 **Default:** `undefined`
 
@@ -519,38 +587,98 @@ import { Color } from "@navaramap/three";
 }
 ```
 
-### waterScaleNormal
+### waveExaggeration
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the scale of the water surface normals. Smaller values make the water surface rougher.
+**Description:** Scales the slopes of the water's waves, keeping their size and speed. `0` makes a still, mirror-like surface. Only used when `water` is enabled.
 
-**Default:** `undefined`
+**Default:** `1`
 
 **Example:**
 
 ```typescript
 {
   polygon: {
-    waterScaleNormal: 2.0
+    water: true,
+    waveExaggeration: 0.5
   }
 }
 ```
 
-### waterSpeed
+### waterScale
 
-**Type:** `number | undefined`
+**Type:** `"ocean" | "large" | "medium" | "small" | undefined`
 
-**Description:** Specifies the speed of water waves.
+**Description:** Extent of the water body. Waves grow with the open distance across the water, so a smaller body gets shorter, finer waves at the same `waveStrength`. `"ocean"` grows the waves as far as `waveStrength` allows. `"large"` assumes about 20 km of open water, such as a bay or a large lake. `"medium"` assumes about 2 km, such as a lake or a wide river. `"small"` assumes about 200 m, such as a river or a pond. The slope of the waves still follows `waveStrength`. Only used when `water` is enabled.
 
-**Default:** `undefined`
+**Default:** `"ocean"`
 
 **Example:**
 
 ```typescript
 {
   polygon: {
-    waterSpeed: 0.003
+    water: true,
+    waterScale: "small"
+  }
+}
+```
+
+### waveStrength
+
+**Type:** `number | undefined`
+
+**Description:** Sets the size, steepness, and speed of the waves. About `1` is a calm ripple, `5` is moderate, and `20` is a storm. To change only their height, use [`waveExaggeration`](#waveexaggeration). Only used when `water` is enabled.
+
+**Default:** `5`
+
+**Example:**
+
+```typescript
+{
+  polygon: {
+    water: true,
+    waveStrength: 12
+  }
+}
+```
+
+### waveDirection
+
+**Type:** `number | undefined`
+
+**Description:** The direction the waves travel, in degrees clockwise from north. Only used when `water` is enabled.
+
+**Default:** `0`
+
+**Example:**
+
+```typescript
+{
+  polygon: {
+    water: true,
+    waveDirection: 225
+  }
+}
+```
+
+### flowSpeed
+
+**Type:** `number | undefined`
+
+**Description:** The speed in m/s of a current that carries the waves along [`waveDirection`](#wavedirection), without changing their size or slope. The whole surface moves as one. Only used when `water` is enabled.
+
+**Default:** `0`
+
+**Example:**
+
+```typescript
+{
+  polygon: {
+    water: true,
+    waveDirection: 90,
+    flowSpeed: 2
   }
 }
 ```

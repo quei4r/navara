@@ -20,13 +20,17 @@ in float attrBatchId;
   in vec3 forward_offset;
 #endif
 
-in vec3 start_normal;
-in vec4 end_normal_and_texture_coordinate_normalization_x;
-in vec4 right_normal_and_texture_coordinate_normalization_y;
+// xyz: start plane normal, w: high part of the length so far along the line.
+in vec4 start_normal_and_length_high;
+// xyz: end plane normal, w: segment length, negative on the left side.
+in vec4 end_normal_and_segment_length;
+// xyz: right plane normal, w: low part of the length so far along the line.
+in vec4 right_normal_and_line_length;
 
 #include <common>
 #include <color_pars_vertex>
 #include <shadowmap_pars_vertex>
+#include <logdepthbuf_pars_vertex>
 #include chunks/batch_texture_pars_vertex;
 
 uniform vec3 minMaxHeightAndWidth;
@@ -41,11 +45,28 @@ flat out vec3 v_endPlaneNormalEc;
 flat out vec4 v_rightPlaneEC;
 flat out float v_startPlaneOffsetEc;
 flat out float v_endPlaneOffsetEc;
-out vec4 v_endEcAndStartEcX;
-out vec4 v_texcoordNormalizationAndStartEcYZ;
 out vec3 vViewPosition;
 flat out float nvr_vBatchId;
 out vec3 vNormal;
+
+#if defined(NVR_LINE_DASH) || defined(USE_BATCH_LINE_DASH)
+uniform float uLineDashRow;
+// Height range of the terrain under a ground line; minMaxHeightAndWidth also
+// covers the volume's allowance for the curvature.
+uniform vec2 nvr_uGroundHeightRange;
+// x: segment length, y/z: high/low part of the length so far along the line
+// at the segment start (meters), w: atlas row of the dash pattern.
+flat out vec4 nvr_vLineDash;
+// Converts a distance from the start (x) / end (y) plane into a distance
+// along the segment: the planes are miter planes, not perpendicular to it.
+flat out vec2 nvr_vLineDashPlaneScale;
+// This segment's entry in the line's segment table (the geometry's
+// line_segments).
+flat out float nvr_vLineDashSegment;
+// x: height above the line's positions at which the dash pattern measures the
+// line's width, y: how far from that height the volume reaches.
+flat out vec2 nvr_vLineDashLift;
+#endif
 
 
 void main() {
@@ -78,8 +99,22 @@ void main() {
 
     #include chunks/height_vertex;
     #include chunks/line_width_vertex;
+    #ifdef USE_BATCH_LINE_DASH
+        float nvr_batchLineDash = 0.0;
+    #endif
 
     #include chunks/batch_texture_vertex;
+
+    #if defined(NVR_LINE_DASH) || defined(USE_BATCH_LINE_DASH)
+        nvr_vLineDash.x = abs(end_normal_and_segment_length.w);
+        nvr_vLineDash.y = start_normal_and_length_high.w;
+        nvr_vLineDash.z = right_normal_and_line_length.w;
+        #ifdef USE_BATCH_LINE_DASH
+            nvr_vLineDash.w = nvr_batchLineDash;
+        #else
+            nvr_vLineDash.w = uLineDashRow;
+        #endif
+    #endif
 
     vec3 ecStart;
     vec3 ecEnd;
@@ -111,35 +146,50 @@ void main() {
     // start plane
     vec4 startPlaneEC;
     #ifdef USE_RTE
-        startPlaneEC.xyz = mat3(modelViewMatrixRTE) * start_normal;
+        startPlaneEC.xyz = mat3(modelViewMatrixRTE) * start_normal_and_length_high.xyz;
     #else
-        startPlaneEC.xyz = normalMatrix * start_normal;
+        startPlaneEC.xyz = normalMatrix * start_normal_and_length_high.xyz;
     #endif
     startPlaneEC.w = -dot(startPlaneEC.xyz, ecStart);
 
     // end plane
     vec4 endPlaneEC;
     #ifdef USE_RTE
-        endPlaneEC.xyz = mat3(modelViewMatrixRTE) * end_normal_and_texture_coordinate_normalization_x.xyz;
+        endPlaneEC.xyz = mat3(modelViewMatrixRTE) * end_normal_and_segment_length.xyz;
     #else
-        endPlaneEC.xyz = normalMatrix * end_normal_and_texture_coordinate_normalization_x.xyz;
+        endPlaneEC.xyz = normalMatrix * end_normal_and_segment_length.xyz;
     #endif
     endPlaneEC.w = -dot(endPlaneEC.xyz, ecEnd);
 
     // Right plane
     #ifdef USE_RTE
-        v_rightPlaneEC.xyz = mat3(modelViewMatrixRTE) * right_normal_and_texture_coordinate_normalization_y.xyz;
+        v_rightPlaneEC.xyz = mat3(modelViewMatrixRTE) * right_normal_and_line_length.xyz;
     #else
-        v_rightPlaneEC.xyz = normalMatrix * right_normal_and_texture_coordinate_normalization_y.xyz;
+        v_rightPlaneEC.xyz = normalMatrix * right_normal_and_line_length.xyz;
     #endif
     v_rightPlaneEC.w = -dot(v_rightPlaneEC.xyz, ecStart);
 
-    v_texcoordNormalizationAndStartEcYZ.x = abs(end_normal_and_texture_coordinate_normalization_x.w);
-    v_texcoordNormalizationAndStartEcYZ.y = right_normal_and_texture_coordinate_normalization_y.w;
-
-    v_endEcAndStartEcX.xyz = ecEnd;
-    v_endEcAndStartEcX.w = ecStart.x;
-    v_texcoordNormalizationAndStartEcYZ.zw = ecStart.yz;
+    #if defined(NVR_LINE_DASH) || defined(USE_BATCH_LINE_DASH)
+        nvr_vLineDashPlaneScale = vec2(
+            1.0 / dot(startPlaneEC.xyz, forwardDirectionEC),
+            -1.0 / dot(endPlaneEC.xyz, forwardDirectionEC)
+        );
+        // The geometry emits eight vertices per segment.
+        nvr_vLineDashSegment = float(gl_VertexID / 8);
+        #ifdef NVR_GROUND_POLYLINE
+            // The positions lie on the ellipsoid; the ground is somewhere in
+            // the terrain's height range.
+            nvr_vLineDashLift = vec2(
+                0.5 * (nvr_uGroundHeightRange.x + nvr_uGroundHeightRange.y),
+                0.5 * abs(nvr_uGroundHeightRange.y - nvr_uGroundHeightRange.x)
+            );
+        #else
+            nvr_vLineDashLift = vec2(
+                addHeight,
+                max(abs(minMaxHeightAndWidth.x), abs(minMaxHeightAndWidth.y))
+            );
+        #endif
+    #endif
 
     #ifdef USE_RTE
         vec4 positionEC = modelViewMatrixRTE * vec4(transformed, 1.0);
@@ -157,13 +207,17 @@ void main() {
     // Extrudes height
     vec3 heightNormal = normalize(nvr_branchFreeTernary(absStartPlaneDistance < absEndPlaneDistance, cross(v_rightPlaneEC.xyz, startPlaneEC.xyz), cross(endPlaneEC.xyz, v_rightPlaneEC.xyz)));
     #ifdef USE_RTE
-        // Calculate distance from reference points to determine vertex type
-        vec3 ecCurPoint = nvr_branchFreeTernary(absStartPlaneDistance < absEndPlaneDistance, ecStart, ecEnd);
-        vec3 distToRef = normalize(positionEC.xyz - ecCurPoint);
-
-        // Use mix for branchless selection: mix(bottom, top, step(threshold, distance))
-        // step(THRESHOLD, distToRef) returns 0.0 for bottom vertices, 1.0 for top vertices
-        vec3 height = heightNormal * nvr_branchFreeTernary(dot(distToRef, heightNormal) > 0., minMaxHeightAndWidth.y, minMaxHeightAndWidth.x);
+        // The wall is 1 m tall with its bottom on the segment end, below the
+        // f32 step of eye coordinates at globe distances, so top and bottom
+        // are told apart in world space, where the high/low difference is
+        // exact. `heightNormal` is then oriented up for the same reason.
+        bool atStart = absStartPlaneDistance < absEndPlaneDistance;
+        vec3 wallOffset = (position_3d_high - nvr_branchFreeTernary(atStart, start_3d_high, end_3d_high)) * u_rteOne
+            + (position_3d_low - nvr_branchFreeTernary(atStart, start_3d_low, end_3d_low));
+        bool isTop = dot(wallOffset, wallOffset) > 0.25;
+        vec3 upEC = mat3(modelViewMatrixRTE) * normalize(nvr_branchFreeTernary(atStart, segmentStartAbs, segmentEndAbs));
+        heightNormal *= sign(dot(heightNormal, upEC));
+        vec3 height = heightNormal * nvr_branchFreeTernary(isTop, minMaxHeightAndWidth.y, minMaxHeightAndWidth.x);
         positionEC.xyz += height;
     #else
         vec3 cur_point = nvr_branchFreeTernary(absStartPlaneDistance < absEndPlaneDistance, start, start + forward_offset);
@@ -179,8 +233,6 @@ void main() {
 
 	#include <normal_vertex>
  
-    v_texcoordNormalizationAndStartEcYZ.y = nvr_branchFreeTernary(v_texcoordNormalizationAndStartEcYZ.y > 1.0, 0.0, abs(v_texcoordNormalizationAndStartEcYZ.y));
-
     // Use batchLineWidth when >= 0.0, otherwise fall back to default width.
     // Negative batchLineWidth indicates "use default width from minMaxHeightAndWidth.z"
     #ifdef USE_BATCH_LINE_WIDTH
@@ -209,11 +261,25 @@ void main() {
     positionEC.xyz += pushDirection * forwardPush * forwardDirectionEC;
 
     lineWidth = lineWidth / dot(normalEC, v_rightPlaneEC.xyz); // lineWidth = distance to push along N
+    #ifndef NVR_GROUND_POLYLINE
+        // Without the ground test nothing cuts the volume back to the line
+        // width, so each side goes out half of it. The ground volume keeps
+        // the full push, and its fragment test cuts it back.
+        lineWidth *= 0.5;
+    #endif
 
-    normalEC *= sign(end_normal_and_texture_coordinate_normalization_x.w);
+    normalEC *= sign(end_normal_and_segment_length.w);
 
     positionEC.xyz += lineWidth * normalEC;
     gl_Position = projectionMatrix * positionEC;
+    #include <logdepthbuf_vertex>
+    #ifdef NVR_GROUND_POLYLINE
+        // The volume can reach thousands of kilometres below the ground over
+        // a wide extent, and the faces it draws are the far ones. Clamped to
+        // the far plane they still cover the ground, and the fragment shader
+        // writes the ground's depth.
+        gl_Position.z = min(gl_Position.z, gl_Position.w);
+    #endif
     vViewPosition = -positionEC.xyz;
 
     // Alias for three's chunk convention: the CSM view-space shadow patch

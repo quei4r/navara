@@ -211,6 +211,36 @@ impl Ellipsoid<FloatType> {
     }
 }
 
+/// Web Mercator (EPSG:3857), which projects onto a sphere of the ellipsoid's
+/// semi-major axis.
+impl Ellipsoid<f64> {
+    /// Easting and northing in metres, y growing northward, of a longitude and
+    /// latitude in degrees. The latitude is not clamped: a pole projects to
+    /// infinity, so callers that may reach one clamp it first.
+    pub fn to_web_mercator(&self, lng_deg: f64, lat_deg: f64) -> (f64, f64) {
+        let lat = lat_deg.to_radians();
+        (
+            lng_deg.to_radians() * self.a,
+            (lat * 0.5 + std::f64::consts::FRAC_PI_4).tan().ln() * self.a,
+        )
+    }
+
+    /// Longitude and latitude in degrees of a [`Self::to_web_mercator`]
+    /// position. The longitude is not wrapped, so an easting past the
+    /// antimeridian comes back past ±180°.
+    pub fn from_web_mercator(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            (x / self.a).to_degrees(),
+            (2.0 * (y / self.a).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees(),
+        )
+    }
+
+    /// Width of the projected world in metres: the length of the equator.
+    pub fn web_mercator_world_width(&self) -> f64 {
+        2.0 * std::f64::consts::PI * self.a
+    }
+}
+
 impl<F: Float + One<F>> LLE<F, Radians> {
     pub fn to_xyz(self, e: Ellipsoid<F>) -> XYZ<F> {
         e.lle_to_xyz(self)
@@ -261,6 +291,23 @@ mod tests {
         assert!((-2430601.8 - xyz.x.val()).abs() < 0.1, "x: {}", xyz.x.val());
         assert!((-4702442.7 - xyz.y.val()).abs() < 0.1, "y: {}", xyz.y.val());
         assert!((3546587.4 - xyz.z.val()).abs() < 0.1, "z: {}", xyz.z.val());
+    }
+
+    #[test]
+    fn web_mercator_matches_epsg_3857_and_round_trips() {
+        // The EPSG:3857 bounds: ±180° spans ±20,037,508.34 m, and the square
+        // world's edge of latitude, ±85.0511°, sits at the same northing.
+        let (x, y) = WGS84_64.to_web_mercator(180.0, 85.051_128_779_806_59);
+        assert_abs_diff_eq!(x, 20_037_508.342_789_244, epsilon = 1e-6);
+        assert_abs_diff_eq!(y, 20_037_508.342_789_244, epsilon = 1e-3);
+        assert_abs_diff_eq!(WGS84_64.web_mercator_world_width(), 2.0 * x, epsilon = 1e-6);
+
+        for (lng, lat) in [(0.0, 0.0), (139.7, 35.7), (-0.13, 51.5), (200.0, -60.0)] {
+            let (x, y) = WGS84_64.to_web_mercator(lng, lat);
+            let (lng2, lat2) = WGS84_64.from_web_mercator(x, y);
+            assert_abs_diff_eq!(lng2, lng, epsilon = 1e-9);
+            assert_abs_diff_eq!(lat2, lat, epsilon = 1e-9);
+        }
     }
 
     #[test]

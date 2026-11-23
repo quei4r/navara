@@ -5,6 +5,8 @@ import PolylineVertShader from "@shaders/glsl/polyline.vert.glsl";
 import { packing } from "@takram/three-geospatial/shaders";
 import type { WebGLProgramParametersWithUniforms } from "three";
 
+import { SOLID_DASH_ROW } from "../../../../lineDash";
+
 import type { SupportedMaterial } from "./material";
 import type { PolylineBaseMutates, PolylineBaseState } from "./types";
 
@@ -64,6 +66,25 @@ export const transformShader = (
   }
 
   shader.defines.USE_SELECTIVE_EFFECT = 1;
+
+  // `shader.defines` is the material's own object, so a define whose
+  // condition stopped holding has to be removed, not just left unset.
+  if (state.groundCulling) {
+    shader.defines.NVR_GROUND_POLYLINE = true;
+  } else {
+    delete shader.defines.NVR_GROUND_POLYLINE;
+  }
+  if (state.groundCulling && state.useGroundNormals) {
+    shader.defines.NVR_GROUND_POLYLINE_NORMALS = true;
+  } else {
+    delete shader.defines.NVR_GROUND_POLYLINE_NORMALS;
+  }
+
+  if (state.dashRow !== SOLID_DASH_ROW) {
+    shader.defines.NVR_LINE_DASH = true;
+  } else {
+    delete shader.defines.NVR_LINE_DASH;
+  }
 
   if (material.userData.defines) {
     Object.assign(shader.defines, material.userData.defines);

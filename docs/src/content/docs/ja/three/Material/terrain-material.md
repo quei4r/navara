@@ -15,10 +15,10 @@ sidebar:
 
 **デフォルト:** `true`
 
-**説明:** 地形を表示するかどうか。
+**説明:** 地形メッシュを描画するかどうか。`false` にすると地表が描画されなくなり、その上に描画されるラスターレイヤー、ヒルシェード、地表に重畳されるベクターの地物も表示されません。地形データの読み込みは続くため、`clampToGround: true` を指定したポイント・ビルボード・テキストや地形の高さのサンプリングなど、地形の高さを参照する機能はそのまま動作します。
 
 ```typescript
-{ terrain: { show: true } }
+{ terrain: { show: false } }
 ```
 
 ### castShadow
@@ -95,6 +95,90 @@ sidebar:
 
 ```typescript
 { terrain: { skirtExaggeration: 1.5 } }
+```
+
+### exaggeration
+
+**型:** `number | undefined`
+
+**デフォルト:** `1`
+
+**説明:** 地形の高さ方向の誇張率です。地形の高さは [`exaggerationRelativeHeight`](#exaggerationrelativeheight) を基準にこの倍率で拡大され、詳細度の選択とカリングも拡大後の地表に従います。`sampleTerrainHeight`、`observeTerrainHeightAt`、`sampleTerrainHeightRange`、`observeTerrainHeightRange`、`sampleTerrainMostDetailed` は拡大後の高さを返すため、地表に固定したフィーチャーや `heightReference: "terrain"` のメッシュは地表に乗ったままになります。3D Tiles と glTF モデルは引き伸ばされず、標高ヒートマップとヒルシェードは元の標高を使います。負の値は `0` として扱われ、地形は `exaggerationRelativeHeight` の高さで平らになります。`layer.update()` で実行時に変更でき、地形レイヤーを削除すると誇張は解除されます。
+
+```typescript
+const terrainLayer = view.addLayer({
+  type: "terrain",
+  source: terrain,
+  terrain: { exaggeration: 2 },
+});
+
+// 実行時に変更する
+terrainLayer.update({ terrain: { exaggeration: 3 } });
+```
+
+### exaggerationRelativeHeight
+
+**型:** `number | undefined`
+
+**デフォルト:** `0`
+
+**説明:** 地形を誇張するときに動かない基準の高さ（メートル）です。カメラや地表からの相対値ではなく、地形の高さと同じ基準（WGS84 楕円体からの高さ。`raster-dem` ソースではデコードした標高値そのもの）で測った絶対値です。地形の高さ `h` は `(h - exaggerationRelativeHeight) * exaggeration + exaggerationRelativeHeight` の高さに描画されます。既定の `0` では標高の高い地域ほど地表全体が持ち上がるため、見ている地面の標高（高原の谷底や、誇張されない 3D Tiles・モデルが建つ地面など）に設定すると、その地面を動かさずに周囲の起伏だけを強調できます。海岸から山地までを見渡す場合は、海面が動かないよう `0` のままにします。
+
+```typescript
+// 標高 1000 m の盆地の底を動かさずに周囲の起伏を強調する
+terrainLayer.update({
+  terrain: { exaggeration: 2, exaggerationRelativeHeight: 1000 },
+});
+```
+
+### waterMaskColor
+
+**Type:** `Color | undefined`
+
+**Description:** ソースの watermask が示す水域の水の色です。`quantized-mesh` ソースの `requestWaterMask` が必要です。水面は空や太陽の映り込みの下にこの色を見せます。指定しない場合は水面の下の画像や地球の色を使います。航空写真では沖合の海が明るい一様な青になることが多く、`#0d1c2c` のような暗い色にすると深い外洋に近くなります。`undefined` を渡すと水面の下の画像や地球の色を使います。
+
+```typescript
+terrainLayer.update({
+  terrain: { waterMaskColor: new Color().setStyle("#0d1c2c") },
+});
+```
+
+### waveExaggeration
+
+**Type:** `number | undefined`
+
+**Description:** ソースの watermask が示す水域について、波の大きさと速さを保ったまま傾きを拡大縮小します。`0` では静かな鏡のような水面になります。`quantized-mesh` ソースの `requestWaterMask` が必要です。
+
+**Default:** `1`
+
+### waveStrength
+
+**Type:** `number | undefined`
+
+**Description:** ソースの watermask が示す水域の波の大きさ、急さ、速さを決めます。`quantized-mesh` ソースの `requestWaterMask` が必要です。`1` 程度で穏やかなさざ波、`5` で標準、`20` で荒天になります。
+
+**Default:** `5`
+
+### waveDirection
+
+**Type:** `number | undefined`
+
+**Description:** watermask の水域の波が進む方向で、北から時計回りの角度（度）です。
+
+**Default:** `0`
+
+### flowSpeed
+
+**Type:** `number | undefined`
+
+**Description:** watermask の水域の波を `waveDirection` の向きに運ぶ流れの速さ（m/s）です。波の大きさや傾きは変わりません。
+
+**Default:** `0`
+
+```typescript
+terrainLayer.update({
+  terrain: { waveStrength: 12, waveDirection: 225, flowSpeed: 2 },
+});
 ```
 
 ## 他のレイヤーとの組み合わせ

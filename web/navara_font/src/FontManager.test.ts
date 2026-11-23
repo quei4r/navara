@@ -81,10 +81,6 @@ vi.stubGlobal("fetch", mockFetch);
 // Helpers
 // ---------------------------------------------------------------------------
 
-function createMockConcurrencyManager() {
-  return { increment: vi.fn(), decrement: vi.fn() };
-}
-
 /** Latin + CJK two-face family. */
 function createTestFamily(): FontFamily {
   return {
@@ -141,6 +137,7 @@ function createShapeResult(text: string, unitsPerEm = 1000): ShapeTextResult {
     ascender: 800,
     descender: -200,
     lineGap: 0,
+    allowsLetterSpacing: true,
   };
 }
 
@@ -202,7 +199,6 @@ describe("FontManager", () => {
     // Restore the default in case a test overrode the implementation.
     mocks.mockLoadFont.mockResolvedValue({ ok: true, cmapRanges: null });
     manager = new FontManager(WORKER_URL);
-    manager.setConcurrencyManager(createMockConcurrencyManager() as never);
     mockFetchSuccess();
     setupBatchMock();
   });
@@ -441,6 +437,18 @@ describe("FontManager", () => {
       await manager.unloadFont(FONT_URL, false);
 
       expect(mocks.mockUnloadFont).toHaveBeenCalledTimes(1);
+    });
+
+    it("should not reject when the manager is disposed mid-unload", async () => {
+      await manager.loadFont(FONT_URL, false);
+      mocks.mockUnloadFont.mockReturnValueOnce(
+        Promise.reject(new Error("FontWorkerClient disposed")),
+      );
+
+      const unload = manager.unloadFont(FONT_URL, false);
+      manager.dispose();
+
+      await expect(unload).resolves.toBeUndefined();
     });
 
     it("should be a no-op for unknown font URLs", async () => {
@@ -1033,6 +1041,7 @@ describe("FontManager", () => {
               ascender: 800,
               descender: -200,
               lineGap: 0,
+              allowsLetterSpacing: true,
             },
           })),
           atlas: {
@@ -1130,6 +1139,7 @@ describe("FontManager", () => {
                 ascender: 800,
                 descender: -200,
                 lineGap: 0,
+                allowsLetterSpacing: true,
               },
             })),
             atlas: {
@@ -1510,6 +1520,7 @@ describe("FontManager", () => {
                   ascender: 800,
                   descender: -200,
                   lineGap: 0,
+                  allowsLetterSpacing: true,
                 },
               })),
               atlas: {
@@ -1674,6 +1685,7 @@ describe("FontManager", () => {
                       ascender: 800,
                       descender: -200,
                       lineGap: 0,
+                      allowsLetterSpacing: true,
                     }
                   : null,
               })),
@@ -1997,16 +2009,6 @@ describe("FontManager", () => {
   // -----------------------------------------------------------------------
 
   describe("client initialization", () => {
-    it("should reject when concurrencyManager is not set", async () => {
-      const bare = new FontManager(WORKER_URL);
-
-      await expect(bare.loadFont(FONT_URL, false)).rejects.toThrow(
-        "concurrencyManager not set",
-      );
-
-      bare.dispose();
-    });
-
     it("should create the FontWorkerClient only once across multiple loads", async () => {
       await manager.loadFont("https://fonts.test/a.ttf", false);
       await manager.loadFont("https://fonts.test/b.ttf", false);

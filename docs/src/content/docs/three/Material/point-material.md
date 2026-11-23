@@ -9,20 +9,43 @@ sidebar:
 
 ## Properties
 
-### center
+### anchor
 
-**Type:** `{ x: number, y: number }`
+**Type:** `"center" | "left" | "right" | "top" | "bottom" | "top-left" | "top-right" | "bottom-left" | "bottom-right" | undefined`
 
-**Description:** Specifies the shift amount from the center. The range is between 0 and 1. The unit is a relative position to the point circle.
+**Description:** Sets which part of the point sits on its position, as MapLibre's `icon-anchor` does. For example, `"bottom"` stands the point on its position like a map pin. The anchor is also the point [`rotation`](#rotation) turns the point around.
 
-**Default:** Required
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `"center"`
 
 **Example:**
 
 ```typescript
 {
   point: {
-    center: { x: 0.5, y: 0.5 }
+    anchor: "bottom"
+  }
+}
+```
+
+### backfaceCulling
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the point is hidden when seen from behind. When `false`, both sides of the point are drawn. When `true`, only its front is drawn.
+
+Only a flat point (see [`pointFacing`](#pointfacing)) has a back the camera can see. Its front faces away from the globe, so turning this on hides the parts of a large point that wrap over the horizon. It has no effect on an upright point, which always lies in the screen plane facing the viewer.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    pointFacing: "flat",
+    backfaceCulling: true
   }
 }
 ```
@@ -83,6 +106,24 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### declutterPadding
+
+**Type:** `number[] | undefined`
+
+**Description:** Extra space around the point's collision box, in screen pixels whatever [`sizeInMeters`](#sizeinmeters) is. One to four values, expanded like CSS padding: `[all]`, `[vertical, horizontal]`, `[top, horizontal, bottom]` or `[top, right, bottom, left]`. Only meaningful when [`declutter`](#declutter) is enabled.
+
+**Default:** `[2]`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    declutterPadding: [4, 8]
+  }
+}
+```
+
 ### declutterPriority
 
 **Type:** `number | undefined`
@@ -98,6 +139,24 @@ import { Color } from "@navaramap/three";
   point: {
     declutter: true,
     declutterPriority: 1
+  }
+}
+```
+
+### declutterRank
+
+**Type:** `number | undefined`
+
+**Description:** Coarse placement order for decluttering, compared before [`declutterPriority`](#declutterpriority): every point of a material with a higher rank is placed before any label or sprite with a lower one, whatever their priorities. A per-feature `declutterPriority` therefore only reorders labels and sprites of the same rank. Only meaningful when [`declutter`](#declutter) is enabled.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    declutterRank: 1
   }
 }
 ```
@@ -180,7 +239,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `("point" | "line" | "polygon")[] | undefined`
 
-**Description:** Source geometry categories this material consumes. Adding `"line"` emits one point per line-string vertex, and adding `"polygon"` emits one point per polygon-ring vertex (the closing duplicate vertex is skipped). Setting the array replaces the default, so include `"point"` when point geometry should keep rendering. This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` applies a new value only to tiles loaded afterwards, so already-loaded tiles keep their previous geometry until the layer is re-created.
+**Description:** Source geometry categories this material consumes. Adding `"line"` emits one point per line-string vertex by default. Set [`placement`](#placement) to repeat points along the line instead. Adding `"polygon"` emits one point per polygon-ring vertex (the closing duplicate vertex is skipped), or points along the rings with [`placement`](#placement). Setting the array replaces the default, so include `"point"` when point geometry should keep rendering. This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` applies a new value only to tiles loaded afterwards, so already-loaded tiles keep their previous geometry until the layer is re-created.
 
 **Default:** `["point"]`
 
@@ -208,6 +267,44 @@ import { Color } from "@navaramap/three";
 {
   point: {
     height: 100 // 100 meters
+  }
+}
+```
+
+### ignorePlacement
+
+**Type:** `boolean | undefined`
+
+**Description:** Keeps this point's box out of the collision check, so labels and sprites placed after it can overlap it. The point itself still hides when it collides with one placed before it, unless [`overlap`](#overlap) allows it. Only meaningful when [`declutter`](#declutter) is enabled.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    ignorePlacement: true
+  }
+}
+```
+
+### offset
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** Moves the point away from its anchor point, in the unit of [`size`](#size): pixels when [`sizeInMeters`](#sizeinmeters) is `false`, meters otherwise. A positive `x` moves it right and a positive `y` moves it down, as MapLibre's `icon-offset` does. The offset lies in the point's own plane, so it turns with [`rotation`](#rotation).
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    offset: { x: 0, y: -8 } // 8 units up
   }
 }
 ```
@@ -249,6 +346,55 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### overlap
+
+**Type:** `"never" | "always" | "cooperative" | undefined`
+
+**Description:** Whether the point may be drawn over labels and sprites placed before it (higher [`declutterRank`](#declutterrank), then higher [`declutterPriority`](#declutterpriority), places first). `"never"` hides it on any collision. `"always"` never hides it, and its box still keeps later `"never"` ones away unless [`ignorePlacement`](#ignoreplacement) is set. `"cooperative"` hides it only when it collides with a `"never"` one. Only meaningful when [`declutter`](#declutter) is enabled.
+
+**Default:** `"never"`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    overlap: "always"
+  }
+}
+```
+
+### placement
+
+**Type:** `"point" | "line" | "line-center" | undefined`
+
+**Description:** How points are placed on line and polygon geometry. Only takes effect when [`geometryTypes`](#geometrytypes) includes `"line"` or `"polygon"`. Point geometry is always placed at the point itself.
+
+- `"point"`: one point per line-string vertex and per polygon-ring vertex.
+- `"line"`: points repeat along the line every [`spacing`](#spacing), evenly spaced regardless of where the line's vertices are. Polygon boundary rings, holes included, are followed the same way.
+- `"line-center"`: a single point at the halfway point along each line string or polygon ring.
+
+With `"line"` and `"line-center"`, each point is also turned to the direction of the line where it sits (see [`rotateToLine`](#rotatetoline)). Unless [`pointFacing`](#pointfacing) or [`rotateWithCamera`](#rotatewithcamera) is set, it lies flat on the surface and is aligned with the map.
+
+This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` does not rebuild points that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `"point"`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    geometryTypes: ["line"],
+    placement: "line",
+    spacing: 50, // Screen pixels
+    size: 6,
+    sizeInMeters: false,
+    clampToGround: true
+  }
+}
+```
+
 ### sizeInMeters
 
 **Type:** `boolean | undefined`
@@ -263,6 +409,104 @@ import { Color } from "@navaramap/three";
 {
   point: {
     sizeInMeters: true
+  }
+}
+```
+
+### pointFacing
+
+**Type:** `"upright" | "flat" | undefined`
+
+**Description:** Whether the point lies in the screen plane or on the globe surface, as MapLibre's `icon-pitch-alignment` (`"upright"` is `"viewport"`, `"flat"` is `"map"`). An upright point is never foreshortened, however the camera is pitched. `"flat"` lays it on the globe surface around its anchor, following the globe's curvature, so it reads as painted onto the surface and foreshortens with camera pitch.
+
+Combine with [`rotateWithCamera`](#rotatewithcamera) for four behaviours:
+
+| `pointFacing` | `rotateWithCamera` | Result |
+| --- | --- | --- |
+| `"upright"` | `true` | Screen-aligned billboard (the default for `placement: "point"`) |
+| `"upright"` | `false` | In the screen plane, turned with the camera heading so the point's x-axis points east |
+| `"flat"` | `true` | Painted on the surface, turned to keep facing the viewer |
+| `"flat"` | `false` | Painted on the surface, north-up, turning with the map (the default along a line) |
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/) as `facing`.
+
+**Default:** `"upright"`, or `"flat"` when `rotateWithCamera` is `false` (MapLibre's `"auto"`)
+
+**Example:**
+
+```typescript
+{
+  point: {
+    pointFacing: "flat"
+  }
+}
+```
+
+### rotateToLine
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether a point placed along a line turns with the line. When `true`, the direction of the line at the point's anchor, as a compass bearing, is added to [`rotation`](#rotation). Only used when [`placement`](#placement) is `"line"` or `"line-center"`.
+
+The added bearing reads as a direction on the map when the point is aligned with the map ([`rotateWithCamera`](#rotatewithcamera) `false`, as it is by default along a line). Upright, the point stays in the screen plane and is turned by the camera heading plus the line's bearing. On a point that turns with the camera, the bearing only spins it on screen.
+
+This option applies when the layer's geometry is built. `layer.update()` does not change it for points that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    geometryTypes: ["line"],
+    placement: "line",
+    pointFacing: "flat",
+    rotateWithCamera: false,
+    rotateToLine: true
+  }
+}
+```
+
+### rotateWithCamera
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the point turns with the camera or with the map, as MapLibre's `icon-rotation-alignment` (`true` is `"viewport"`, `false` is `"map"`). When `true`, it stays upright on screen: a screen-aligned billboard, or with [`pointFacing`](#pointfacing) set to `"flat"`, a surface quad turned to keep facing the viewer. When `false`, it is aligned with the map. With `"upright"`, it stays in the screen plane at full size but turns with the camera heading so that its x-axis keeps pointing east, and it shows upside down when the camera faces south. With `"flat"`, it lies on the surface north-up and turns with the map.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `true` for `placement: "point"`, `false` along a line (MapLibre's `"auto"`)
+
+**Example:**
+
+```typescript
+{
+  point: {
+    pointFacing: "upright",
+    rotateWithCamera: false // On screen, turned with the camera heading
+  }
+}
+```
+
+### rotation
+
+**Type:** `number | undefined`
+
+**Description:** Rotates the point within its own plane around its anchor point, in degrees, clockwise as seen from the front. The rotation is applied on top of the orientation that [`pointFacing`](#pointfacing) and [`rotateWithCamera`](#rotatewithcamera) resolve to.
+
+[`anchor`](#anchor) decides where inside the point the pivot sits.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/), so every point in a layer can point a different way.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    rotation: 45
   }
 }
 ```
@@ -299,6 +543,71 @@ import { Color } from "@navaramap/three";
 {
   point: {
     size: 10 // 10 meters
+  }
+}
+```
+
+### spacing
+
+**Type:** `number | undefined`
+
+**Description:** The distance between repeated points when [`placement`](#placement) is `"line"`, in screen pixels. The unit is the same on `geojson` and `vector-tile` sources.
+
+The points shown on a line are decided again as the camera moves. Pulling the camera back thins them out, and moving closer fills in more points between them. Points never slide along the line: they only appear or disappear. The gap on screen stays between one and two times `spacing`, also in a tilted view, where the near and far parts of the view each get their own density.
+
+A line always keeps the point at its halfway point, and a line shorter than `spacing` on screen gets only that one. Points stop filling in very close to the ground (street level) on a GeoJSON source, and when a vector tile is shown much deeper than its own zoom level (overscaled). There they sit farther apart than `spacing`.
+
+As with MapLibre's `symbol-spacing`, a point longer along the line than three quarters of `spacing` spreads its repeats to that length plus a quarter of `spacing`. The length is measured in the point's own frame: with `rotateToLine` its top points along the line, so its height is what counts, and `rotation` turns it from there. On a vector tile source, each tile places points only inside its own bounds. Each tile spaces its own points, so repeats end up at most about one tile apart (512 to 1024 screen pixels) however large `spacing` is.
+
+This option applies when the layer's geometry is built. `layer.update()` does not rebuild points that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `250.0`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    geometryTypes: ["line"],
+    placement: "line",
+    spacing: 100
+  }
+}
+```
+
+### translate
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** Moves the drawn point by a number of screen pixels. A positive `x` moves it right and a positive `y` moves it down, in the frame [`translateAnchor`](#translateanchor) sets. The shift is applied after the point is projected, so it stays the same number of pixels at any distance and does not turn with [`rotation`](#rotation). Decluttering reserves the space where the point is drawn.
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    translate: { x: 0, y: -10 } // 10 px up
+  }
+}
+```
+
+### translateAnchor
+
+**Type:** `"map" | "viewport" | undefined`
+
+**Description:** Sets the frame [`translate`](#translate) is measured in. With `"map"`, the shift turns with the camera heading, so a positive `x` points east and a positive `y` points south. With `"viewport"`, it follows the screen axes. Unlike MapLibre's `"map"`, the shift is not foreshortened when the camera is pitched.
+
+**Default:** `"map"`
+
+**Example:**
+
+```typescript
+{
+  point: {
+    translate: { x: 10, y: 0 },
+    translateAnchor: "viewport" // 10 px right on screen, whatever the heading
   }
 }
 ```

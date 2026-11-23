@@ -90,13 +90,27 @@ view.setCamera({
 });
 ```
 
+## Multiple Views
+
+A page can run several `ThreeView` instances at once, for example to compare two maps side by side. Give each view its own canvas. The views can be initialized concurrently, and disposing one does not interrupt the others.
+
+```tsx
+const left = new ThreeView({ canvas: leftCanvas });
+const right = new ThreeView({ canvas: rightCanvas });
+await Promise.all([left.init(), right.init()]);
+```
+
+All views on a page share one pool of background workers, so their tile processing competes for the same CPU cores instead of multiplying them. The first view to call `init()` creates the pool, and its `workerPoolSize`, `mobileOptimization` and `memoryBudget.maxWorkerHeapBytes` decide the pool size and worker heap budget. The same options passed to a later view do not change the pool while it exists, and a console warning reports when they differ. The pool is shut down when the last view is disposed, and the next view to initialize creates a new one.
+
+Everything else belongs to each view: the WebGL context, the tile cache (`cacheBytes`), the remaining `memoryBudget` limits, and the font worker. Memory use therefore grows with the number of views, and data shown in two views is downloaded and decoded once per view. When showing several views on a memory-constrained device, lower `cacheBytes` on each of them.
+
 ## Properties
 
 ### container
 
 **Type:** `HTMLElement | undefined`
 
-**Description:** The HTML container element for rendering the view. When specified, ThreeView adds a canvas within this container.
+**Description:** The HTML container element for rendering the view. When specified, ThreeView adds a canvas within this container and sizes the view to it. The canvas is absolutely positioned, so give the container its own size. A container with `position: static` is set to `position: relative` until the view is disposed. Without `container` and `canvas`, ThreeView appends a viewport-sized element to `document.body`.
 
 **Example:**
 
@@ -110,7 +124,7 @@ const view = new ThreeView({
 
 **Type:** `HTMLCanvasElement | OffscreenCanvas | undefined`
 
-**Description:** The canvas element used for rendering. When specified, this canvas is used. When not specified, a new canvas is created.
+**Description:** The canvas element used for rendering. When specified, this canvas is used. When not specified, a new canvas is created. The view is sized to the parent element of the canvas, and the canvas is given that size in pixels. In a flex or grid layout the parent therefore needs `min-width: 0` and `min-height: 0` (or `overflow: hidden`) to be able to shrink.
 
 **Example:**
 
@@ -138,7 +152,7 @@ const view = new ThreeView({
 
 **Type:** `boolean | undefined`
 
-**Description:** Whether to disable automatic resize handling on window resize events. When `true`, the view is not automatically resized when the window size changes.
+**Description:** Whether to disable automatic resizing. By default the view follows the size of its container (`container`, or the parent element of `canvas`), including size changes that happen without a window resize. When `true`, call [`resize()`](../../../three/api/threeview-functions/#resize) yourself.
 
 **Default:** `false`
 
@@ -441,6 +455,22 @@ const view = new ThreeView({
 });
 ```
 
+### workerPoolSize
+
+**Type:** `number | undefined`
+
+**Description:** Number of background workers that decode tiles and build meshes. Each worker has its own JavaScript engine instance and WebAssembly heap, so a smaller pool uses less memory but loads tiles more slowly after fast camera moves. The value is rounded down and clamped to the range from `1` to `navigator.hardwareConcurrency`, with a console warning when it changes, and also applies with `mobileOptimization`. On mobile, and when the browser does not report `navigator.deviceMemory`, the default `memoryBudget.maxWorkerHeapBytes` is a fixed amount per worker, so a larger pool raises peak memory. Only `init()` reads this option. All views on a page share one pool, so only the first view to call `init()` sets its size (see [Multiple Views](#multiple-views)).
+
+**Default:** `navigator.hardwareConcurrency` (at most `2` with `mobileOptimization`)
+
+**Example:**
+
+```typescript
+const view = new ThreeView({
+  workerPoolSize: 4,
+});
+```
+
 ### memoryBudget
 
 **Type:** `object | undefined`
@@ -477,38 +507,6 @@ const view = new ThreeView({
 :::tip[Related Documentation]
 The SSE multiplier range can also be changed at runtime via [`setSseMultiplierRange()`](../threeview-functions#setssemultiplierrange).
 :::
-
-### waterTexture
-
-**Type:** `{ enabled: boolean; url?: string } | undefined`
-
-**Description:** Configuration for shared water textures. When enabled, a single water normal texture is shared across all meshes that use water effects. This is more efficient than each mesh loading its own texture individually.
-
-**Default:** Disabled when omitted (the shared water texture is loaded only when `{ enabled: true }` is passed).
-
-```typescript
-type WaterTextureOptions = {
-  enabled: boolean; // Whether to enable water texture sharing
-  url?: string; // URL for custom water normal texture (uses built-in texture when omitted)
-};
-```
-
-**Example:**
-
-```typescript
-// Use built-in texture
-const view = new ThreeView({
-  waterTexture: { enabled: true },
-});
-
-// Use a custom texture
-const viewWithCustomWater = new ThreeView({
-  waterTexture: {
-    enabled: true,
-    url: "https://example.com/water-normal.png",
-  },
-});
-```
 
 ### GlobeOptions
 

@@ -1,5 +1,3 @@
-import type { ConcurrencyManager } from "@navaramap/worker";
-
 import type {
   ShapeTextResult,
   FontAtlasData,
@@ -11,7 +9,17 @@ export type FontWorkerClientOptions = {
   /** Memory budget for the worker's font caches (font data + atlas pixels).
    * Caps further atlas growth; the WASM heap itself never shrinks. */
   fontBudgetBytes?: number;
+  /** Holds a worker-pool core while the font worker is busy and returns
+   * its release (`reserveWorkerCore` of the view's worker pool). Passed in
+   * rather than imported: this package bundles its own copy of
+   * `@navaramap/worker`, which would hold a core on a pool that does not
+   * exist. */
+  reserveWorkerCore?: () => () => void;
 };
+
+/** How long the worker's core stays held after its last heavy request, so a
+ * burst of requests does not flip the reservation per request. */
+const CORE_RELEASE_DELAY_MS = 100;
 
 /**
  * Main-thread client that communicates with the dedicated font Web Worker.
@@ -19,21 +27,20 @@ export type FontWorkerClientOptions = {
  */
 export class FontWorkerClient {
   private _worker: Worker;
-  private _concurrencyManager: ConcurrencyManager;
   private _nextId = 0;
   private _pending = new Map<
     number,
     { resolve: (value: unknown) => void; reject: (reason: unknown) => void }
   >();
   private _ready: Promise<void>;
+  /** Heavy requests (init, font loads, text shaping) still in flight. */
+  private _heavyRequests = 0;
+  private _releaseCore: (() => void) | undefined;
+  private _releaseCoreTimer: ReturnType<typeof setTimeout> | undefined;
+  private _reserveWorkerCore: (() => () => void) | undefined;
 
-  constructor(
-    workerUrl: string | URL,
-    concurrencyManager: ConcurrencyManager,
-    options?: FontWorkerClientOptions,
-  ) {
-    this._concurrencyManager = concurrencyManager;
-
+  constructor(workerUrl: string | URL, options?: FontWorkerClientOptions) {
+    this._reserveWorkerCore = options?.reserveWorkerCore;
     this._worker = new Worker(workerUrl, {
       type: import.meta.env.PROD ? undefined : "module",
     });
@@ -59,10 +66,11 @@ export class FontWorkerClient {
 
     // Trigger WASM init and resolve once the worker is ready; the init
     // payload also delivers the memory budget.
-    this._ready = this._send("init", {
-      fontBudgetBytes: options?.fontBudgetBytes,
-    }).then(() => undefined);
-    this._concurrencyManager.increment();
+    this._ready = this._holdCore(
+      this._send("init", {
+        fontBudgetBytes: options?.fontBudgetBytes,
+      }),
+    ).then(() => undefined);
   }
 
   /** Wait for the WASM module to be initialized in the worker. */
@@ -87,9 +95,9 @@ export class FontWorkerClient {
     atlasKey: string | undefined,
     highQuality: boolean,
   ): Promise<{ ok: boolean; cmapRanges: Uint32Array | null }> {
-    return this._send("loadFont", { url, data, atlasKey, highQuality }, [
-      data,
-    ]) as Promise<{
+    return this._holdCore(
+      this._send("loadFont", { url, data, atlasKey, highQuality }, [data]),
+    ) as Promise<{
       ok: boolean;
       cmapRanges: Uint32Array | null;
     }>;
@@ -122,10 +130,12 @@ export class FontWorkerClient {
       height: number;
       channels: number;
     };
-    const raw = (await this._send("prepareTextBatch", {
-      fontUrl,
-      texts,
-    })) as {
+    const raw = (await this._holdCore(
+      this._send("prepareTextBatch", {
+        fontUrl,
+        texts,
+      }),
+    )) as {
       results: { text: string; shapeResult: ShapeTextResult | null }[];
       atlas: RawAtlas | null;
       colorAtlas: RawAtlas | null;
@@ -161,12 +171,41 @@ export class FontWorkerClient {
   }
 
   dispose(): void {
+    if (this._releaseCoreTimer !== undefined) {
+      clearTimeout(this._releaseCoreTimer);
+      this._releaseCoreTimer = undefined;
+    }
+    this._releaseCore?.();
+    this._releaseCore = undefined;
     this._worker.terminate();
     for (const pending of this._pending.values()) {
       pending.reject(new Error("FontWorkerClient disposed"));
     }
     this._pending.clear();
-    this._concurrencyManager.decrement();
+  }
+
+  /**
+   * Hold a worker-pool core while `request` keeps the font worker busy, so
+   * the pool leaves the worker a core of its own (see `reserveWorkerCore`).
+   */
+  private _holdCore(request: Promise<unknown>): Promise<unknown> {
+    if (this._releaseCoreTimer !== undefined) {
+      clearTimeout(this._releaseCoreTimer);
+      this._releaseCoreTimer = undefined;
+    }
+    this._releaseCore ??= this._reserveWorkerCore?.();
+    this._heavyRequests++;
+    const settle = () => {
+      this._heavyRequests--;
+      if (this._heavyRequests > 0 || !this._releaseCore) return;
+      this._releaseCoreTimer = setTimeout(() => {
+        this._releaseCoreTimer = undefined;
+        this._releaseCore?.();
+        this._releaseCore = undefined;
+      }, CORE_RELEASE_DELAY_MS);
+    };
+    request.then(settle, settle);
+    return request;
   }
 
   private _send(

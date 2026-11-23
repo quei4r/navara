@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use navara_buffer_store::Handle;
+use navara_feature_component::model::GltfResourceBase;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -76,7 +79,8 @@ pub struct PolygonMesh {
     pub outline_geometry: Option<TransferablePolygonOutlineGeometry>,
     pub transform: Transform,
     pub active: bool,
-    #[wasm_bindgen(getter_with_clone)]
+    /// Whether the polygon should be rendered as a texturized draped feature
+    pub should_be_texturized: bool,
     pub bounding_sphere: Option<BoundingSphere>,
     pub batch_length: u32,
 }
@@ -88,11 +92,29 @@ pub struct ModelMesh {
     pub material: ModelMaterial,
     pub transform: Transform,
     pub bin: Option<Handle>,
+    // Exposed through getters so change events, which never read it, skip the copy.
+    #[serde(skip)]
+    gltf_resource: Option<Arc<GltfResourceBase>>,
     pub aabb: Aabb,
     #[wasm_bindgen(getter_with_clone)]
     pub geometry: TransferableModelGeometry,
     pub active: bool,
     pub batch_length: u32,
+}
+
+#[wasm_bindgen]
+impl ModelMesh {
+    /// Resource path for `GLTFLoader.parse`.
+    #[wasm_bindgen(getter)]
+    pub fn resource_path(&self) -> Option<String> {
+        self.gltf_resource.as_ref().map(|r| r.path.clone())
+    }
+
+    /// Query to merge into each URI the glTF resolves.
+    #[wasm_bindgen(getter)]
+    pub fn resource_query(&self) -> Option<String> {
+        self.gltf_resource.as_ref().and_then(|r| r.query.clone())
+    }
 }
 
 #[wasm_bindgen]
@@ -191,6 +213,7 @@ impl<'a> From<&'a navara_feature_component::render::RenderableFeature> for Rende
                 outline_geometry,
                 transform,
                 active,
+                render_info,
                 bounding_sphere,
                 batch_length,
                 ..
@@ -201,6 +224,7 @@ impl<'a> From<&'a navara_feature_component::render::RenderableFeature> for Rende
                     outline_geometry: outline_geometry.as_ref().map(|og| og.into()),
                     transform: transform.into(),
                     active: *active,
+                    should_be_texturized: render_info.should_be_texturized,
                     bounding_sphere: bounding_sphere.as_ref().map(|bs| (*bs).into()),
                     batch_length: *batch_length,
                 }),
@@ -219,7 +243,8 @@ impl<'a> From<&'a navara_feature_component::render::RenderableFeature> for Rende
                 model: Some(ModelMesh {
                     material: material.into(),
                     transform: transform.into(),
-                    bin: bin.as_ref().map(|v| v.0),
+                    bin: bin.as_ref().map(|v| v.handle),
+                    gltf_resource: bin.as_ref().and_then(|v| v.gltf_resource.clone()),
                     aabb: aabb.clone().into(),
                     geometry: geometry.into(),
                     active: *active,

@@ -22,7 +22,9 @@ pnpm-debug.log*
 lerna-debug.log*
 
 # WEB
-web/wasm
+# Build output; package.json is the tracked manifest of each WASM package
+web/wasm/*/*
+!web/wasm/*/package.json
 node_modules
 dist
 dist-example
@@ -30,6 +32,8 @@ dist-ssr
 site-dist
 *.local
 !web/**/example/pages/debug
+# Scratch scenes for the release promotion video (skills/navara-release-video)
+web/**/example/pages/release-video
 
 # Docs (Astro)
 .astro/

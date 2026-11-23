@@ -1,8 +1,7 @@
-import dts from "unplugin-dts/vite";
 import { defineConfig } from "vite";
 import tsconfig from "vite-tsconfig-paths";
 
-import { commonConfig, composePlugins } from "../vite.config.common";
+import { commonConfig, composePlugins, dts } from "../vite.config.common";
 
 export default defineConfig((env) => {
   const common = commonConfig("NavaraThreePlugins", env);
@@ -20,9 +19,13 @@ export default defineConfig((env) => {
       rollupOptions: {
         ...common.build.rollupOptions,
         external: [
+          "@navaramap/material-schema",
           "@navaramap/three",
+          "@navaramap/three-default-descs",
           "@navaramap/three-default-plugin",
+          "postprocessing",
           "three",
+          "tweakpane",
         ],
       },
     },

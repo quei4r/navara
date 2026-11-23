@@ -6,8 +6,12 @@ import {
   PerspectiveCamera,
   Scene,
   WebGLRenderTarget,
+  type Camera,
+  type Light,
+  type Object3D,
+  type WebGLRenderer,
 } from "three";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { NVR_UNLIT_SCENE_DEFINE } from "../material";
 import {
@@ -42,6 +46,51 @@ const createPass = (scenes: Scenes, lit: boolean) =>
     {} as Globe,
     { buffers: resolveGBufferOptions({ shadow: true }), lit },
   );
+
+describe("renderShadowMaps", () => {
+  const countMeshes = (scene: Object3D) => {
+    let count = 0;
+    scene.traverse((object) => {
+      if (object instanceof Mesh) count++;
+    });
+    return count;
+  };
+
+  it("gives the casters a shadow draw and no regular draw", () => {
+    const scenes = createScenes();
+    addMesh(scenes.globe);
+    addMesh(scenes.mrt);
+    addMesh(scenes.opaque);
+    const caster = scenes.mrt.children[0];
+    caster.position.set(1, 2, 3);
+
+    let regularDrawMeshes = -1;
+    let shadowDrawMeshes = -1;
+    const originalRender = vi.fn(
+      (_lights: Light[], casters: Scene, _camera: Camera) => {
+        shadowDrawMeshes = countMeshes(casters);
+        expect(caster.matrixWorld.elements[12]).toBe(1);
+      },
+    );
+    const shadowMap = { needsUpdate: false, render: originalRender };
+    const renderer = {
+      shadowMap,
+      setRenderTarget: vi.fn(),
+      render: (scene: Scene, camera: Camera) => {
+        regularDrawMeshes = countMeshes(scene);
+        shadowMap.render([], scene, camera);
+      },
+    } as unknown as WebGLRenderer;
+
+    createPass(scenes, true)["renderShadowMaps"](renderer);
+
+    expect(regularDrawMeshes).toBe(0);
+    expect(shadowDrawMeshes).toBe(3);
+    expect(shadowMap.needsUpdate).toBe(true);
+    expect(shadowMap.render).toBe(originalRender);
+    expect(scenes.mrt.parent).toBeNull();
+  });
+});
 
 // Regression: `view.lit` was stamped on the G-buffer scenes only, so meshes
 // in the forward-only scenes – the default routing - stayed lit.
@@ -92,6 +141,70 @@ describe("stampGBufferDefines", () => {
     expect(material.defines?.[USE_GBUFFER_SHADOW_DEFINE]).toBe(1);
   });
 
+  it("clears the G-buffer defines when a material moves from mrt to opaque", () => {
+    const scenes = createScenes();
+    const material = new MeshStandardMaterial();
+    const mesh = new Mesh(undefined, material);
+    scenes.mrt.add(mesh);
+
+    const pass = createPass(scenes, true);
+    pass["stampGBufferDefines"]();
+    expect(material.defines?.[USE_GBUFFER_SHADOW_DEFINE]).toBe(1);
+
+    scenes.mrt.remove(mesh);
+    scenes.opaque.add(mesh);
+    pass["stampGBufferDefines"]();
+
+    expect(material.defines).not.toHaveProperty(USE_GBUFFER_SHADOW_DEFINE);
+
+    // And back again: the cleared material is stamped afresh.
+    scenes.opaque.remove(mesh);
+    scenes.mrt.add(mesh);
+    pass["stampGBufferDefines"]();
+
+    expect(material.defines?.[USE_GBUFFER_SHADOW_DEFINE]).toBe(1);
+  });
+
+  it("keeps the G-buffer defines on a material shared by both scene sets", () => {
+    const scenes = createScenes();
+    const material = new MeshStandardMaterial();
+    scenes.mrt.add(new Mesh(undefined, material));
+    scenes.opaque.add(new Mesh(undefined, material));
+
+    const pass = createPass(scenes, true);
+    pass["stampGBufferDefines"]();
+
+    expect(material.defines?.[USE_GBUFFER_SHADOW_DEFINE]).toBe(1);
+  });
+
+  it("stamps a material added inside a scene-resident group", () => {
+    const scenes = createScenes();
+    const group = new Group();
+    scenes.mrt.add(group);
+    const pass = createPass(scenes, true);
+    pass["stampGBufferDefines"]();
+
+    const added = new MeshStandardMaterial();
+    group.add(new Mesh(undefined, added));
+    pass["stampGBufferDefines"]();
+
+    expect(added.defines?.[USE_GBUFFER_SHADOW_DEFINE]).toBe(1);
+  });
+
+  it("stamps a material swapped in place on a mesh already in the scene", () => {
+    const scenes = createScenes();
+    const mesh = new Mesh(undefined, new MeshStandardMaterial());
+    scenes.mrt.add(mesh);
+    const pass = createPass(scenes, true);
+    pass["stampGBufferDefines"]();
+
+    const replaced = new MeshStandardMaterial();
+    mesh.material = replaced;
+    pass["stampGBufferDefines"]();
+
+    expect(replaced.defines?.[USE_GBUFFER_SHADOW_DEFINE]).toBe(1);
+  });
+
   it("restamps every material after setLit", () => {
     const scenes = createScenes();
     const opaqueMaterial = addMesh(scenes.opaque);
@@ -139,5 +252,20 @@ describe("globe-normal copy target", () => {
 
     expect(size(pass).width).toBe(1);
     expect(size(pass).height).toBe(1);
+  });
+});
+
+// Regression: three reallocates a depth texture on resize only through its
+// owning target, so an unowned one kept its old size and left the G-buffer
+// framebuffer incomplete.
+describe("setBuffers", () => {
+  it("hands the depth texture's ownership to the rebuilt G-buffer target", () => {
+    const pass = createPass(createScenes(), true);
+    const depthTexture = pass.gbufferRenderTarget.depthTexture;
+
+    pass.setBuffers(resolveGBufferOptions({ shadow: false }));
+
+    expect(pass.gbufferRenderTarget.depthTexture).toBe(depthTexture);
+    expect(depthTexture?.renderTarget).toBe(pass.gbufferRenderTarget);
   });
 });

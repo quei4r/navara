@@ -4,6 +4,8 @@
 //! them as plain data (no `navara_material` / `bevy_ecs` dependency) lets the
 //! parse core run either inline or inside a Web Worker.
 
+pub use crate::line_placement::{LineAnchors, PointPlacement, PolygonAnchors};
+
 /// The geometry-appearance kind a parsed group belongs to.
 ///
 /// This mirrors `navara_feature_component::geometry_builder::GeometryAppearanceKind`
@@ -49,8 +51,8 @@ impl LayerParseKind {
 /// heights, so they cannot be collapsed into a single scalar.
 ///
 /// The `from_*` flags mirror the appearance's opt-in `geometry_types`: besides
-/// point geometry, an emitter can derive a point per line-string vertex and/or
-/// per polygon-ring vertex.
+/// point geometry, an emitter can derive anchors from line-strings and/or
+/// polygons, as `placement` (and, for polygons, `kind`) decides.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PointEmitter {
     pub kind: LayerParseKind,
@@ -58,16 +60,44 @@ pub struct PointEmitter {
     /// Emit for point/multipoint geometry (the native source).
     #[serde(default = "default_true")]
     pub from_points: bool,
-    /// Also emit one point per line-string vertex.
+    /// Also emit anchors for line strings, as [`Self::line_anchors`] decides.
     #[serde(default)]
     pub from_lines: bool,
-    /// Also emit one point per polygon-ring vertex (closing duplicate skipped).
+    /// Also emit anchors for polygons, as [`Self::polygon_anchors`] decides.
     #[serde(default)]
     pub from_polygons: bool,
+    /// How anchors are derived from line geometry (and polygon rings).
+    #[serde(default)]
+    pub placement: PointPlacement,
+    /// Anchor spacing along a line in pixels at this tile's own zoom. Along-line
+    /// placements only; [`PointPlacement::LineCenter`] uses it to size the
+    /// anchor's sampled path and scale bands.
+    #[serde(default = "default_spacing")]
+    pub spacing_px: f32,
+}
+
+impl PointEmitter {
+    /// Where this emitter anchors on a line string: text and billboards label
+    /// it once, point markers mark its vertices.
+    pub fn line_anchors(&self) -> LineAnchors {
+        self.placement
+            .line_anchors(self.kind != LayerParseKind::Point)
+    }
+
+    /// Where this emitter anchors on a polygon: text and billboards label it
+    /// once, point markers mark its vertices.
+    pub fn polygon_anchors(&self) -> PolygonAnchors {
+        self.placement
+            .polygon_anchors(self.kind != LayerParseKind::Point)
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_spacing() -> f32 {
+    250.0
 }
 
 /// Instructions for parsing the features of a single matched target layer.

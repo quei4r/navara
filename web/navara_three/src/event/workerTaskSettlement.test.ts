@@ -4,17 +4,17 @@ import type {
 } from "@navaramap/engine";
 import { expect, it, vi } from "vitest";
 
-import type { WorkerPoolPromise, WorkerPoolPromises } from "../type";
+import type { WorkerPoolPromise } from "../type";
 
 import {
   runDelegatedWorkerTask,
   settleWorkerTask,
 } from "./workerTaskSettlement";
 
-const makeCtx = () => ({ workerPoolPromises: new Map() as WorkerPoolPromises });
-
-const asPoolPromise = <T>(promise: Promise<T>) =>
-  promise as unknown as WorkerPoolPromise<T>;
+const asPoolPromise = <T>(promise: Promise<T>, cancel = vi.fn()) =>
+  Object.assign(promise, { cancel }) as unknown as WorkerPoolPromise<T> & {
+    cancel: typeof cancel;
+  };
 
 const cancellationError = () => {
   const err = new Error("promise cancelled");
@@ -22,61 +22,59 @@ const cancellationError = () => {
   return err;
 };
 
-it("should register the promise, resolve to completed, and unregister", async () => {
-  const ctx = makeCtx();
+it("should resolve to completed", async () => {
   let resolve!: (v: string) => void;
   const promise = asPoolPromise(new Promise<string>((r) => (resolve = r)));
 
-  const settling = settleWorkerTask(ctx, "id", promise);
-  expect(ctx.workerPoolPromises.get("id")).toBe(promise);
-
+  const settling = settleWorkerTask(new AbortController().signal, promise);
   resolve("value");
   expect(await settling).toEqual({ status: "completed", value: "value" });
-  expect(ctx.workerPoolPromises.size).toBe(0);
+  expect(promise.cancel).not.toHaveBeenCalled();
 });
 
-it("should classify a CancellationError as cancelled, not failed", async () => {
-  const ctx = makeCtx();
+it("should cancel the pool promise when the signal aborts", async () => {
+  const abort = new AbortController();
   let reject!: (e: unknown) => void;
-  const promise = asPoolPromise(new Promise<void>((_, r) => (reject = r)));
+  const cancel = vi.fn(() => reject(cancellationError()));
+  const promise = asPoolPromise(
+    new Promise<void>((_, r) => (reject = r)),
+    cancel,
+  );
 
-  const settling = settleWorkerTask(ctx, "id", promise);
-  reject(cancellationError());
+  const settling = settleWorkerTask(abort.signal, promise);
+  abort.abort();
 
+  expect(cancel).toHaveBeenCalledOnce();
   expect(await settling).toEqual({ status: "cancelled" });
-  expect(ctx.workerPoolPromises.size).toBe(0);
+});
+
+it("should cancel right away when the signal is already aborted", async () => {
+  const abort = new AbortController();
+  abort.abort();
+  let reject!: (e: unknown) => void;
+  const cancel = vi.fn(() => reject(cancellationError()));
+  const promise = asPoolPromise(
+    new Promise<void>((_, r) => (reject = r)),
+    cancel,
+  );
+
+  expect(await settleWorkerTask(abort.signal, promise)).toEqual({
+    status: "cancelled",
+  });
+  expect(cancel).toHaveBeenCalledOnce();
 });
 
 it("should classify any other rejection as failed with its error", async () => {
-  const ctx = makeCtx();
   const error = new Error("worker exploded");
   const settling = settleWorkerTask(
-    ctx,
-    "id",
+    new AbortController().signal,
     asPoolPromise(Promise.reject(error)),
   );
 
   expect(await settling).toEqual({ status: "failed", error });
-  expect(ctx.workerPoolPromises.size).toBe(0);
-});
-
-it("should not delete a map entry that was replaced by a newer task", async () => {
-  const ctx = makeCtx();
-  let reject!: (e: unknown) => void;
-  const promise = asPoolPromise(new Promise<void>((_, r) => (reject = r)));
-  const settling = settleWorkerTask(ctx, "id", promise);
-
-  // A newer task reuses the id while the first one is being cancelled.
-  const replacement = asPoolPromise(new Promise<void>(() => {}));
-  ctx.workerPoolPromises.set("id", replacement);
-  reject(cancellationError());
-
-  expect(await settling).toEqual({ status: "cancelled" });
-  expect(ctx.workerPoolPromises.get("id")).toBe(replacement);
 });
 
 const makeDelegatedCtx = () => ({
-  workerPoolPromises: new Map() as WorkerPoolPromises,
   workerTaskHandler: {
     triggerWorkerTaskCompleted: vi.fn(),
     triggerWorkerTaskFailed: vi.fn(),
@@ -96,7 +94,7 @@ it("should deliver a completed result and not release the delegator again", asyn
 
   await runDelegatedWorkerTask(
     ctx,
-    "id",
+    new AbortController(),
     1n,
     "test task",
     params,
@@ -125,7 +123,7 @@ it("should release the delegator when the body bails out without completing", as
 
   await runDelegatedWorkerTask(
     ctx,
-    "id",
+    new AbortController(),
     1n,
     "test task",
     params,
@@ -153,7 +151,7 @@ it("should contain an unexpected body throw and release the delegator", async ()
 
   await runDelegatedWorkerTask(
     ctx,
-    "id",
+    new AbortController(),
     1n,
     "test task",
     params,
@@ -181,7 +179,7 @@ it("should log a failed settlement and run onFailed, which can complete instead"
 
   await runDelegatedWorkerTask(
     ctx,
-    "id",
+    new AbortController(),
     1n,
     "test task",
     params,
@@ -208,27 +206,31 @@ it("should log a failed settlement and run onFailed, which can complete instead"
   consoleError.mockRestore();
 });
 
-it("should treat a cancellation as a silent release without invoking onFailed", async () => {
+it("should treat an abort as a silent release without invoking onFailed", async () => {
   const ctx = makeDelegatedCtx();
   const { params, delegator_id } = makeBoundary();
   const onFailed = vi.fn();
   const consoleError = vi
     .spyOn(console, "error")
     .mockImplementation(() => undefined);
+  const abort = new AbortController();
 
   await runDelegatedWorkerTask(
     ctx,
-    "id",
+    abort,
     1n,
     "test task",
     params,
     delegator_id,
     async (task) => {
-      const value = await task.settle(
-        asPoolPromise(Promise.reject(cancellationError())),
-        onFailed,
+      let reject!: (e: unknown) => void;
+      const promise = asPoolPromise(
+        new Promise<void>((_, r) => (reject = r)),
+        vi.fn(() => reject(cancellationError())),
       );
-      expect(value).toBeUndefined();
+      const settling = task.settle(promise, onFailed);
+      abort.abort();
+      expect(await settling).toBeUndefined();
     },
   );
 

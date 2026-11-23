@@ -22,11 +22,53 @@
 //! | 8      | sizeInMeters | `0.0` = px, non-zero = meters |
 //! | 9      | priority | higher wins an overlap |
 //! | 10     | isShown | `0.0` = hidden, non-zero = currently shown (feeds hysteresis) |
+//! | 11     | overlap | `0.0` = never, `1.0` = always, `2.0` = cooperative |
+//! | 12     | ignorePlacement | non-zero = the box is never claimed, so later candidates may overlap it |
+//! | 13     | rank | compared before priority; higher places first |
+//! | 14..18 | padding | screen px added around the box: top, right, bottom, left |
+//! | 18     | pairGroup | layer and tile the candidate belongs to; `0.0` = never paired |
+//! | 19     | featureIndex | feature within the pair group |
+//! | 20     | pairRole | `0.0` = unpaired, `1.0` = label, `2.0` = billboard |
+//! | 21     | standalone | non-zero = may show while its partner is hidden |
+//! | 22     | flatFacing | non-zero = the quad lies on the globe surface |
+//! | 23     | rotateWithCamera | non-zero = the quad reads left to right on screen |
+//! | 24     | rotation | radians, clockwise from the front |
+//! | 25,26  | translateX/Y | screen px the drawn quad is moved by, +Y down |
+//! | 27     | translateMap | non-zero = the translate turns with the camera heading (+X east, +Y south) |
+//! | 28     | variants | rows in the label's group on its first row, `0.0` on the rows after it |
+//!
+//! A label with variable anchors arrives as a group of contiguous rows, one
+//! per placement it may take, the one in use first; only one of them is shown.
 
+use std::collections::HashMap;
+
+use navara_material::Overlap;
 use wasm_bindgen::prelude::*;
 
+use crate::line_label::{basis_box, quad_screen_basis};
+
 /// Number of `f64` values per candidate in the packed input slice.
-pub const CANDIDATE_STRIDE: usize = 11;
+pub const CANDIDATE_STRIDE: usize = 29;
+
+/// Decode the packed `overlap` field.
+fn overlap_from_code(code: f64) -> Overlap {
+    match code as u8 {
+        0 => Overlap::Never,
+        1 => Overlap::Always,
+        2 => Overlap::Cooperative,
+        _ => unreachable!("overlap code {code}"),
+    }
+}
+
+/// Whether a candidate placed with `overlap` may overlap a box claimed with
+/// `claimed` (MapLibre's `overlapAllowed`).
+fn overlap_allowed(overlap: Overlap, claimed: Overlap) -> bool {
+    match overlap {
+        Overlap::Always => true,
+        Overlap::Cooperative => claimed != Overlap::Never,
+        Overlap::Never => false,
+    }
+}
 
 // Mirrors shaders/glsl/chunks/ellipsoid.glsl. These are duplicated as literals
 // (rather than taken from `navara_core`) on purpose: the projection below is a
@@ -55,23 +97,36 @@ struct ProjectionContext<'a> {
 
 /// CPU mirror of `nvr_horizon_culled`
 /// (shaders/glsl/chunks/horizon_culling_pars_vertex.glsl): true when the point
-/// lies beyond the ellipsoidal horizon as seen from the camera, i.e. the GPU
-/// will cull the label's vertices. Such labels must not claim collision space,
-/// or an invisible label could suppress a visible one. Like the shader, the
-/// test runs on the anchor *before* the height offset is applied.
-fn is_beyond_horizon(px: f64, py: f64, pz: f64, cx: f64, cy: f64, cz: f64) -> bool {
-    let csx = cx / WGS84_A;
-    let csy = cy / WGS84_A;
-    let csz = cz / WGS84_B;
-    let vtx = csx - px / WGS84_A;
-    let vty = csy - py / WGS84_A;
-    let vtz = csz - pz / WGS84_B;
-    let a = csx * csx + csy * csy + csz * csz - 1.0;
-    vtx * csx + vty * csy + vtz * csz > a
+/// lies beyond the horizon of the ellipsoid shrunk by `min_height` (the
+/// `nvrHorizonMinHeight` uniform, never positive) as seen from the camera, i.e.
+/// the GPU will cull the label's vertices. The ellipsoid is scaled down to pass
+/// through the point or the camera when either lies below it. Such labels must not claim collision
+/// space, or an invisible label could suppress a visible one. Like the shader,
+/// the test runs on the anchor *before* the height offset is applied.
+fn is_beyond_horizon(
+    px: f64,
+    py: f64,
+    pz: f64,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+    min_height: f64,
+) -> bool {
+    let ra = WGS84_A + min_height;
+    let rb = WGS84_B + min_height;
+    let (psx, psy, psz) = (px / ra, py / ra, pz / rb);
+    let (csx, csy, csz) = (cx / ra, cy / ra, cz / rb);
+    let occluder_scale_squared = (psx * psx + psy * psy + psz * psz)
+        .min(csx * csx + csy * csy + csz * csz)
+        .min(1.0);
+    psx * csx + psy * csy + psz * csz < occluder_scale_squared
 }
 
 /// Project a candidate's local box to a screen-pixel AABB, mirroring the
 /// billboard vertex shaders (sdfText.vert.glsl / instancedSprite.vert.glsl).
+/// A quad that is turned, flat, or aligned with the map claims the box it is
+/// drawn over, as `nvr_quadBasis` lays it out; along-line candidates arrive
+/// with their box already turned and no orientation.
 /// Writes `[minX, minY, maxX, maxY]` (y-down) into `out` and returns true; returns
 /// false without writing when the anchor is behind the near plane.
 fn project_candidate(c: &[f64], ctx: &ProjectionContext, out: &mut [f64; 4]) -> bool {
@@ -105,8 +160,22 @@ fn project_candidate(c: &[f64], ctx: &ProjectionContext, out: &mut [f64; 4]) -> 
     let cy = p[1] * vx + p[5] * vy + p[9] * vz + p[13];
     let cw = p[3] * vx + p[7] * vy + p[11] * vz + p[15];
 
-    let sx = (cx / cw + 1.0) * 0.5 * ctx.width_px;
-    let sy = (1.0 - cy / cw) * 0.5 * ctx.height_px;
+    let mut sx = (cx / cw + 1.0) * 0.5 * ctx.width_px;
+    let mut sy = (1.0 - cy / cw) * 0.5 * ctx.height_px;
+
+    // Mirror of nvr_translateOffset (shaders/glsl/chunks/quad_orientation.glsl):
+    // a screen-pixel shift, turned with the camera heading when map-anchored.
+    let (tx, ty) = (c[25], c[26]);
+    if tx != 0.0 || ty != 0.0 {
+        if c[27] != 0.0 {
+            let (right, up) = quad_screen_basis(c, ctx.view, false, false, 0.0);
+            sx += tx * right.0 - ty * up.0;
+            sy -= tx * right.1 - ty * up.1;
+        } else {
+            sx += tx;
+            sy += ty;
+        }
+    }
 
     // Mirror of nvr_pxToWorld (shaders/glsl/chunks/pixelToWorld.glsl), inverted:
     // pixels per world meter at the anchor's view depth. `|viewZ|` (here `-vz`,
@@ -119,10 +188,13 @@ fn project_candidate(c: &[f64], ctx: &ProjectionContext, out: &mut [f64; 4]) -> 
         1.0
     };
 
-    let min_x = c[4];
-    let max_x = c[5];
-    let min_y = c[6];
-    let max_y = c[7];
+    let (flat, follow, rotation) = (c[22] != 0.0, c[23] != 0.0, c[24]);
+    let (min_x, max_x, min_y, max_y) = if !flat && follow && rotation == 0.0 {
+        (c[4], c[5], c[6], c[7])
+    } else {
+        let (right, up) = quad_screen_basis(c, ctx.view, flat, follow, rotation);
+        basis_box(c[4], c[5], c[6], c[7], right, up)
+    };
     out[0] = sx + min_x * k;
     out[1] = sy - max_y * k;
     out[2] = sx + max_x * k;
@@ -133,9 +205,10 @@ fn project_candidate(c: &[f64], ctx: &ProjectionContext, out: &mut [f64; 4]) -> 
 /// Outcome of one placement attempt against the grid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Claim {
-    /// The box was free: it now occupies its cells, and the label is shown.
+    /// The box is free, or the candidate may overlap everything it hits.
     Claimed,
-    /// An already-claimed box overlaps it; nothing was claimed.
+    /// An already-claimed box the candidate may not overlap hits it; nothing
+    /// was claimed.
     Blocked,
     /// The box lies entirely outside the tracked area (viewport + margin), so
     /// it contested no on-screen space and claimed nothing. Distinct from
@@ -162,6 +235,8 @@ struct ScreenCollisionGrid {
     /// Per-cell lists of indices into `boxes` (4 values per box).
     cells: Vec<Vec<usize>>,
     boxes: Vec<f64>,
+    /// Overlap mode each box was claimed with, one per box.
+    modes: Vec<Overlap>,
 }
 
 impl ScreenCollisionGrid {
@@ -179,19 +254,20 @@ impl ScreenCollisionGrid {
             rows,
             cells: vec![Vec::new(); cols * rows],
             boxes: Vec::new(),
+            modes: Vec::new(),
         }
     }
 
     /// Claim `[minX, maxX] × [minY, maxY]` (screen px, y-down) if it does not
-    /// overlap any previously claimed box. A box entirely outside the tracked
-    /// area (viewport + margin) claims nothing and reports
-    /// [`Claim::OutsideArea`].
+    /// overlap a previously claimed box that `overlap` forbids it to overlap:
+    /// [`ScreenCollisionGrid::test`], then [`ScreenCollisionGrid::insert`] on
+    /// success.
     ///
-    /// `test_shrink_px` shrinks the box used for the *collision test* by that many
-    /// pixels per side while the full box is still claimed on success — the
-    /// placement-hysteresis primitive: an already-shown label tolerates marginal
-    /// overlaps (its shrunk test box clears) yet keeps competitors away from its
-    /// real footprint.
+    /// With `claim_space` false (MapLibre's `*-ignore-placement`) a box that
+    /// passes the test still reports [`Claim::Claimed`], but is not registered,
+    /// so later boxes may overlap it.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn try_claim(
         &mut self,
         min_x: f64,
@@ -199,6 +275,33 @@ impl ScreenCollisionGrid {
         max_x: f64,
         max_y: f64,
         test_shrink_px: f64,
+        overlap: Overlap,
+        claim_space: bool,
+    ) -> Claim {
+        let claim = self.test(min_x, min_y, max_x, max_y, test_shrink_px, overlap);
+        if claim == Claim::Claimed && claim_space {
+            self.insert(min_x, min_y, max_x, max_y, overlap);
+        }
+        claim
+    }
+
+    /// Whether the box could be claimed, without claiming it. A box entirely
+    /// outside the tracked area (viewport + margin) reports
+    /// [`Claim::OutsideArea`].
+    ///
+    /// `test_shrink_px` shrinks the box used for the *collision test* by that many
+    /// pixels per side while the full box is still claimed on success — the
+    /// placement-hysteresis primitive: an already-shown label tolerates marginal
+    /// overlaps (its shrunk test box clears) yet keeps competitors away from its
+    /// real footprint.
+    fn test(
+        &self,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+        test_shrink_px: f64,
+        overlap: Overlap,
     ) -> Claim {
         let m = self.margin;
         if max_x <= -m || min_x >= self.width + m || max_y <= -m || min_y >= self.height + m {
@@ -211,7 +314,7 @@ impl ScreenCollisionGrid {
         let t_max_y = max_y - test_shrink_px;
 
         // A box smaller than the shrink has no test area left — always free.
-        if t_min_x < t_max_x && t_min_y < t_max_y {
+        if overlap != Overlap::Always && t_min_x < t_max_x && t_min_y < t_max_y {
             let c0 = self.col_of(t_min_x);
             let c1 = self.col_of(t_max_x);
             let r0 = self.row_of(t_min_y);
@@ -224,6 +327,7 @@ impl ScreenCollisionGrid {
                             && t_max_x > self.boxes[b]
                             && t_min_y < self.boxes[b + 3]
                             && t_max_y > self.boxes[b + 1]
+                            && !overlap_allowed(overlap, self.modes[b / 4])
                         {
                             return Claim::Blocked;
                         }
@@ -231,12 +335,17 @@ impl ScreenCollisionGrid {
                 }
             }
         }
+        Claim::Claimed
+    }
 
+    /// Register a box that [`ScreenCollisionGrid::test`] reported claimable.
+    fn insert(&mut self, min_x: f64, min_y: f64, max_x: f64, max_y: f64, overlap: Overlap) {
         let idx = self.boxes.len();
         self.boxes.push(min_x);
         self.boxes.push(min_y);
         self.boxes.push(max_x);
         self.boxes.push(max_y);
+        self.modes.push(overlap);
         let c0 = self.col_of(min_x);
         let c1 = self.col_of(max_x);
         let r0 = self.row_of(min_y);
@@ -246,7 +355,6 @@ impl ScreenCollisionGrid {
                 self.cells[r * self.cols + c].push(idx);
             }
         }
-        Claim::Claimed
     }
 
     fn col_of(&self, x: f64) -> usize {
@@ -260,22 +368,21 @@ impl ScreenCollisionGrid {
     }
 }
 
-/// Padding added around every collision box (px); two placed labels never sit
-/// closer than twice this. Matches `DeclutterManager.PADDING_PX`.
-const DEFAULT_PADDING_PX: f64 = 2.0;
-
 /// Run one placement pass. Returns a `hidden` flag (0 or 1) per candidate, in the
-/// same order as the input slice.
+/// same order as the input slice. Of a group of variable-anchor rows, at most
+/// one is shown: the first that fits.
 ///
 /// `candidates` is a packed `f64` slice of `n * CANDIDATE_STRIDE` values (see the
 /// module docs); `view` and `proj` are column-major 4×4 matrices (16 values each).
-/// `padding_px` pads every box; `hysteresis_px` is the collision-test shrink
-/// applied only to currently-shown labels.
+/// `horizon_min_height` is the renderer's `nvrHorizonMinHeight`, which the
+/// horizon test shrinks the ellipsoid by. `hysteresis_px` is the
+/// collision-test shrink applied only to currently-shown labels.
 ///
 /// The result is *hidden-by-default*: only a label that claimed space inside the
 /// tracked area (viewport + grid margin) comes back shown. Off-screen and
 /// GPU-culled labels stay hidden so they cannot fade in unseen and then pan into
-/// view at full opacity.
+/// view at full opacity. An [`Overlap::Always`] label is the exception: it can
+/// never lose, so it is always shown and has no fade-in to wait for.
 #[wasm_bindgen(js_name = declutterPlace)]
 #[allow(clippy::too_many_arguments)]
 pub fn declutter_place(
@@ -289,7 +396,7 @@ pub fn declutter_place(
     width_px: f64,
     height_px: f64,
     fov_rad: f64,
-    padding_px: f64,
+    horizon_min_height: f64,
     hysteresis_px: f64,
 ) -> Vec<u8> {
     let n = candidates.len() / CANDIDATE_STRIDE;
@@ -312,23 +419,38 @@ pub fn declutter_place(
     for i in 0..n {
         let c = &candidates[i * CANDIDATE_STRIDE..i * CANDIDATE_STRIDE + CANDIDATE_STRIDE];
         let mut b = [0.0f64; 4];
-        let visible =
-            !is_beyond_horizon(c[0], c[1], c[2], ctx.camera_x, ctx.camera_y, ctx.camera_z)
-                && project_candidate(c, &ctx, &mut b);
+        let visible = !is_beyond_horizon(
+            c[0],
+            c[1],
+            c[2],
+            ctx.camera_x,
+            ctx.camera_y,
+            ctx.camera_z,
+            horizon_min_height,
+        ) && project_candidate(c, &ctx, &mut b);
         placeable[i] = visible;
         if visible {
             boxes[i * 4..i * 4 + 4].copy_from_slice(&b);
         }
     }
 
-    // Priority order with hysteresis: among equal priorities, currently-shown
-    // labels place first (incumbents win ties). The final camera-independent
-    // tiebreak (anchor position, then index) keeps fresh ties deterministic —
-    // array order would reshuffle as tiles load and make labels flicker.
-    let mut order: Vec<usize> = (0..n).collect();
+    // Rank, then priority order with hysteresis: among equal priorities,
+    // currently-shown labels place first (incumbents win ties). The final
+    // camera-independent tiebreak (anchor position, then index) keeps fresh ties
+    // deterministic — array order would reshuffle as tiles load and make labels
+    // flicker.
+    let mut order: Vec<usize> = (0..n)
+        .filter(|&i| candidates[i * CANDIDATE_STRIDE + 28] != 0.0)
+        .collect();
     order.sort_by(|&a, &b| {
         let ca = &candidates[a * CANDIDATE_STRIDE..];
         let cb = &candidates[b * CANDIDATE_STRIDE..];
+        // rank desc
+        let ra = ca[13];
+        let rb = cb[13];
+        if ra != rb {
+            return rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal);
+        }
         // priority desc
         let pa = ca[9];
         let pb = cb[9];
@@ -356,41 +478,168 @@ pub fn declutter_place(
         a.cmp(&b)
     });
 
-    let pad = if padding_px.is_finite() {
-        padding_px
-    } else {
-        DEFAULT_PADDING_PX
+    let partners = pair_partners(candidates);
+    // `test_overlap` is what the box is tested with; it claims with its own.
+    let judge = |grid: &ScreenCollisionGrid, i: usize, test_overlap: Overlap| {
+        let c = &candidates[i * CANDIDATE_STRIDE..(i + 1) * CANDIDATE_STRIDE];
+        let overlap = overlap_from_code(c[11]);
+        let o = i * 4;
+        let padded = [
+            boxes[o] - c[17],
+            boxes[o + 1] - c[14],
+            boxes[o + 2] + c[15],
+            boxes[o + 3] + c[16],
+        ];
+        // Behind the camera or beyond the horizon, the GPU hides it already, so
+        // like a label outside the tracked area it claims no space and stays
+        // hidden: when it comes back into view it fades in only if it wins its
+        // space then. Shown labels get a shrunk collision test (sticky); hidden
+        // labels need their full padded box free before they may appear.
+        let claim = if placeable[i] {
+            let shrink = if c[10] != 0.0 { hysteresis_px } else { 0.0 };
+            grid.test(
+                padded[0],
+                padded[1],
+                padded[2],
+                padded[3],
+                shrink,
+                test_overlap,
+            )
+        } else {
+            Claim::OutsideArea
+        };
+        Judged {
+            fits: claim == Claim::Claimed || test_overlap == Overlap::Always,
+            claims: claim == Claim::Claimed && c[12] == 0.0,
+            standalone: c[21] != 0.0,
+            padded,
+            overlap,
+        }
     };
+
+    // The row of a label's group it is placed with, judged. MapLibre's
+    // placement passes: every row first as if the label could overlap
+    // nothing, then, if it may overlap, with its own mode. The row in use
+    // leads, so a label only moves when it must; if none fits, it stays.
+    let choose = |grid: &ScreenCollisionGrid, i: usize| {
+        let c = &candidates[i * CANDIDATE_STRIDE..(i + 1) * CANDIDATE_STRIDE];
+        let rows = i..i + c[28] as usize;
+        let overlap = overlap_from_code(c[11]);
+        if rows.len() == 1 {
+            return (i, judge(grid, i, overlap));
+        }
+        let passes = if overlap == Overlap::Never {
+            &[Overlap::Never][..]
+        } else {
+            &[Overlap::Never, overlap][..]
+        };
+        passes
+            .iter()
+            .flat_map(|&pass| rows.clone().map(move |row| (row, pass)))
+            .map(|(row, pass)| (row, judge(grid, row, pass)))
+            .find(|(_, judged)| judged.fits)
+            .unwrap_or_else(|| (i, judge(grid, i, overlap)))
+    };
+
     let mut grid = ScreenCollisionGrid::new(width_px, height_px);
-    let mut hidden = vec![0u8; n];
+    let mut hidden = vec![1u8; n];
+    let mut done = vec![false; n];
     // A label is shown only when it actually claimed space on (or just off)
     // screen. Everything else stays hidden — including labels the pass cannot
     // judge because they are nowhere near the viewport. Granting those a
     // fade-in while they are invisible is what used to make a pan reveal fully
     // opaque clutter that only the *next* pass faded back out.
     for &i in &order {
-        if !placeable[i] {
-            // Behind the camera or beyond the horizon: the GPU hides it already,
-            // so it claims no space — and it stays hidden, so when it comes back
-            // into view it fades in only if it wins its space then.
-            hidden[i] = 1;
+        if done[i] {
             continue;
         }
-        let o = i * 4;
-        let is_shown = candidates[i * CANDIDATE_STRIDE + 10] != 0.0;
-        // Shown labels get a shrunk collision test (sticky); hidden labels need
-        // their full padded box free before they may appear.
-        let claim = grid.try_claim(
-            boxes[o] - pad,
-            boxes[o + 1] - pad,
-            boxes[o + 2] + pad,
-            boxes[o + 3] + pad,
-            if is_shown { hysteresis_px } else { 0.0 },
-        );
-        hidden[i] = u8::from(claim != Claim::Claimed);
+        // A label and its billboard are both judged before either claims
+        // space, so they never collide with each other, and each one shows
+        // only if its partner does too, unless it is standalone.
+        done[i] = true;
+        let mut a = choose(&grid, i);
+        let mut b = partners[i].map(|p| {
+            done[p] = true;
+            choose(&grid, p)
+        });
+        if let Some((_, b)) = &mut b {
+            let fits_a = a.1.fits;
+            a.1.fits &= b.fits || a.1.standalone;
+            b.fits &= fits_a || b.standalone;
+        }
+        for (row, j) in [Some(a), b].into_iter().flatten() {
+            hidden[row] = u8::from(!j.fits);
+            if j.fits && j.claims {
+                let [min_x, min_y, max_x, max_y] = j.padded;
+                grid.insert(min_x, min_y, max_x, max_y, j.overlap);
+            }
+        }
     }
 
     hidden
+}
+
+/// One candidate's own placement test, before it claims anything.
+#[derive(Clone, Copy)]
+struct Judged {
+    /// Whether it may be shown, as far as its own box goes.
+    fits: bool,
+    /// Whether showing it claims its box: the box is inside the tracked area,
+    /// clear of what blocks it, and not placed with ignore-placement.
+    claims: bool,
+    standalone: bool,
+    /// Screen box with its padding, `[minX, minY, maxX, maxY]`.
+    padded: [f64; 4],
+    overlap: Overlap,
+}
+
+/// Pair each label with the billboard of the same feature at the nearest
+/// anchor, as MapLibre places a symbol's text and icon as one, unless both are
+/// standalone: those are placed independently and may block each other. A
+/// feature placed along a line has a label at each of its anchors and a
+/// billboard at some of them; matching the closest first pairs each billboard
+/// with the label at its own anchor even while the two meshes' anchors differ,
+/// as they do by rounding or until both see the same terrain update. Returns
+/// each candidate's partner, if it has one.
+fn pair_partners(candidates: &[f64]) -> Vec<Option<usize>> {
+    let n = candidates.len() / CANDIDATE_STRIDE;
+    let mut features: HashMap<[u64; 2], [Vec<usize>; 2]> = HashMap::new();
+    for i in 0..n {
+        let c = &candidates[i * CANDIDATE_STRIDE..(i + 1) * CANDIDATE_STRIDE];
+        let role = c[20] as usize;
+        if role == 0 || c[28] == 0.0 {
+            continue;
+        }
+        let key = [c[18], c[19]].map(f64::to_bits);
+        features.entry(key).or_default()[role - 1].push(i);
+    }
+    let mut partners = vec![None; n];
+    let standalone = |i: usize| candidates[i * CANDIDATE_STRIDE + 21] != 0.0;
+    let distance_sq = |a: usize, b: usize| {
+        let (a, b) = (a * CANDIDATE_STRIDE, b * CANDIDATE_STRIDE);
+        (0..3)
+            .map(|k| (candidates[a + k] - candidates[b + k]).powi(2))
+            .sum::<f64>()
+    };
+    let mut matches = Vec::new();
+    for [labels, billboards] in features.into_values() {
+        matches.clear();
+        for &l in &labels {
+            for &b in &billboards {
+                if !(standalone(l) && standalone(b)) {
+                    matches.push((distance_sq(l, b), l, b));
+                }
+            }
+        }
+        matches.sort_by(|x, y| x.0.total_cmp(&y.0));
+        for &(_, l, b) in &matches {
+            if partners[l].is_none() && partners[b].is_none() {
+                partners[l] = Some(b);
+                partners[b] = Some(l);
+            }
+        }
+    }
+    partners
 }
 
 #[cfg(test)]
@@ -482,26 +731,90 @@ mod tests {
             0.0,      // sizeInMeters (px)
             priority,
             if is_shown { 1.0 } else { 0.0 },
+            0.0, // overlap: never
+            0.0, // ignorePlacement
+            0.0, // rank
+            2.0, // padding top
+            2.0, // padding right
+            2.0, // padding bottom
+            2.0, // padding left
+            0.0, // pairGroup
+            0.0, // featureIndex
+            0.0, // pairRole: unpaired
+            1.0, // standalone
+            0.0, // flatFacing
+            1.0, // rotateWithCamera
+            0.0, // rotation
+            0.0, // translateX
+            0.0, // translateY
+            0.0, // translateMap
+            1.0, // variants
         ]
+    }
+
+    const LABEL: f64 = 1.0;
+    const BILLBOARD: f64 = 2.0;
+
+    fn paired(
+        mut c: [f64; CANDIDATE_STRIDE],
+        group: f64,
+        feature: f64,
+        role: f64,
+        standalone: bool,
+    ) -> [f64; CANDIDATE_STRIDE] {
+        c[18] = group;
+        c[19] = feature;
+        c[20] = role;
+        c[21] = if standalone { 1.0 } else { 0.0 };
+        c
+    }
+
+    /// A label and a billboard sharing an anchor, the billboard boxed to the
+    /// left of the label, plus a high-priority blocker covering only the label.
+    fn symbol_under_blocker(
+        label_standalone: bool,
+        billboard_standalone: bool,
+    ) -> [[f64; CANDIDATE_STRIDE]; 3] {
+        let mut blocker = label(R, 0.0, 0.0, 5.0, false);
+        blocker[4] = 5.0;
+        blocker[5] = 30.0;
+        let text = paired(
+            label(R, 0.0, 0.0, 1.0, false),
+            7.0,
+            3.0,
+            LABEL,
+            label_standalone,
+        );
+        let mut icon = paired(
+            label(R, 0.0, 0.0, 1.0, false),
+            7.0,
+            3.0,
+            BILLBOARD,
+            billboard_standalone,
+        );
+        icon[4] = -60.0;
+        icon[5] = -30.0;
+        [blocker, text, icon]
+    }
+
+    fn with_overlap(
+        mut c: [f64; CANDIDATE_STRIDE],
+        overlap: Overlap,
+        ignore_placement: bool,
+    ) -> [f64; CANDIDATE_STRIDE] {
+        c[11] = match overlap {
+            Overlap::Never => 0.0,
+            Overlap::Always => 1.0,
+            Overlap::Cooperative => 2.0,
+        };
+        c[12] = if ignore_placement { 1.0 } else { 0.0 };
+        c
     }
 
     fn place(cands: &[[f64; CANDIDATE_STRIDE]]) -> Vec<u8> {
         let flat: Vec<f64> = cands.iter().flatten().copied().collect();
         let (view, proj, cx, cy, cz, near, w, h, fov) = camera();
-        declutter_place(
-            &flat,
-            &view,
-            &proj,
-            cx,
-            cy,
-            cz,
-            near,
-            w,
-            h,
-            fov,
-            DEFAULT_PADDING_PX,
-            6.0,
-        )
+        declutter_place(&flat, &view, &proj, cx, cy, cz, near, w, h, fov, 0.0, 6.0)
     }
 
     #[test]
@@ -515,6 +828,121 @@ mod tests {
         assert_eq!(hidden[1], 0, "highest priority shown");
         assert_eq!(hidden[0], 1, "lower priority hidden");
         assert_eq!(hidden[2], 0, "far-away label shown");
+    }
+
+    #[test]
+    fn higher_rank_wins_whatever_the_priority() {
+        let mut ranked = label(R, 0.0, 0.0, -5.0, false);
+        ranked[13] = 1.0;
+        let hidden = place(&[label(R, 0.0, 0.0, 5.0, true), ranked]);
+        assert_eq!(hidden, vec![1, 0]);
+    }
+
+    #[test]
+    fn padding_is_added_in_screen_pixels_per_side() {
+        // Boxes 20px wide, 24px apart: clear with the default 2px padding.
+        let a = label(R, 0.0, 0.0, 1.0, false);
+        let b = label(R, 0.0, 0.0, 0.0, false);
+        let mut b_right = b;
+        b_right[4] = 34.0; // minX
+        b_right[5] = 54.0; // maxX
+        assert_eq!(place(&[a, b_right]), vec![0, 0]);
+        // 30px on the side facing the other label closes the gap...
+        let mut a_padded = a;
+        a_padded[15] = 30.0; // right
+        assert_eq!(place(&[a_padded, b_right]), vec![0, 1]);
+        // ...on the far side it does not.
+        let mut a_far = a;
+        a_far[17] = 30.0; // left
+        assert_eq!(place(&[a_far, b_right]), vec![0, 0]);
+    }
+
+    #[test]
+    fn a_paired_label_and_billboard_show_together() {
+        // Both standalone behaves like two unpaired candidates.
+        assert_eq!(place(&symbol_under_blocker(true, true)), vec![0, 1, 0]);
+        // MapLibre's default: the blocked label takes its billboard down too.
+        assert_eq!(place(&symbol_under_blocker(false, false)), vec![0, 1, 1]);
+        // `text-optional`: the billboard may show without its label...
+        assert_eq!(place(&symbol_under_blocker(false, true)), vec![0, 1, 0]);
+        // ...but `icon-optional` alone does not help a blocked label.
+        assert_eq!(place(&symbol_under_blocker(true, false)), vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn a_billboard_hidden_with_its_label_claims_no_space() {
+        let [blocker, text, icon] = symbol_under_blocker(false, false);
+        let mut later = label(R, 0.0, 0.0, 0.0, false);
+        later[4] = -55.0;
+        later[5] = -35.0;
+        assert_eq!(place(&[blocker, text, icon, later]), vec![0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn a_turned_label_claims_the_box_it_is_drawn_over() {
+        // A wide label and a small one boxed above it on the same anchor: clear
+        // while the wide one reads left to right, overlapping once it turns a
+        // quarter.
+        let mut wide = label(R, 0.0, 0.0, 1.0, false);
+        wide[4..8].copy_from_slice(&[-50.0, 50.0, -5.0, 5.0]);
+        let mut above = label(R, 0.0, 0.0, 0.0, false);
+        above[6] = 30.0;
+        above[7] = 50.0;
+        assert_eq!(place(&[wide, above]), vec![0, 0]);
+        wide[24] = std::f64::consts::FRAC_PI_2;
+        assert_eq!(place(&[wide, above]), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_standalone_label_and_billboard_block_each_other() {
+        let text = paired(label(R, 0.0, 0.0, 1.0, false), 7.0, 3.0, LABEL, true);
+        let icon = paired(label(R, 0.0, 0.0, 0.0, false), 7.0, 3.0, BILLBOARD, true);
+        assert_eq!(place(&[text, icon]), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_label_and_its_billboard_do_not_collide_with_each_other() {
+        let text = paired(label(R, 0.0, 0.0, 0.0, false), 7.0, 3.0, LABEL, false);
+        let icon = paired(label(R, 0.0, 0.0, 0.0, false), 7.0, 3.0, BILLBOARD, false);
+        assert_eq!(place(&[text, icon]), vec![0, 0]);
+    }
+
+    #[test]
+    fn pairs_need_the_same_group_and_feature() {
+        let text = paired(label(R, 0.0, 0.0, 1.0, false), 7.0, 3.0, LABEL, false);
+        let icon = |group, feature, y| {
+            paired(
+                label(R, y, 0.0, 0.0, false),
+                group,
+                feature,
+                BILLBOARD,
+                false,
+            )
+        };
+        // Unpaired, the overlapping billboard loses to the label.
+        assert_eq!(place(&[text, icon(8.0, 3.0, 0.0)]), vec![0, 1]);
+        assert_eq!(place(&[text, icon(7.0, 4.0, 0.0)]), vec![0, 1]);
+        assert_eq!(place(&[text, icon(7.0, 3.0, 0.0)]), vec![0, 0]);
+        // Anchors a rounding or a terrain update apart still pair.
+        assert_eq!(place(&[text, icon(7.0, 3.0, 0.25)]), vec![0, 0]);
+    }
+
+    #[test]
+    fn a_feature_s_labels_pair_with_their_nearest_billboards() {
+        // One feature placed at two anchors along a line, each icon slightly off
+        // its label's anchor and listed in the other order. Paired by anchor,
+        // all four show; crossed, each label would collide with the icon it sits
+        // on.
+        let symbol = |y: f64, role| paired(label(R, y, 0.0, 0.0, false), 7.0, 3.0, role, false);
+        assert_eq!(
+            place(&[
+                symbol(0.0, LABEL),
+                symbol(1e6, LABEL),
+                symbol(1e6 + 0.25, BILLBOARD),
+                symbol(0.25, BILLBOARD),
+            ]),
+            vec![0, 0, 0, 0],
+        );
     }
 
     #[test]
@@ -571,6 +999,37 @@ mod tests {
         assert_eq!(hidden[1], 0, "on-screen label shown");
     }
 
+    #[test]
+    fn always_labels_are_shown_wherever_they_are() {
+        let mut off_screen = label(R, 0.0, 0.0, 0.0, false);
+        off_screen[4] = 2000.0;
+        off_screen[5] = 2100.0;
+        let hidden = place(&[
+            with_overlap(label(R, 0.0, 0.0, 5.0, false), Overlap::Never, false),
+            with_overlap(label(R, 0.0, 0.0, 1.0, false), Overlap::Always, false),
+            with_overlap(off_screen, Overlap::Always, false),
+            with_overlap(label(-R, 0.0, 0.0, 0.0, false), Overlap::Always, false),
+        ]);
+        assert_eq!(hidden, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn always_labels_block_later_labels_unless_they_ignore_placement() {
+        let never = label(R, 0.0, 0.0, 1.0, false);
+        let always = label(R, 0.0, 0.0, 5.0, false);
+        let hidden = place(&[never, with_overlap(always, Overlap::Always, false)]);
+        assert_eq!(hidden, vec![1, 0], "allow-overlap still claims its box");
+        let hidden = place(&[never, with_overlap(always, Overlap::Always, true)]);
+        assert_eq!(hidden, vec![0, 0], "ignore-placement claims nothing");
+    }
+
+    #[test]
+    fn ignore_placement_labels_still_lose_to_earlier_labels() {
+        let winner = label(R, 0.0, 0.0, 5.0, false);
+        let loser = with_overlap(label(R, 0.0, 0.0, 1.0, false), Overlap::Never, true);
+        assert_eq!(place(&[winner, loser]), vec![0, 1]);
+    }
+
     // --- projection --------------------------------------------------------
 
     /// Camera at the origin looking down -Z with a 90° vertical FOV, so
@@ -624,19 +1083,13 @@ mod tests {
         max_y: f64,
         size_in_meters: bool,
     ) -> [f64; CANDIDATE_STRIDE] {
-        [
-            0.0,
-            0.0,
-            anchor_z,
-            add_height,
-            min_x,
-            max_x,
-            min_y,
-            max_y,
-            if size_in_meters { 1.0 } else { 0.0 },
-            0.0,
-            0.0,
-        ]
+        let mut c = [0.0; CANDIDATE_STRIDE];
+        c[2] = anchor_z;
+        c[3] = add_height;
+        c[4..8].copy_from_slice(&[min_x, max_x, min_y, max_y]);
+        c[8] = if size_in_meters { 1.0 } else { 0.0 };
+        c[23] = 1.0; // rotateWithCamera: screen-aligned
+        c
     }
 
     #[test]
@@ -710,6 +1163,7 @@ mod tests {
             0.0,
             2.0 * WGS84_A,
             0.0,
+            0.0,
             0.0
         ));
         assert!(is_beyond_horizon(
@@ -717,6 +1171,7 @@ mod tests {
             0.0,
             0.0,
             2.0 * WGS84_A,
+            0.0,
             0.0,
             0.0
         ));
@@ -726,8 +1181,58 @@ mod tests {
             0.0,
             2.0 * WGS84_A,
             0.0,
+            0.0,
             0.0
         ));
+    }
+
+    /// A label between the ellipsoid's horizon and that of the ellipsoid shrunk
+    /// by the horizon minimum is drawn, so it is not culled.
+    #[test]
+    fn horizon_follows_the_shrunk_ellipsoid() {
+        // 1 km above the equator; the surface point ~150 km away lies beyond
+        // the ellipsoid's horizon (~113 km) but within the one shrunk by 500 m
+        // (~218 km).
+        let theta: f64 = 150_000.0 / WGS84_A;
+        let (px, py) = (WGS84_A * theta.cos(), WGS84_A * theta.sin());
+        let cx = WGS84_A + 1000.0;
+        assert!(is_beyond_horizon(px, py, 0.0, cx, 0.0, 0.0, 0.0));
+        assert!(!is_beyond_horizon(px, py, 0.0, cx, 0.0, 0.0, -500.0));
+    }
+
+    /// A label on the ocean floor deeper than the camera's height is tested
+    /// against the ellipsoid through it, so it stays drawn under the camera.
+    #[test]
+    fn horizon_keeps_a_point_below_the_ellipsoid_under_the_camera() {
+        let floor = WGS84_A - 3500.0;
+        let cx = WGS84_A + 1000.0;
+        assert!(!is_beyond_horizon(floor, 0.0, 0.0, cx, 0.0, 0.0, -500.0));
+        // 5 km away along the floor, well within the floor's own horizon.
+        let theta: f64 = 5_000.0 / floor;
+        let (px, py) = (floor * theta.cos(), floor * theta.sin());
+        assert!(!is_beyond_horizon(px, py, 0.0, cx, 0.0, 0.0, -500.0));
+        // On the far side of the globe it is still culled.
+        assert!(is_beyond_horizon(-floor, 0.0, 0.0, cx, 0.0, 0.0, -500.0));
+    }
+
+    /// A camera below the ellipsoid culls at its own tangent plane: points
+    /// around it stay, the far side of the globe is culled.
+    #[test]
+    fn horizon_from_a_camera_below_the_ellipsoid() {
+        let cx = WGS84_A - 300.0;
+        let theta: f64 = 10_000.0 / WGS84_A;
+        let (px, py) = (WGS84_A * theta.cos(), WGS84_A * theta.sin());
+        assert!(!is_beyond_horizon(px, py, 0.0, cx, 0.0, 0.0, 0.0));
+        assert!(!is_beyond_horizon(
+            WGS84_A - 430.0,
+            0.0,
+            0.0,
+            cx,
+            0.0,
+            0.0,
+            0.0
+        ));
+        assert!(is_beyond_horizon(0.0, WGS84_A, 0.0, cx, 0.0, 0.0, 0.0));
     }
 
     // --- grid --------------------------------------------------------------
@@ -736,53 +1241,73 @@ mod tests {
         ScreenCollisionGrid::new(800.0, 600.0)
     }
 
+    /// `try_claim` for a `never` box that claims its space.
+    fn claim(
+        g: &mut ScreenCollisionGrid,
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+        test_shrink_px: f64,
+    ) -> Claim {
+        g.try_claim(
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            test_shrink_px,
+            Overlap::Never,
+            true,
+        )
+    }
+
     #[test]
     fn grid_places_non_overlapping_boxes() {
         let mut g = grid();
-        assert_eq!(g.try_claim(10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
-        assert_eq!(g.try_claim(60.0, 10.0, 100.0, 30.0, 0.0), Claim::Claimed);
-        assert_eq!(g.try_claim(10.0, 40.0, 50.0, 60.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 60.0, 10.0, 100.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 10.0, 40.0, 50.0, 60.0, 0.0), Claim::Claimed);
     }
 
     #[test]
     fn grid_rejects_overlap_and_leaves_grid_untouched() {
         let mut g = grid();
-        assert_eq!(g.try_claim(10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
-        assert_eq!(g.try_claim(40.0, 20.0, 80.0, 40.0, 0.0), Claim::Blocked);
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 40.0, 20.0, 80.0, 40.0, 0.0), Claim::Blocked);
         // The rejected box claimed nothing.
-        assert_eq!(g.try_claim(55.0, 25.0, 80.0, 40.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 55.0, 25.0, 80.0, 40.0, 0.0), Claim::Claimed);
     }
 
     #[test]
     fn grid_exactly_touching_boxes_do_not_collide() {
         let mut g = grid();
-        assert_eq!(g.try_claim(10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
-        assert_eq!(g.try_claim(50.0, 10.0, 90.0, 30.0, 0.0), Claim::Claimed);
-        assert_eq!(g.try_claim(10.0, 30.0, 50.0, 50.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 50.0, 10.0, 90.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 10.0, 30.0, 50.0, 50.0, 0.0), Claim::Claimed);
     }
 
     #[test]
     fn grid_detects_collisions_across_cell_boundaries() {
         let mut g = grid();
-        assert_eq!(g.try_claim(30.0, 30.0, 300.0, 90.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 30.0, 30.0, 300.0, 90.0, 0.0), Claim::Claimed);
         // Overlaps only its far end, in a different cell than the origin.
-        assert_eq!(g.try_claim(280.0, 50.0, 320.0, 70.0, 0.0), Claim::Blocked);
+        assert_eq!(claim(&mut g, 280.0, 50.0, 320.0, 70.0, 0.0), Claim::Blocked);
     }
 
     #[test]
     fn grid_competes_within_margin_not_beyond() {
         let mut g = grid();
         // Just off the left edge, inside the 128px margin: claims space.
-        assert_eq!(g.try_claim(-60.0, 10.0, -10.0, 30.0, 0.0), Claim::Claimed);
-        assert_eq!(g.try_claim(-40.0, 10.0, 20.0, 30.0, 0.0), Claim::Blocked);
+        assert_eq!(claim(&mut g, -60.0, 10.0, -10.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, -40.0, 10.0, 20.0, 30.0, 0.0), Claim::Blocked);
         // Entirely beyond the margin: claims nothing, and is reported as such
         // rather than as a win — it is off screen, so it stays hidden.
         assert_eq!(
-            g.try_claim(-500.0, 10.0, -400.0, 30.0, 0.0),
+            claim(&mut g, -500.0, 10.0, -400.0, 30.0, 0.0),
             Claim::OutsideArea
         );
         assert_eq!(
-            g.try_claim(-480.0, 10.0, -420.0, 30.0, 0.0),
+            claim(&mut g, -480.0, 10.0, -420.0, 30.0, 0.0),
             Claim::OutsideArea
         );
     }
@@ -790,27 +1315,233 @@ mod tests {
     #[test]
     fn grid_test_shrink_tolerates_marginal_overlap_but_claims_full_box() {
         let mut g = grid();
-        assert_eq!(g.try_claim(10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
         // Overlaps by 4px; a 6px shrink clears it (hysteresis case)...
-        assert_eq!(g.try_claim(46.0, 10.0, 86.0, 30.0, 6.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 46.0, 10.0, 86.0, 30.0, 6.0), Claim::Claimed);
         // ...but the FULL box was claimed: a box overlapping the shrunk-away
         // strip still collides.
-        assert_eq!(g.try_claim(80.0, 10.0, 120.0, 30.0, 0.0), Claim::Blocked);
+        assert_eq!(claim(&mut g, 80.0, 10.0, 120.0, 30.0, 0.0), Claim::Blocked);
     }
 
     #[test]
     fn grid_without_shrink_marginal_overlap_collides() {
         let mut g = grid();
-        assert_eq!(g.try_claim(10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
-        assert_eq!(g.try_claim(46.0, 10.0, 86.0, 30.0, 0.0), Claim::Blocked);
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 46.0, 10.0, 86.0, 30.0, 0.0), Claim::Blocked);
     }
 
     #[test]
     fn grid_box_fully_consumed_by_shrink_is_free() {
         let mut g = grid();
-        assert_eq!(g.try_claim(10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
         // 8px-wide box inside the claimed area, but 6px/side shrink leaves no
         // test area — claimed anyway.
-        assert_eq!(g.try_claim(20.0, 15.0, 28.0, 25.0, 6.0), Claim::Claimed);
+        assert_eq!(claim(&mut g, 20.0, 15.0, 28.0, 25.0, 6.0), Claim::Claimed);
+    }
+
+    #[test]
+    fn grid_always_skips_the_test_but_claims_its_box() {
+        let mut g = grid();
+        let always = Overlap::Always;
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(
+            g.try_claim(40.0, 10.0, 80.0, 30.0, 0.0, always, true),
+            Claim::Claimed
+        );
+        // Hits only the `always` box, which a `never` box may not overlap.
+        assert_eq!(claim(&mut g, 60.0, 10.0, 90.0, 30.0, 0.0), Claim::Blocked);
+    }
+
+    #[test]
+    fn grid_cooperative_overlaps_everything_but_never_boxes() {
+        let mut g = grid();
+        let coop = Overlap::Cooperative;
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(
+            g.try_claim(40.0, 10.0, 80.0, 30.0, 0.0, coop, true),
+            Claim::Blocked,
+            "a never box blocks it"
+        );
+        assert_eq!(
+            g.try_claim(100.0, 10.0, 140.0, 30.0, 0.0, Overlap::Always, true),
+            Claim::Claimed
+        );
+        assert_eq!(
+            g.try_claim(130.0, 10.0, 170.0, 30.0, 0.0, coop, true),
+            Claim::Claimed,
+            "an always box does not"
+        );
+        assert_eq!(
+            g.try_claim(160.0, 10.0, 200.0, 30.0, 0.0, coop, true),
+            Claim::Claimed,
+            "nor does a cooperative one"
+        );
+        assert_eq!(claim(&mut g, 190.0, 10.0, 230.0, 30.0, 0.0), Claim::Blocked);
+    }
+
+    #[test]
+    fn grid_without_claiming_space_tests_but_registers_nothing() {
+        let mut g = grid();
+        let never = Overlap::Never;
+        assert_eq!(claim(&mut g, 10.0, 10.0, 50.0, 30.0, 0.0), Claim::Claimed);
+        assert_eq!(
+            g.try_claim(40.0, 10.0, 80.0, 30.0, 0.0, never, false),
+            Claim::Blocked
+        );
+        assert_eq!(
+            g.try_claim(100.0, 10.0, 140.0, 30.0, 0.0, never, false),
+            Claim::Claimed
+        );
+        assert_eq!(claim(&mut g, 100.0, 10.0, 140.0, 30.0, 0.0), Claim::Claimed);
+    }
+    #[test]
+    fn viewport_translate_moves_the_box_in_screen_pixels() {
+        let ctx = context_90();
+        let mut c = proj_candidate(-100.0, 0.0, -10.0, 10.0, -5.0, 5.0, false);
+        let mut out = [0.0; 4];
+        c[25] = 12.0;
+        c[26] = -7.0;
+        assert!(project_candidate(&c, &ctx, &mut out));
+        assert!((out[0] - 402.0).abs() < 1e-3);
+        assert!((out[1] - 288.0).abs() < 1e-3);
+        assert!((out[2] - 422.0).abs() < 1e-3);
+        assert!((out[3] - 298.0).abs() < 1e-3);
+    }
+
+    /// The `place` camera turned a quarter about its view axis: screen right is
+    /// world -Z (south at the anchor) and screen up is world +Y (east).
+    fn turned_context<'a>(view: &'a [f64], proj: &'a [f64]) -> ProjectionContext<'a> {
+        let (_, _, cx, cy, cz, near, w, h, fov) = camera();
+        ProjectionContext {
+            view,
+            proj,
+            camera_x: cx,
+            camera_y: cy,
+            camera_z: cz,
+            near,
+            width_px: w,
+            height_px: h,
+            fov_rad: fov,
+        }
+    }
+
+    #[test]
+    fn map_translate_turns_with_the_camera_heading() {
+        let (_, proj, ..) = camera();
+        #[rustfmt::skip]
+        let world = [
+            0.0, 0.0, -1.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0,
+            2.0 * R, 0.0, 0.0, 1.0,
+        ];
+        let view = invert_rigid(&world);
+        let ctx = turned_context(&view, &proj);
+
+        let mut c = label(R, 0.0, 0.0, 0.0, false);
+        let mut base = [0.0; 4];
+        project_candidate(&c, &ctx, &mut base);
+
+        // 10 px east, which this camera shows as screen up.
+        c[25] = 10.0;
+        c[27] = 1.0;
+        let mut out = [0.0; 4];
+        project_candidate(&c, &ctx, &mut out);
+        assert!((out[0] - base[0]).abs() < 1e-6);
+        assert!((out[1] - (base[1] - 10.0)).abs() < 1e-6);
+
+        // Anchored to the viewport, the same translate stays screen right.
+        c[27] = 0.0;
+        project_candidate(&c, &ctx, &mut out);
+        assert!((out[0] - (base[0] + 10.0)).abs() < 1e-6);
+        assert!((out[1] - base[1]).abs() < 1e-6);
+    }
+
+    /// A label's variable-anchor rows as the manager packs them: the group
+    /// size on the first row, `0` on the rest.
+    fn variants<const K: usize>(
+        mut rows: [[f64; CANDIDATE_STRIDE]; K],
+    ) -> [[f64; CANDIDATE_STRIDE]; K] {
+        for (k, row) in rows.iter_mut().enumerate() {
+            row[28] = if k == 0 { K as f64 } else { 0.0 };
+        }
+        rows
+    }
+
+    /// A high-priority label covering the screen x range `[min_x, max_x]`
+    /// around the anchor, and a two-row label whose first row overlaps it
+    /// and second row sits clear to the left.
+    fn blocked_label(min_x: f64, max_x: f64, is_shown: bool) -> Vec<[f64; CANDIDATE_STRIDE]> {
+        let mut blocker = label(R, 0.0, 0.0, 5.0, false);
+        blocker[4] = min_x;
+        blocker[5] = max_x;
+        let mut left = label(R, 0.0, 0.0, 1.0, false);
+        left[4] = -60.0;
+        left[5] = -40.0;
+        let [current, left] = variants([label(R, 0.0, 0.0, 1.0, is_shown), left]);
+        vec![blocker, current, left]
+    }
+
+    #[test]
+    fn a_blocked_label_takes_its_next_anchor() {
+        assert_eq!(place(&blocked_label(5.0, 30.0, false)), vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn a_label_with_a_free_anchor_stays_there() {
+        assert_eq!(place(&blocked_label(100.0, 130.0, false)), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn a_shown_label_keeps_its_anchor_under_a_marginal_overlap() {
+        // 4 px of overlap, inside the hysteresis shrink.
+        assert_eq!(place(&blocked_label(10.0, 30.0, true)), vec![0, 0, 1]);
+        assert_eq!(place(&blocked_label(10.0, 30.0, false)), vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn a_label_blocked_at_every_anchor_is_hidden() {
+        assert_eq!(place(&blocked_label(-70.0, 30.0, false)), vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn an_overlapping_label_still_prefers_a_free_anchor() {
+        let mut rows = blocked_label(5.0, 30.0, false);
+        rows[1] = with_overlap(rows[1], Overlap::Always, false);
+        rows[2] = with_overlap(rows[2], Overlap::Always, false);
+        assert_eq!(place(&rows), vec![0, 1, 0]);
+        // With every anchor blocked it overlaps at the one in use.
+        let mut rows = blocked_label(-70.0, 30.0, false);
+        rows[1] = with_overlap(rows[1], Overlap::Always, false);
+        rows[2] = with_overlap(rows[2], Overlap::Always, false);
+        assert_eq!(place(&rows), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn a_billboard_shows_with_the_anchor_its_label_takes() {
+        let mut rows = blocked_label(5.0, 30.0, false);
+        rows[1] = paired(rows[1], 7.0, 3.0, LABEL, false);
+        rows[2] = paired(rows[2], 7.0, 3.0, LABEL, false);
+        let mut icon = paired(label(R, 0.0, 0.0, 1.0, false), 7.0, 3.0, BILLBOARD, false);
+        icon[6] = -40.0;
+        icon[7] = -20.0;
+        rows.push(icon);
+        assert_eq!(place(&rows), vec![0, 1, 0, 0]);
+        // Blocked at every anchor, the label takes its billboard down.
+        rows[0][4] = -70.0;
+        assert_eq!(place(&rows), vec![0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn a_translated_label_collides_where_it_is_drawn() {
+        // Two labels 40 px apart; moving the second 40 px back onto the first
+        // makes them collide.
+        let a = label(R, 0.0, 0.0, 1.0, false);
+        let mut b = label(R, 0.0, 0.0, 0.0, false);
+        b[4] = 30.0;
+        b[5] = 50.0;
+        assert_eq!(place(&[a, b]), vec![0, 0]);
+        b[25] = -40.0;
+        assert_eq!(place(&[a, b]), vec![0, 1]);
     }
 }

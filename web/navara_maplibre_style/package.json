@@ -17,8 +17,8 @@
     "test": "vitest --passWithNoTests --watch=false",
     "lint": "eslint . --fix",
     "lint:check": "eslint .",
-    "format": "prettier --write --ignore-path ../../.gitignore .",
-    "format:check": "prettier --check --ignore-path ../../.gitignore ."
+    "format": "prettier --write --ignore-path ../../.gitignore --ignore-path ../../.prettierignore --ignore-path .prettierignore .",
+    "format:check": "prettier --check --ignore-path ../../.gitignore --ignore-path ../../.prettierignore --ignore-path .prettierignore ."
   },
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -33,9 +33,10 @@
     "@navaramap/three": "workspace:*"
   },
   "dependencies": {
-    "@maplibre/maplibre-gl-style-spec": "26.2.1",
+    "@maplibre/maplibre-gl-style-spec": "26.6.0",
     "@navaramap/core": "workspace:*",
     "@navaramap/engine": "workspace:*",
+    "@navaramap/three-plugins": "workspace:*",
     "@types/geojson": "7946.0.16"
   },
   "devDependencies": {

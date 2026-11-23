@@ -24,6 +24,14 @@
       * getBatchTexel(batchId, BATCHED_TEXTURE_ROW_EMISSIVE_INTENSITY)[BATCHED_TEXTURE_COMP_EMISSIVE_INTENSITY];
   #endif
 
+  #ifdef USE_BATCH_OUTLINE
+    // All four slots are always allocated together (see ensureOutlineSlots).
+    nvr_batchOutlineColor = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_OUTLINE_COLOR).rgb;
+    nvr_batchOutlineOpacity = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_OUTLINE_OPACITY)[BATCHED_TEXTURE_COMP_OUTLINE_OPACITY];
+    nvr_batchOutlineWidth = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_OUTLINE_WIDTH)[BATCHED_TEXTURE_COMP_OUTLINE_WIDTH];
+    nvr_batchOutlineBlur = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_OUTLINE_BLUR)[BATCHED_TEXTURE_COMP_OUTLINE_BLUR];
+  #endif
+
   #ifdef USE_BATCH_HEIGHT
     addHeight = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_HEIGHT)[BATCHED_TEXTURE_COMP_HEIGHT];
   #endif
@@ -34,6 +42,44 @@
 
   #ifdef USE_BATCH_LINE_WIDTH
     batchLineWidth = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_LINE_WIDTH)[BATCHED_TEXTURE_COMP_LINE_WIDTH];
+  #endif
+
+  #ifdef USE_BATCH_LINE_DASH
+    // Row in the view's line dash atlas; 0 is a solid line.
+    nvr_batchLineDash = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_LINE_DASH)[BATCHED_TEXTURE_COMP_LINE_DASH];
+  #endif
+
+  #ifdef USE_BATCH_ROTATION
+    // Radians; the CPU converts the material's degrees before writing.
+    nvr_batchRotation = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_ROTATION)[BATCHED_TEXTURE_COMP_ROTATION];
+  #endif
+
+  #ifdef USE_BATCH_ORIENTATION
+    // Packed: spreadGlyphs (text only, read by sdfText.vert.glsl) in the 4s
+    // place, flatFacing in the 2s place, rotateWithCamera in the 1s place; see
+    // packOrientation in web/navara_three/src/batchTexture/core.ts
+    float nvr_batchOrientation = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_ORIENTATION)[BATCHED_TEXTURE_COMP_ORIENTATION];
+    nvr_batchFlatFacing = mod(nvr_batchOrientation, 4.0) >= 1.5;
+    nvr_batchRotateWithCamera = mod(nvr_batchOrientation, 2.0) >= 0.5;
+  #endif
+
+  #ifdef USE_BATCH_ANCHOR
+    // Packed 2h + 6v, h and v in {0, 0.5, 1}; see anchorCode in
+    // web/navara_three/src/material/anchor.ts. The +0.5 keeps floor() off the
+    // exact multiples of 3.
+    float nvr_batchAnchorCode = getBatchTexel(batchId, BATCHED_TEXTURE_ROW_ANCHOR)[BATCHED_TEXTURE_COMP_ANCHOR];
+    nvr_batchAnchor = vec2(
+      mod(nvr_batchAnchorCode, 3.0) * 0.5 - 0.5,
+      0.5 - floor((nvr_batchAnchorCode + 0.5) / 3.0) * 0.5
+    );
+  #endif
+
+  #ifdef USE_BATCH_OFFSET
+    // Both halves are always allocated together (see ensureOffsetSlots).
+    nvr_batchOffset = vec2(
+      getBatchTexel(batchId, BATCHED_TEXTURE_ROW_OFFSET_X)[BATCHED_TEXTURE_COMP_OFFSET_X],
+      getBatchTexel(batchId, BATCHED_TEXTURE_ROW_OFFSET_Y)[BATCHED_TEXTURE_COMP_OFFSET_Y]
+    );
   #endif
 
   #ifdef USE_BATCH_SIZE

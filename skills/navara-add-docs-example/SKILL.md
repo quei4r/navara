@@ -11,7 +11,7 @@ description: >
 **First read [.claude/skills/navara-usage/SKILL.md](../navara-usage/SKILL.md)** (and the reference matching the topic) so the snippet demonstrates correct, idiomatic API usage. The authoritative process docs live in the repo — read them before writing:
 
 - `docs/AGENTS.md` — entry point and key principles
-- `docs/guide/WRITING_RULES.md` — terminology and link rules
+- `docs/guide/WRITING_RULES.md` — prose rules (one property per section, behavior over implementation, what an option does rather than what it restores, facts over impressions), terminology, and link rules
 - `docs/guide/NAVARA_THREE_INSTRUCTIONS.md` — update workflow, package→section map, WASM `.d.ts` handling
 - `docs/guide/NAVARA_THREE_UPDATE_CHECKLIST.md` — scenario checklists
 - `docs/guide/TRANSLATION_GUIDE.md` — when touching `ja/`
@@ -44,6 +44,7 @@ description: >
 - Prefer relative paths for page links, `@assets/` for images, `@components/` for component imports.
 - Every code block declares its language; frontmatter needs `title`, `description`, `sidebar.order`.
 - Add new examples **alongside** existing ones; don't remove or restructure existing content.
+- **Mark APIs the latest npm release lacks** with that release + 0.0.1 (`site/released-version.json`): `since: X.Y.Z` in the frontmatter for a new page, `:since[X.Y.Z]` at the end of a heading or paragraph otherwise. They render a Nightly badge until a release reaches that version; `nightly` in place of the version (packages under `web/experimental/`) keeps the badge until it is replaced (details: `docs/guide/NAVARA_THREE_UPDATE_CHECKLIST.md`, "Unreleased Features").
 
 ## Quality checklist before finishing
 

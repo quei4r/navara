@@ -151,6 +151,31 @@ impl RenderableFeature {
         }
     }
 
+    /// Whether the frontend bakes this feature into terrain tiles: a draped
+    /// (texturized) polygon or polyline.
+    pub fn is_draped(&self) -> bool {
+        match self {
+            RenderableFeature::Polygon { render_info, .. } => render_info.should_be_texturized,
+            RenderableFeature::Polyline { render_info, .. } => render_info.should_be_texturized,
+            _ => false,
+        }
+    }
+
+    /// Whether the frontend draws this feature the same while active or not:
+    /// a draped feature is baked into terrain tiles whenever shown, and the
+    /// drape resolve picks which tile is baked. A polygon outline is drawn
+    /// directly and follows `active`.
+    pub fn is_drawn_regardless_of_activation(&self) -> bool {
+        let outlined = matches!(
+            self,
+            RenderableFeature::Polygon {
+                outline_geometry: Some(_),
+                ..
+            }
+        );
+        self.is_draped() && !outlined
+    }
+
     pub fn is_rendered(&self) -> bool {
         match self {
             RenderableFeature::Point { render_info, .. } => render_info.is_rendered,
@@ -240,12 +265,14 @@ pub struct TransferablePolylineGeometry {
     pub forward_offset: Option<TransferableFloatAttribute>,
     pub end_high: Option<TransferableFloatAttribute>,
     pub end_low: Option<TransferableFloatAttribute>,
-    pub start_normals: Option<TransferableFloatAttribute>,
-    pub end_normal_and_texture_coordinate_normalization_x: Option<TransferableFloatAttribute>,
-    pub right_normal_and_texture_coordinate_normalization_y: TransferableFloatAttribute,
+    pub start_normal_and_length_high: Option<TransferableFloatAttribute>,
+    pub end_normal_and_segment_length: Option<TransferableFloatAttribute>,
+    pub right_normal_and_line_length: TransferableFloatAttribute,
     pub batch_ids: Option<TransferableFloatAttribute>,
     pub batch_index: Option<TransferableUintAttribute>,
     pub indices: Handle,
+    pub line_segments: Option<TransferableFloatAttribute>,
+    pub line_distance_and_ends: Option<TransferableFloatAttribute>,
 }
 
 impl TransferablePolylineGeometry {
@@ -254,11 +281,8 @@ impl TransferablePolylineGeometry {
         geo: navara_geometry::PolylineGeometry,
     ) -> TransferablePolylineGeometry {
         let position = buf.new_f32(geo.attributes.position.data);
-        let right_normal_and_texture_coordinate_normalization_y = buf.new_f32(
-            geo.attributes
-                .right_normal_and_texture_coordinate_normalization_y
-                .data,
-        );
+        let right_normal_and_line_length =
+            buf.new_f32(geo.attributes.right_normal_and_line_length.data);
         let indices = buf.new_u32(geo.indices);
 
         TransferablePolylineGeometry {
@@ -319,26 +343,21 @@ impl TransferablePolylineGeometry {
                     data: buf.new_f32(attr.data),
                     size: attr.size,
                 }),
-            start_normals: geo
-                .attributes
-                .start_normals
-                .map(|attr| TransferableFloatAttribute {
+            start_normal_and_length_high: geo.attributes.start_normal_and_length_high.map(|attr| {
+                TransferableFloatAttribute {
                     data: buf.new_f32(attr.data),
                     size: attr.size,
-                }),
-            end_normal_and_texture_coordinate_normalization_x: geo
-                .attributes
-                .end_normal_and_texture_coordinate_normalization_x
-                .map(|attr| TransferableFloatAttribute {
+                }
+            }),
+            end_normal_and_segment_length: geo.attributes.end_normal_and_segment_length.map(
+                |attr| TransferableFloatAttribute {
                     data: buf.new_f32(attr.data),
                     size: attr.size,
-                }),
-            right_normal_and_texture_coordinate_normalization_y: TransferableFloatAttribute {
-                data: right_normal_and_texture_coordinate_normalization_y,
-                size: geo
-                    .attributes
-                    .right_normal_and_texture_coordinate_normalization_y
-                    .size,
+                },
+            ),
+            right_normal_and_line_length: TransferableFloatAttribute {
+                data: right_normal_and_line_length,
+                size: geo.attributes.right_normal_and_line_length.size,
             },
             batch_ids: geo
                 .attributes
@@ -355,6 +374,19 @@ impl TransferablePolylineGeometry {
                     size: batch_idx.size,
                 }),
             indices,
+            line_segments: geo
+                .attributes
+                .line_segments
+                .map(|attr| TransferableFloatAttribute {
+                    data: buf.new_f32(attr.data),
+                    size: attr.size,
+                }),
+            line_distance_and_ends: geo.attributes.line_distance_and_ends.map(|attr| {
+                TransferableFloatAttribute {
+                    data: buf.new_f32(attr.data),
+                    size: attr.size,
+                }
+            }),
         }
     }
 
@@ -395,17 +427,13 @@ impl TransferablePolylineGeometry {
         if let Some(forward_offset) = &self.forward_offset {
             buf.remove(&forward_offset.data);
         }
-        if let Some(start_normals) = &self.start_normals {
-            buf.remove(&start_normals.data);
+        if let Some(start_normal_and_length_high) = &self.start_normal_and_length_high {
+            buf.remove(&start_normal_and_length_high.data);
         }
-        if let Some(end_normal) = &self.end_normal_and_texture_coordinate_normalization_x {
+        if let Some(end_normal) = &self.end_normal_and_segment_length {
             buf.remove(&end_normal.data);
         }
-        buf.remove(
-            &self
-                .right_normal_and_texture_coordinate_normalization_y
-                .data,
-        );
+        buf.remove(&self.right_normal_and_line_length.data);
         let mut removed_batch_ids = Vec::new();
         if let Some(batch_ids) = &self.batch_ids
             && let Some(vec_ids) = buf.remove_f32(&batch_ids.data)
@@ -416,6 +444,12 @@ impl TransferablePolylineGeometry {
         }
         if let Some(batch_index) = &self.batch_index {
             buf.remove(&batch_index.data);
+        }
+        if let Some(line_segments) = &self.line_segments {
+            buf.remove(&line_segments.data);
+        }
+        if let Some(line_distance_and_ends) = &self.line_distance_and_ends {
+            buf.remove(&line_distance_and_ends.data);
         }
         buf.remove(&self.indices);
         removed_batch_ids
@@ -627,6 +661,19 @@ pub struct TransferablePointGeometry {
     pub position_3d_low: Option<TransferableFloatAttribute>,
     pub batch_ids: TransferableFloatAttribute,
     pub batch_index: TransferableUintAttribute,
+    /// Per-anchor tangent bearing in degrees clockwise from north. `None`
+    /// unless the anchors were placed along a line.
+    pub bearings: Option<TransferableFloatAttribute>,
+    /// Per-anchor `(min, max]` ground metres per screen pixel over which the
+    /// renderer shows it; `size` is the stride. Set exactly when `bearings` is.
+    pub scale_bands: Option<TransferableFloatAttribute>,
+    /// Per-anchor east/north path samples for bending glyphs along the line;
+    /// `size` is the stride (two floats per sample). `None` unless along-line
+    /// text.
+    pub path_samples: Option<TransferableFloatAttribute>,
+    /// Per-anchor `(metres between path samples, metres of real line either
+    /// side of the anchor)`.
+    pub path_meta: Option<TransferableFloatAttribute>,
 }
 
 impl TransferablePointGeometry {
@@ -653,6 +700,10 @@ impl TransferablePointGeometry {
                 data: buf.new_u32(batch_indices),
                 size: 1,
             },
+            bearings: None,
+            scale_bands: None,
+            path_samples: None,
+            path_meta: None,
         }
     }
 
@@ -685,6 +736,10 @@ impl TransferablePointGeometry {
                 data: buf.new_u32(batch_indices),
                 size: 1,
             },
+            bearings: None,
+            scale_bands: None,
+            path_samples: None,
+            path_meta: None,
         }
     }
 
@@ -698,6 +753,17 @@ impl TransferablePointGeometry {
         }
         if let Some(position_3d_low) = &self.position_3d_low {
             buf.remove(&position_3d_low.data);
+        }
+        for attr in [
+            &self.bearings,
+            &self.scale_bands,
+            &self.path_samples,
+            &self.path_meta,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            buf.remove(&attr.data);
         }
 
         if let Some(vec_ids) = buf.remove_f32(&self.batch_ids.data) {
@@ -713,6 +779,21 @@ impl TransferablePointGeometry {
 impl From<&crate::batched_geometry::BatchedPointGeometry> for TransferablePointGeometry {
     fn from(geom: &crate::batched_geometry::BatchedPointGeometry) -> Self {
         use crate::batched_geometry::PointEncoding;
+        let bearings = geom
+            .bearings
+            .map(|data| TransferableFloatAttribute { data, size: 1 });
+        let scale_bands = geom.scale_bands.map(|data| TransferableFloatAttribute {
+            data,
+            size: navara_parser::line_placement::SCALE_BAND_STRIDE as u8,
+        });
+        let path_samples = geom.path_samples.map(|data| TransferableFloatAttribute {
+            data,
+            size: (navara_parser::line_placement::PATH_SAMPLES * 2) as u8,
+        });
+        let path_meta = geom.path_meta.map(|data| TransferableFloatAttribute {
+            data,
+            size: navara_parser::line_placement::PATH_META_STRIDE as u8,
+        });
         match geom.encoding {
             PointEncoding::Rtc => Self {
                 position: Some(TransferableFloatAttribute {
@@ -729,6 +810,10 @@ impl From<&crate::batched_geometry::BatchedPointGeometry> for TransferablePointG
                     data: geom.batch_indices,
                     size: 1,
                 },
+                bearings,
+                scale_bands,
+                path_samples,
+                path_meta,
             },
             PointEncoding::Rte => Self {
                 position: None,
@@ -748,6 +833,10 @@ impl From<&crate::batched_geometry::BatchedPointGeometry> for TransferablePointG
                     data: geom.batch_indices,
                     size: 1,
                 },
+                bearings,
+                scale_bands,
+                path_samples,
+                path_meta,
             },
         }
     }

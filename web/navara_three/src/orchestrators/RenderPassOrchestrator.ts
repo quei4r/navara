@@ -19,7 +19,11 @@ import {
 import type { Object3D, Texture, Vector3 } from "three";
 import type { PostProcessing, RenderTarget } from "three/webgpu";
 
-import { estimateFixedGpuBytes } from "../utils/fixedGpuFootprint";
+import {
+  estimateFixedGpuBytes,
+  listRenderTargets,
+  type RenderTargetEntry,
+} from "../utils/fixedGpuFootprint";
 import { getWebGPU, isWebGPULoaded } from "../utils/webgpuLoader";
 
 export type RenderPassOrchestratorOptions = {
@@ -584,18 +588,7 @@ export class RenderPassOrchestrator {
   }
 
   /**
-   * Clear all passes.
-   */
-  clearPasses(): void {
-    for (const namedPass of this.passMap.list) {
-      this.effectComposer?.removePass(namedPass.pass);
-    }
-    this.passMap.list = [];
-    this.passMap.indexMap = {};
-    this.onPassesChanged?.();
-  }
 
-  /**
    * Estimates the resident GPU bytes of the fixed, screen-sized render-target
    * stack (composer buffers + every target reachable from the passes), for
    * reporting into the memory ledger's `fixed_gpu_bytes` term.
@@ -604,18 +597,28 @@ export class RenderPassOrchestrator {
     if (!this.effectComposer) {
       return 0;
     }
-    return estimateFixedGpuBytes(
-      this.effectComposer,
-      this.passMap.list.map((p) => p.pass),
-    );
+    return estimateFixedGpuBytes(this.effectComposer, this.passMap.list);
+  }
+
+  /** Every render target of the fixed stack, attributed to its owning pass. */
+  listRenderTargets(): RenderTargetEntry[] {
+    if (!this.effectComposer) {
+      return [];
+    }
+    return listRenderTargets(this.effectComposer, this.passMap.list);
   }
 
   /**
-   * Dispose all GPU resources held by the effect composer.
+   * Dispose all GPU resources held by the effect composer, including the
+   * passes still in the pipeline.
    */
   dispose(): void {
-    this.clearPasses();
+    // `effectComposer.dispose()` disposes only the passes still in its list,
+    // and `removePass` does not dispose, so the list is not cleared first.
     this.effectComposer?.dispose();
+    this.passMap.list = [];
+    this.passMap.indexMap = {};
+    this.onPassesChanged?.();
   }
 
   /**

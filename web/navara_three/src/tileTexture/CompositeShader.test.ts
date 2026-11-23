@@ -20,6 +20,18 @@ describe("generateCompositeFragmentShader", () => {
     expect(src).toContain("layout(location = 2) out vec4 normalBuffer;");
   });
 
+  it("leaves out the normal output for an atlas without that attachment", () => {
+    const src = generateCompositeFragmentShader(
+      2,
+      2,
+      2,
+      { ...ALL_OFF, hasHillshade: true },
+      false,
+    );
+    expect(src).toContain("layout(location = 1) out vec4 attrBuffer;");
+    expect(src).not.toContain("normalBuffer");
+  });
+
   it("emits rasterCount + vectorCount compact slot blocks", () => {
     const src = generateCompositeFragmentShader(2, 1, 24, ALL_OFF);
     // Compact slot 0,1 are raster (absSlot 0,1); slot 2 is vector (absSlot 24).
@@ -59,7 +71,8 @@ describe("generateCompositeFragmentShader", () => {
       hasHillshade: true,
     });
     expect(src).toContain("uniform bool uIsHillshades[2];");
-    expect(src).toContain("uniform float uHillshadeExaggeration;");
+    // Exaggeration is applied once, by the TileMesh shader, not here.
+    expect(src).not.toContain("uHillshadeExaggeration");
     expect(src).toContain("hillshadeNormal = n0 * 0.5 + 0.5;");
     expect(src).toContain("hillshadeNormal = n1 * 0.5 + 0.5;");
     // Hillshade slots must contribute no color to the composite.
@@ -100,9 +113,9 @@ describe("generateCompositeFragmentShader", () => {
       ...ALL_OFF,
       hasElevationHeatmap: true,
     });
-    expect(src).toContain("uniform bool uIsElevationHeatmaps[2];");
+    expect(src).toContain("uniform vec4 uElevationHeatmapParams[2];");
     expect(src).toContain("uniform sampler2D uColorMapTexture;");
-    expect(src).toContain("if (uIsElevationHeatmaps[0])");
+    expect(src).toContain("bool isElevationHeatmap0 = params0.x > 0.5;");
     expect(src).toContain("sampleElevationBilinear(uTextures[0]");
   });
 
@@ -127,7 +140,7 @@ describe("generateCompositeFragmentShader", () => {
     // Watermask priority: max() with step() over the slot-loop result so the
     // watermask flips isWater on even when no slot's uWaters[k] was true.
     expect(src).toMatch(
-      /isWater = max\(isWater, step\(0\.5, texture\(uWatermask, vUv\)\.r\)\);/,
+      /isWater = max\(isWater, step\(0\.5, nvrWatermaskBSpline\(vUv\)\)\);/,
     );
   });
 

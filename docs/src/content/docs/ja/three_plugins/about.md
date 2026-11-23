@@ -19,7 +19,11 @@ navara_three（コア: ThreeView, Plugin, addPlugin）
         ├── PersonViewPlugin（キーボード操作による一人称 / 三人称ビューコントローラー）
         ├── OverlayPlugin（ワールド座標からスクリーン座標への HTML オーバーレイ投影）
         ├── CesiumIonPlugin（Cesium Ion quantized-mesh 地形）
-        └── TileJsonPlugin（TileJSON 3.0.0 タイルソースの登録）
+        ├── TileJsonPlugin（TileJSON 3.0.0 タイルソースの登録）
+        ├── StreetLightsPlugin（夜の街灯・屋上灯・車）
+        ├── DevtoolsPlugin（開発用ツール：プロファイラー、レイヤーとカメラのインスペクター）
+        └── MaterialSchemaPlugin（スタイル UI 向けに、レイヤーのマテリアルとスタイルを JSON で提供。
+                                  スキーマ自体は @navaramap/material-schema）
 ```
 
 `three_plugins` は `Plugin` 基底クラスとコア API のために `navara_three` に依存し、`DefaultDescriptions` 型のために `three_default_plugin` に依存しています。各プラグインは独立しており、片方だけを使うこともできます。
@@ -32,7 +36,10 @@ import {
   OverlayPlugin,
   CesiumIonPlugin,
   TileJsonPlugin,
+  StreetLightsPlugin,
   moveOverlayElement,
+  DevtoolsPlugin,
+  MaterialSchemaPlugin,
 } from "@navaramap/three-plugins";
 ```
 
@@ -53,6 +60,18 @@ import {
 ### TileJsonPlugin
 
 TileJSON 3.0.0 ドキュメントを取得し、`addSource()` を通じて単一のラスター・ベクトル・raster-DEM（標高）タイルソースとして登録するプラグインです。タイル URL、ズーム範囲、スキーム、アトリビューション、そして raster-DEM では MapLibre 互換の `tileSize` / `encoding` をドキュメントから導出します。詳細は [TileJsonPlugin](../tilejsonplugin/) を参照してください。
+
+### StreetLightsPlugin :since[0.3.2]
+
+ベクトルタイルセットの道路と建物を、それぞれのソースとプロパティのリーダーとともに受け取り、路面を描き、ズーム 14 のタイルを位置の周辺にストリーミングして、道路に沿った街灯、リーダーが選んだ屋上の赤い灯、道路の区間を走る車を配置するプラグインです。街灯と屋上灯は `start()` に渡した Selective Effect（組み込みの Bloom など）に参加します。詳細は [StreetLightsPlugin](../streetlightsplugin/) を参照してください。
+
+### DevtoolsPlugin :since[0.3.2]
+
+1 つのパネルにまとめた開発用ツールです。プロファイラー（フレーム時間、メモリ、ダウンロード、描画バッファ）、レイヤーインスペクター（各レイヤーのコスト、表示切り替え、スタイルフォーム）、カメラインスペクター（位置、向き、視野角とそのコピー・貼り付け）を備えます。開発ビルド専用です。詳細は [DevtoolsPlugin](../devtoolsplugin/) を参照してください。
+
+### MaterialSchemaPlugin :since[0.3.2]
+
+エンジンが受け付けるすべてのレイヤーマテリアルを JSON で記述します。レイヤータイプごとのマテリアルと、各フィールドの種類、説明、デフォルト値、受け付ける値、そして変更がすぐに反映されるか、レイヤーを追加し直したときにだけ反映されるかを含みます。`describeLayer()` はレイヤー自身の値を加えるので、スタイル UI を作るのに使えます。詳細は [MaterialSchemaPlugin](../materialschemaplugin/) を参照してください。
 
 ## 使い方
 

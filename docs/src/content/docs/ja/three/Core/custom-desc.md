@@ -27,7 +27,7 @@ Descriptor の種類に応じて、対応する基底クラスを継承して実
 | `constructor(view, ctx, config)` | Descriptor 生成時                                     | ThreeView、ViewContext、設定を受け取る                                                     |
 | `onCreate()`                     | `addMesh()` / `addEffect()` / `addLight()` 呼び出し時 | ファクトリメソッドを呼び出してインスタンスを作成し、シーンに追加する。基底クラスが実装済み |
 | `onUpdateConfig(updates)`        | `handle.update()` 呼び出し時                          | 設定の部分更新を処理する                                                                   |
-| `onDestroy()`                    | `handle.delete()` 呼び出し時                          | リソースの解放とシーンからの削除                                                           |
+| `onDestroy()`                    | `handle.delete()` または `view.dispose()` 呼び出し時 | リソースの解放とシーンからの削除                                                           |
 | `update(time)`                   | 毎フレーム（オプション）                              | アニメーション処理。実装した場合のみ呼び出される                                           |
 | `onResize(width, height)`        | ビューポートリサイズ時（オプション）                  | メッシュのみ。実装した場合のみ呼び出される                                                 |
 
@@ -97,10 +97,26 @@ Descriptor の種類に応じて、対応する基底クラスを継承して実
 | `ctx.getRenderTarget()`       | メインレンダーターゲット（G-buffer を含む）を取得    |
 | `ctx.getGlobeDepthTexture()`  | ポストプロセッシング用のグローブ深度テクスチャを取得 |
 | `ctx.getGlobeNormalTexture()` | 地形のみの法線を画面座標で取得。`requiredBuffers` に `globeNormal` を宣言すること（未宣言だと 1x1 のまま） |
-| `ctx.getNormalTexture()`      | G-buffer からシーン法線テクスチャを取得              |
+| `ctx.getNormalTexture()`      | G-buffer からシーン法線テクスチャを取得。`requiredBuffers` に `normal` を宣言すること |
 | `ctx.getEffectIdsTexture()`   | G-buffer からエフェクト ID テクスチャを取得          |
 | `ctx.getEmissiveTexture()`    | G-buffer からエミッシブテクスチャを取得              |
 | `ctx.getShadowTexture()`      | G-buffer からシャドウテクスチャ（R=影の量、0=非影..1=完全な影）を取得 |
+
+#### 共有ユニフォーム
+
+各メソッドは、ビューが毎フレーム更新する `{ value }` の ref を返します。現在の `value` ではなく ref 自体をマテリアルの `uniforms` に代入すると、マテリアルが更新に追従します。
+
+| メソッド                                  | 説明 |
+| ----------------------------------------- | ---- |
+| `ctx.getGlobeDepthTextureUniform()`       | `ctx.getGlobeDepthTexture()` のテクスチャ |
+| `ctx.getGlobeNormalTextureUniform()`      | `ctx.getGlobeNormalTexture()` のテクスチャ。サンプリングするには `globeNormal` を必要なバッファとして宣言します |
+| `ctx.getSkyEnvMapTextureUniform()`        | 空の環境マップ |
+| `ctx.getWaterState()`                     | 水面のシェーダーチャンクが使うビューの水面の状態。`uniforms` は水面のマテリアルが共有するもので、`createWaves(conditions)` は 1 つの水面の波を保持します。`uniforms` を最初に読むと波のテクスチャを生成します |
+| `ctx.getViewportAndPixelRatioUniform()`   | `[width, height, pixelRatio]`。ビューポートのサイズは CSS ピクセル単位です |
+| `ctx.getFrustumNearFarUniform()`          | カメラの `[near, far]` |
+| `ctx.getFrustumRatioUniform()`            | ニア平面上でのカメラのフラスタムの `[top, bottom, right, left]` |
+| `ctx.getInverseProjectionMatrixUniform()` | カメラの逆射影行列 |
+| `ctx.getTimeUniform()`                    | `preUpdate` に渡されるフレームのタイムスタンプ |
 
 #### シャドウ（実験的）
 
@@ -113,12 +129,12 @@ Descriptor の種類に応じて、対応する基底クラスを継承して実
 
 Navara は複数のレンダーターゲット（MRT）からなる G-buffer にレンダリングします。深度・法線を利用するエフェクト（SSAO、SSR、Outline、大気透視、雲）や Selective Effect（Bloom / Outline）はこれらのアタッチメントを読み取るため、メッシュがそれらのエフェクトに参加できるのは、そのマテリアルが G-buffer に書き込む場合だけです。
 
-常に存在するのは color と normal だけです。それ以外は必要に応じて確保され、**隙間なく後ろに詰められる**ため、ロケーションは構成によって変わります。シェーダーには各バッファの `layout(location = …)` が define として渡されます。
+常に存在するのは color だけです。normal を含むそれ以外は必要に応じて確保され、**隙間なく後ろに詰められる**ため、ロケーションは構成によって変わります。シェーダーには各バッファの `layout(location = …)` が define として渡されます。
 
 | アタッチメント | ロケーション | 内容                                                         | 確保される条件            |
 | -------------- | ------------ | ------------------------------------------------------------ | ------------------------- |
 | Color          | 0            | `gl_FragColor`                                                | 常時                      |
-| Normal         | 1            | ビュー空間の法線（＋マテリアルプロパティ）                    | 常時                      |
+| Normal         | 1            | ビュー空間の法線（＋マテリアルプロパティ）                    | `buffers.normal`          |
 | Effect ID      | 可変         | Selective Effect のビットマスク                                | `buffers.selectiveEffect` |
 | Emissive       | 可変         | Selective Effect の加算エミッシブ                              | `buffers.emissive`        |
 | Shadow         | 可変         | R = 影の量（0=非影..1=完全な影）、G = albedo 出力フラグ       | `buffers.shadow`          |
@@ -239,9 +255,40 @@ view.addMesh<GlowSphereDesc>({
 
 これらのバッファをカスタムエフェクトから読み取るには、`ctx` の [バッファ / テクスチャアクセス](#バッファ--テクスチャアクセス) アクセサを使うか、[`find<MRTPassEffectDesc>("mrt")`](#他のエフェクトを参照) で他のエフェクトから MRT パスを参照します。
 
-エフェクト ID・エミッシブ・シャドウ・globeNormal のバッファはオプションです。アクティブなエフェクトが `static requiredBuffers` で宣言している間だけ存在し（例: `["selectiveEffect", "emissive"]` / `["shadow"]` / `["globeNormal"]`）、それ以外ではアクセサは `undefined` を返します。
+法線・エフェクト ID・エミッシブ・シャドウ・globeNormal のバッファはオプションです。アクティブなエフェクトが `static requiredBuffers` で宣言している（例: `["normal"]` / `["selectiveEffect", "emissive"]` / `["shadow"]` / `["globeNormal"]`）か、メッシュが要求している（[G-Buffer の要求](#g-buffer-の要求)を参照）間だけ存在し、それ以外ではアクセサは `undefined` を返します。
 
-`globeNormal` だけは性質が異なり、G-buffer のアタッチメントではなく**地形法線の画面座標コピー**です。そのためアタッチメント枠を消費せず、デバイスの `MAX_DRAW_BUFFERS` にも数えられません。未宣言の場合はコピー先が 1x1 のままで、`ctx.getGlobeNormalTexture()` が返すテクスチャは意味のあるサンプリングができません。これらを読み取るカスタムエフェクトは、ビューにバッファを確保させるため `requiredBuffers` を宣言してください。なお、確保されるバッファ構成の変更はアタッチメントの再確保とシェーダーの再コンパイルを伴うため、エフェクトは一度追加したら削除・再追加を繰り返さず、`update()` で調整してください。また構成変更でアタッチメントは再構築されるため、これらのテクスチャはパス生成時にキャッシュせず、毎フレーム（`update()` やパスの `render()` で）取得してください。
+必要なバッファが自身の設定に依存するエフェクトは、代わりに `getRequiredBuffers()` をオーバーライドします。オーバーライドは static を完全に置き換えるので、どちらか一方だけを宣言してください。`onCreate()` より前に読まれるためコンストラクタの config から結果を導き、`update()` で結果が変わるときは `ctx` に `gbufferRequirementsChanged` を emit します。view はバッファを再導出します。新しいアタッチメントがデバイスの `MAX_DRAW_BUFFERS` を超える場合、view はエラーをログに出し、以前のバッファ構成を保ちます。`addEffect()` と `addMesh()` の時点で超える場合は、そのディスクリプタのバッファがすでに確保されていない限り throw します。
+
+Selective Effect に対応するメッシュは、Selective Effect かオプションのバッファが有効な間だけ G-buffer パスで描画されます。G-buffer の出力に合成され、バッファを一つも必要としない場合があるエフェクトは、`static requiresMrtPass = true` を設定してメッシュをそこに留め、パスの半透明コンテンツと正しく前後関係を保ちます（大気透視がこれを行います）。
+
+```typescript
+import { type GBufferName } from "@navaramap/three";
+
+export class MyEffectDesc extends EffectDesc<MyEffectConfig, MyEffectUpdate, MyPostProcessingPass> {
+  static key = "myEffect";
+
+  private shadow: boolean;
+
+  constructor(view: ThreeView, ctx: ViewContext, config: MyEffectConfig) {
+    super(view, ctx, config);
+    this.shadow = config.myEffect?.shadow ?? false;
+  }
+
+  getRequiredBuffers(): readonly GBufferName[] {
+    return this.shadow ? ["normal", "shadow"] : ["normal"];
+  }
+
+  update(config: MyEffectUpdate) {
+    const shadow = config.myEffect?.shadow;
+    if (shadow !== undefined && shadow !== this.shadow) {
+      this.shadow = shadow;
+      this.ctx.emit("gbufferRequirementsChanged");
+    }
+  }
+}
+```
+
+`globeNormal` だけは性質が異なり、G-buffer のアタッチメントではなく**地形法線の画面座標コピー**です。そのため自身はアタッチメント枠を消費しません。ただし法線アタッチメントからコピーするので、要求すると `normal` も確保されます。未宣言の場合はコピー先が 1x1 のままで、`ctx.getGlobeNormalTexture()` が返すテクスチャは意味のあるサンプリングができません。これらを読み取るカスタムエフェクトやメッシュは、ビューにバッファを確保させるため宣言してください。なお、確保されるバッファ構成の変更はアタッチメントの再確保とシェーダーの再コンパイルを伴うため、エフェクトは一度追加したら削除・再追加を繰り返さず、`update()` で調整してください。また構成変更でアタッチメントは再構築されるため、これらのテクスチャはパス生成時にキャッシュせず、毎フレーム（`update()` やパスの `render()` で）取得してください。
 
 サンプリング時に注意すべきエンコーディング:
 
@@ -292,6 +339,54 @@ type MyMeshUpdate = MeshUpdate & MyMeshDescription;
 | `"mrt"`         | Selective Effect 用（Bloom / Outline） |
 | `"skyEnvMap"`   | 環境マップ用                                |
 | `"draped"`      | 地形ドレープレンダリング用                  |
+
+`"draped"` パスでは、`DrapedMesh` のボリュームが地面と交わる部分が地形に貼り付けて描画されます。`MeshLambertMaterial` のようなライティングありの組み込みマテリアルは、各ピクセルの下の地形の法線と位置で陰影が付きます。カスタムの `ShaderMaterial` は自身のボリュームの上で陰影が付きます。`DrapedMesh` はドレープ中は影を落としません。
+
+### G-Buffer の要求
+
+マテリアルがオプションのバッファ（たとえば [`ctx.getGlobeNormalTextureUniform()`](#共有ユニフォーム) のテクスチャ）をサンプリングするメッシュは、`getRequiredBuffers()` をオーバーライドしてそれを宣言します。ビューは、アクティブなエフェクトとメッシュが要求したバッファの和集合を確保します。
+
+既定では、`"draped"` パスのメッシュはライティングありのマテリアルの陰影に使う `globeNormal` を要求し、それ以外のメッシュは何も要求しません。ライティングなしのマテリアル、または `setDrapeGroundNormals(material, false)` で楕円体の法線を使うようにしたマテリアルでドレープするメッシュは、`[]` を返すと地形法線の全画面コピーを省けます。
+
+`getRequiredBuffers()` は `onCreate()` より前に読まれるため、コンストラクタの設定から結果を導いてください。`update()` で結果が変わるときは、`ctx` に `gbufferRequirementsChanged` を emit してください。メッシュが `"draped"` パスに入るときと出るときは、自動的に emit されます。
+
+```typescript
+import ThreeView, {
+  MeshDesc,
+  type GBufferName,
+  type MeshConfig,
+  type MeshUpdate,
+  type ViewContext,
+} from "@navaramap/three";
+import type { Mesh } from "three";
+
+type MyMeshConfig = MeshConfig & { myMesh?: { groundShading?: boolean } };
+type MyMeshUpdate = MeshUpdate & { myMesh?: { groundShading?: boolean } };
+
+class MyMeshDesc extends MeshDesc<MyMeshConfig, MyMeshUpdate, Mesh> {
+  private groundShading: boolean;
+
+  constructor(view: ThreeView, ctx: ViewContext, config: MyMeshConfig) {
+    super(view, ctx, config);
+    this.groundShading = config.myMesh?.groundShading ?? false;
+  }
+
+  override getRequiredBuffers(): readonly GBufferName[] {
+    return this.groundShading ? ["globeNormal"] : [];
+  }
+
+  onUpdateConfig(updates: MyMeshUpdate): void {
+    const groundShading = updates.myMesh?.groundShading;
+    if (groundShading !== undefined && groundShading !== this.groundShading) {
+      this.groundShading = groundShading;
+      this.ctx.emit("gbufferRequirementsChanged");
+    }
+    super.onUpdateConfig(updates);
+  }
+
+  // createMesh() は省略
+}
+```
 
 ### 実装例
 
@@ -649,6 +744,10 @@ createPass() {
   // ...
 }
 ```
+
+### 破棄
+
+エフェクトが削除されると（`handle.delete()`、または `view.dispose()` で追加済みのすべての Descriptor）、基底クラスの `onDestroy()` がパスをパイプラインから外して破棄します。インスタンスの `dispose()` を呼び、`dispose()` を持たないラッパーの場合は `raw.dispose()` を呼びます。postprocessing のパスの `dispose()` は、パス自身とそのエフェクトのプロパティにあるレンダーターゲット、マテリアル、テクスチャを解放するため、それらを所有するパスを返してください。他のエフェクトと共有するテクスチャ（`find()` で得た MRT バッファなど）は、パスやそのエフェクトのプロパティではなく uniform に持たせてください。
 
 ## カスタムライト
 

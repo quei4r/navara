@@ -12,12 +12,14 @@ use geozero::GeomProcessor;
 use geozero::mvt::{Message, Tile as MvtTile, process_geom, tile};
 use navara_core::{CRS, TileXYZ, WGS84_64};
 use navara_geometry::{
-    Hierarchy, WindingOrder, is_closed_flat_ring, open_ring_len, tile_ring_boundary_runs,
+    Hierarchy, WindingOrder, is_closed_flat_ring, open_ring_len, pole_of_inaccessibility,
+    tile_ring_boundary_runs,
 };
 use navara_math::{FloatType, Vec3};
 
-use super::config::{LayerParseConfig, LayerParseKind, PointEmitter};
+use super::config::{LayerParseConfig, LayerParseKind, LineAnchors, PointEmitter, PolygonAnchors};
 use super::pos_converter::PosConverter;
+use crate::line_placement::{AlongLine, LinePath, push_anchor_line_data, tangent_to_bearing};
 
 // ============================================================================
 // Output types
@@ -35,6 +37,16 @@ pub enum ParsedGeometry {
         batch_indices: Vec<u32>,
         /// RTC-encoded positions relative to the tile center (3 f32 per vertex).
         encoded_coords: Vec<f32>,
+        /// Tangent bearing at each anchor, in degrees clockwise from north.
+        /// Empty unless the emitter placed its anchors along a line.
+        bearings: Vec<f32>,
+        /// `SCALE_BAND_STRIDE` scalars per anchor — see the `GeomBuf` variant.
+        scale_bands: Vec<f32>,
+        /// `PATH_SAMPLES` east/north metre offsets per anchor (stride
+        /// `2 * PATH_SAMPLES`). Empty unless this is along-line text.
+        path_samples: Vec<f32>,
+        /// `PATH_META_STRIDE` scalars per anchor — see the `GeomBuf` variant.
+        path_meta: Vec<f32>,
     },
     Polylines {
         points: Vec<f64>,
@@ -128,6 +140,22 @@ enum GeomBuf {
         coords: Vec<Vec3>,
         batch_indices: Vec<u32>,
         encoded_coords: Vec<f32>,
+        /// Tangent bearing at each anchor, in degrees clockwise from north.
+        /// Empty until the first along-line anchor; from then on the same
+        /// length as `coords`, with plain anchors (points, polygon labels)
+        /// back-filled by `push_anchor_line_data`.
+        bearings: Vec<f32>,
+        /// `SCALE_BAND_STRIDE` scalars per anchor: the `(min, max]` ground
+        /// metres per screen pixel over which it is shown. Filled exactly when
+        /// `bearings` is.
+        scale_bands: Vec<f32>,
+        /// `PATH_SAMPLES` east/north metre offsets per anchor (stride
+        /// `2 * PATH_SAMPLES`), for bending glyphs along the line. Text only.
+        path_samples: Vec<f32>,
+        /// `PATH_META_STRIDE` scalars per anchor: the metres between adjacent
+        /// path samples, then how far the real line runs either side of the
+        /// anchor.
+        path_meta: Vec<f32>,
     },
     Polylines {
         points: Vec<f64>,
@@ -155,6 +183,10 @@ impl GeomBuf {
                     coords: Vec::new(),
                     batch_indices: Vec::new(),
                     encoded_coords: Vec::new(),
+                    bearings: Vec::new(),
+                    scale_bands: Vec::new(),
+                    path_samples: Vec::new(),
+                    path_meta: Vec::new(),
                 }
             }
             LayerParseKind::Polyline => GeomBuf::Polylines {
@@ -182,10 +214,18 @@ impl GeomBuf {
                 coords,
                 batch_indices,
                 encoded_coords,
+                bearings,
+                scale_bands,
+                path_samples,
+                path_meta,
             } => ParsedGeometry::Points {
                 coords,
                 batch_indices,
                 encoded_coords,
+                bearings,
+                scale_bands,
+                path_samples,
+                path_meta,
             },
             GeomBuf::Polylines {
                 points,
@@ -288,13 +328,13 @@ impl LayerAccum<'_> {
 
 /// Which source geometry a point is being emitted from, selecting the matching
 /// opt-in flag on a [`PointEmitter`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PointSource {
     /// Native point/multipoint geometry.
     Points,
-    /// Derived from line-string vertices.
+    /// Derived from line-strings.
     Lines,
-    /// Derived from polygon-ring vertices.
+    /// Derived from polygons.
     Polygons,
 }
 
@@ -305,6 +345,21 @@ impl PointSource {
             PointSource::Lines => emitter.from_lines,
             PointSource::Polygons => emitter.from_polygons,
         }
+    }
+
+    /// Whether `emitter` takes one anchor per vertex of this source.
+    fn per_vertex(self, emitter: &PointEmitter) -> bool {
+        self.enabled(emitter)
+            && match self {
+                PointSource::Points => true,
+                PointSource::Lines => emitter.line_anchors() == LineAnchors::Vertices,
+                PointSource::Polygons => emitter.polygon_anchors() == PolygonAnchors::Vertices,
+            }
+    }
+
+    /// Whether `emitter` resamples this source's paths along their length.
+    fn along_line(self, emitter: &PointEmitter) -> bool {
+        self != PointSource::Points && self.enabled(emitter) && emitter.placement.is_along_line()
     }
 }
 
@@ -319,6 +374,22 @@ const PROJECTIONS: usize = 2;
 fn projection_of(config: &LayerParseConfig) -> usize {
     if config.flat { FLAT } else { GEOGRAPHIC }
 }
+
+/// Nominal CSS pixels across a vector tile. MVT geometry arrives in `extent`
+/// units, so `extent / TILE_SIZE_PX` turns a pixel spacing into tile units —
+/// the ratio MapLibre calls `tilePixelRatio` when resolving `symbol-spacing`.
+const TILE_SIZE_PX: f64 = 512.0;
+
+/// Zoom levels past the tile's own for which along-line anchors are generated.
+///
+/// Spacing is resolved on screen, per anchor, so a tile needs anchors dense
+/// enough for the closest it is drawn: up to a zoom or so past its own in a
+/// flat view, further in a pitched one, and at any depth once overscaled past
+/// the source's `maxZoom`. The gap on screen stays under twice `spacing` while
+/// the tile is drawn no more than `FINER_LEVELS + 1` zooms past its own;
+/// beyond that anchors sit further apart than `spacing` asks. Each level
+/// doubles the anchor count.
+const FINER_LEVELS: i32 = 2;
 
 /// Vertex buffers for a single projection mode, shared by every layer using it.
 #[derive(Default)]
@@ -353,6 +424,9 @@ struct MvtFeatureProcessor<'a> {
     /// always project geographically, so the flat-projected buffer cannot be
     /// reused for them.
     raw_ring: Vec<(f64, f64)>,
+    /// Raw rings of the current polygon (outer first), kept until the polygon
+    /// ends when an emitter labels it once at its pole of inaccessibility.
+    polygon_rings: Vec<Vec<(f64, f64)>>,
 
     // --- Dispatch tables, derived from the configs once per MVT sublayer. ---
     /// Every layer's point emitters as `(layer index, emitter)` pairs.
@@ -369,8 +443,22 @@ struct MvtFeatureProcessor<'a> {
     derive_points_from_points: bool,
     /// Whether any point emitter derives from line-string vertices.
     derive_points_from_lines: bool,
-    /// Whether any point emitter derives from polygon-ring vertices.
+    /// Whether any of those emitters wants one anchor *per vertex*. When every
+    /// line emitter places along the line instead, the per-vertex walk is
+    /// skipped entirely rather than projecting each vertex for nobody.
+    derive_points_per_vertex_from_lines: bool,
+    /// Whether any of those emitters places anchors along the line.
+    derive_points_along_lines: bool,
+    /// Whether any of those emitters labels each line once, at its start.
+    derive_line_start_points: bool,
+    /// Whether any point emitter derives from polygons.
     derive_points_from_polygons: bool,
+    /// Whether any of those emitters wants one anchor per ring vertex.
+    derive_points_per_vertex_from_polygons: bool,
+    /// Whether any of those emitters places anchors along the rings.
+    derive_points_along_rings: bool,
+    /// Whether any of those emitters labels each polygon once.
+    derive_polygon_label_points: bool,
     /// Whether any layer's derived boundary polylines render as real (non-draped)
     /// geometry, which requires splitting rings at tile-clip edges (the raw ring
     /// is collected alongside `projected` for the split).
@@ -394,7 +482,13 @@ impl<'a> MvtFeatureProcessor<'a> {
         let mut projection_used = [false; PROJECTIONS];
         let mut derive_points_from_points = false;
         let mut derive_points_from_lines = false;
+        let mut derive_points_per_vertex_from_lines = false;
+        let mut derive_points_along_lines = false;
+        let mut derive_line_start_points = false;
         let mut derive_points_from_polygons = false;
+        let mut derive_points_per_vertex_from_polygons = false;
+        let mut derive_points_along_rings = false;
+        let mut derive_polygon_label_points = false;
         let mut derive_boundary_runs = false;
 
         for (index, config) in configs.iter().enumerate() {
@@ -403,7 +497,15 @@ impl<'a> MvtFeatureProcessor<'a> {
                 emitters.push((index, *emitter));
                 derive_points_from_points |= emitter.from_points;
                 derive_points_from_lines |= emitter.from_lines;
+                derive_points_per_vertex_from_lines |= PointSource::Lines.per_vertex(emitter);
+                derive_points_along_lines |= PointSource::Lines.along_line(emitter);
+                derive_line_start_points |=
+                    emitter.from_lines && emitter.line_anchors() == LineAnchors::Start;
                 derive_points_from_polygons |= emitter.from_polygons;
+                derive_points_per_vertex_from_polygons |= PointSource::Polygons.per_vertex(emitter);
+                derive_points_along_rings |= PointSource::Polygons.along_line(emitter);
+                derive_polygon_label_points |= emitter.from_polygons
+                    && emitter.polygon_anchors() == PolygonAnchors::LabelPoint;
             }
             if config.polyline {
                 line_consumers[projection].push(index);
@@ -435,6 +537,7 @@ impl<'a> MvtFeatureProcessor<'a> {
             in_point: false,
             in_polygon: false,
             raw_ring: Vec::new(),
+            polygon_rings: Vec::new(),
             emitters,
             line_consumers,
             polygon_consumers,
@@ -442,7 +545,13 @@ impl<'a> MvtFeatureProcessor<'a> {
             projection_used,
             derive_points_from_points,
             derive_points_from_lines,
+            derive_points_per_vertex_from_lines,
+            derive_points_along_lines,
+            derive_line_start_points,
             derive_points_from_polygons,
+            derive_points_per_vertex_from_polygons,
+            derive_points_along_rings,
+            derive_polygon_label_points,
             derive_boundary_runs,
             height_cache: Vec::new(),
         }
@@ -470,7 +579,14 @@ impl<'a> MvtFeatureProcessor<'a> {
     }
 
     /// Push one already-projected point into layer `index`'s group for `kind`.
-    fn push_point(&mut self, index: usize, kind: LayerParseKind, coords: Vec3, world_pos: Vec3) {
+    fn push_point(
+        &mut self,
+        index: usize,
+        kind: LayerParseKind,
+        coords: Vec3,
+        world_pos: Vec3,
+        line: Option<AlongLine>,
+    ) {
         let rtc = [
             (world_pos.x - self.rtc_center.x) as f32,
             (world_pos.y - self.rtc_center.y) as f32,
@@ -481,8 +597,20 @@ impl<'a> MvtFeatureProcessor<'a> {
             coords: c,
             batch_indices,
             encoded_coords,
+            bearings,
+            scale_bands,
+            path_samples,
+            path_meta,
         } = &mut self.layers[index].groups[group_index].geom
         {
+            push_anchor_line_data(
+                c.len(),
+                bearings,
+                scale_bands,
+                path_samples,
+                path_meta,
+                line,
+            );
             c.push(coords);
             batch_indices.push(batch_index);
             encoded_coords.extend_from_slice(&rtc);
@@ -515,7 +643,10 @@ impl<'a> MvtFeatureProcessor<'a> {
         self.height_cache.clear();
         for i in 0..self.emitters.len() {
             let (index, emitter) = self.emitters[i];
-            if !source.enabled(&emitter) {
+            // Along-line emitters resample whole paths and polygon labels need
+            // the whole polygon, so both are driven separately
+            // (`emit_line_placed_points`, `emit_polygon_label_points`).
+            if !source.per_vertex(&emitter) {
                 continue;
             }
             let world_pos = match self.height_cache.iter().find(|(h, _)| *h == emitter.height) {
@@ -526,7 +657,7 @@ impl<'a> MvtFeatureProcessor<'a> {
                     world_pos
                 }
             };
-            self.push_point(index, emitter.kind, coords, world_pos);
+            self.push_point(index, emitter.kind, coords, world_pos, None);
         }
     }
 
@@ -548,12 +679,136 @@ impl<'a> MvtFeatureProcessor<'a> {
         } else {
             ring.len()
         };
-        for &(x, y) in &ring[..count] {
-            self.emit_points(x, y, source);
+        let per_vertex = if is_polygon_ring {
+            self.derive_points_per_vertex_from_polygons
+        } else {
+            self.derive_points_per_vertex_from_lines
+        };
+        if per_vertex {
+            for &(x, y) in &ring[..count] {
+                self.emit_points(x, y, source);
+            }
+        }
+        // Along-line placement needs the vertices as a connected path, which is
+        // exactly what `raw_ring` still holds here. A polygon ring is walked
+        // around and back to its start, skipping the edges tile clipping cut,
+        // which would otherwise run labels along the tile's outline.
+        if !is_polygon_ring {
+            if self.derive_points_along_lines {
+                self.emit_line_placed_points(&ring[..count], source);
+            }
+            if self.derive_line_start_points {
+                self.emit_label_point(ring[0], |e| {
+                    e.from_lines && e.line_anchors() == LineAnchors::Start
+                });
+            }
+        } else if self.derive_points_along_rings {
+            let extent = self.converter.extent();
+            for run in tile_ring_boundary_runs(ring[..count].iter().copied(), extent) {
+                let path: Vec<(f64, f64)> = run.iter().map(|&i| ring[i]).collect();
+                self.emit_line_placed_points(&path, source);
+            }
+        }
+        if is_polygon_ring && self.derive_polygon_label_points {
+            self.polygon_rings.push(ring[..count].to_vec());
         }
         // Hand the buffer (and its capacity) back for the next ring.
         self.raw_ring = ring;
         self.raw_ring.clear();
+    }
+
+    /// Emit one anchor for the polygon just closed, at its pole of
+    /// inaccessibility, for every emitter that labels polygons once.
+    ///
+    /// The search stops within a pixel at this tile's own zoom, as MapLibre's
+    /// does. Each tile holds only its clipped piece of a polygon and labels
+    /// that piece; a label landing in the tile's buffer belongs to the
+    /// neighbour's piece and is dropped, as along-line anchors are.
+    fn emit_polygon_label_points(&mut self) {
+        let rings = std::mem::take(&mut self.polygon_rings);
+        let extent = self.converter.extent();
+        if let Some(point) = pole_of_inaccessibility(&rings, extent / TILE_SIZE_PX) {
+            self.emit_label_point(point, |e| {
+                e.from_polygons && e.polygon_anchors() == PolygonAnchors::LabelPoint
+            });
+        }
+        // Hand the buffer (and its capacity) back for the next polygon.
+        self.polygon_rings = rings;
+        self.polygon_rings.clear();
+    }
+
+    /// Emit one anchor at `(x, y)` (tile units) for every emitter `wants`
+    /// picks: a feature's single label, at a polygon's label point or a line's
+    /// start. Dropped when it lands in the tile's buffer, as MapLibre drops a
+    /// symbol outside its tile: there it belongs to the neighbouring tile's
+    /// piece of the feature, or is where tile clipping cut the line rather than
+    /// where the line starts.
+    fn emit_label_point(&mut self, (x, y): (f64, f64), wants: impl Fn(&PointEmitter) -> bool) {
+        let extent = self.converter.extent();
+        if !(0.0..extent).contains(&x) || !(0.0..extent).contains(&y) {
+            return;
+        }
+        let (px, py) = self.converter.project_point(x, y);
+        let coords = Vec3::new(px, py, 0.0 as FloatType);
+        for i in 0..self.emitters.len() {
+            let (index, emitter) = self.emitters[i];
+            if !wants(&emitter) {
+                continue;
+            }
+            let world_pos = CRS::Geographic.to_vec3(WGS84_64, coords, emitter.height);
+            self.push_point(index, emitter.kind, coords, world_pos, None);
+        }
+    }
+
+    /// Emit anchors spaced along a path for every emitter whose placement
+    /// resamples `source`'s paths.
+    ///
+    /// The cumulative arc length is built once and shared across emitters;
+    /// emitters differing only in `spacing_px` then cost one walk each.
+    fn emit_line_placed_points(&mut self, verts: &[(f64, f64)], source: PointSource) {
+        let Some(path) = LinePath::new(verts) else {
+            return; // Degenerate: fewer than two vertices, or all coincide.
+        };
+
+        let extent = self.converter.extent();
+        let tile_px_ratio = extent / TILE_SIZE_PX;
+
+        for i in 0..self.emitters.len() {
+            let (index, emitter) = self.emitters[i];
+            if !source.along_line(&emitter) {
+                continue;
+            }
+            let spacing_px = emitter.spacing_px as f64;
+            let finest = spacing_px * tile_px_ratio / 2f64.powi(FINER_LEVELS);
+            // Only text bends its glyphs along the line; a sprite is one quad
+            // at the anchor and needs nothing but the tangent bearing.
+            let wants_path = emitter.kind == LayerParseKind::Text;
+
+            for anchor in path.anchors(emitter.placement, finest, wants_path) {
+                let (pos, tangent) = path.sample(anchor.s);
+                // An anchor in the tile's buffer belongs to the neighbouring
+                // tile, which labels its own piece of the line. MapLibre drops
+                // these the same way (`addSymbolAtAnchor`).
+                if !(0.0..extent).contains(&pos.0) || !(0.0..extent).contains(&pos.1) {
+                    continue;
+                }
+                let (px, py) = self.converter.project_point(pos.0, pos.1);
+                let coords = Vec3::new(px, py, 0.0 as FloatType);
+                let world_pos = CRS::Geographic.to_vec3(WGS84_64, coords, emitter.height);
+
+                // Mercator's scale distortion is latitude-dependent, so the
+                // conversion uses this anchor's own latitude rather than the
+                // tile's — a tile spans several degrees at low zoom.
+                let meters_per_unit = self.converter.ground_meters_per_unit(coords.y);
+                let line = AlongLine {
+                    bearing: tangent_to_bearing(tangent),
+                    scale_band: anchor.scale_band(meters_per_unit, spacing_px),
+                    path: wants_path
+                        .then(|| path.anchor_path(anchor.s, anchor.path_spacing, meters_per_unit)),
+                };
+                self.push_point(index, emitter.kind, coords, world_pos, Some(line));
+            }
+        }
     }
 
     /// Push one polyline into layer `index`'s polyline group. `ring` marks a
@@ -853,10 +1108,14 @@ impl GeomProcessor for MvtFeatureProcessor<'_> {
             self.rings[projection].outer_ring.clear();
             self.rings[projection].holes.clear();
         }
+        self.polygon_rings.clear();
         Ok(())
     }
 
     fn polygon_end(&mut self, _tagged: bool, _idx: usize) -> geozero::error::Result<()> {
+        if self.derive_polygon_label_points {
+            self.emit_polygon_label_points();
+        }
         self.accumulate_polygon();
         self.in_polygon = false;
         Ok(())
@@ -969,6 +1228,7 @@ fn parse_layer(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::line_placement::{PATH_META_STRIDE, PATH_SAMPLES, PointPlacement};
 
     /// Encode a zigzag integer (MVT spec parameter encoding).
     fn zigzag(n: i32) -> u32 {
@@ -1060,18 +1320,21 @@ mod test {
     /// A polygon feature with an outer ring followed by hole rings.
     fn polygon_with_holes_feature(rings: &[&[(i32, i32)]], tags: Vec<u32>) -> tile::Feature {
         let mut geometry = Vec::new();
+        // Every MoveTo/LineTo is relative to the cursor, which carries over
+        // from the previous ring's last vertex.
+        let mut cursor = (0, 0);
         for ring in rings {
             if let Some(&(x0, y0)) = ring.first() {
                 geometry.push(command(1, 1));
-                geometry.push(zigzag(x0));
-                geometry.push(zigzag(y0));
+                geometry.push(zigzag(x0 - cursor.0));
+                geometry.push(zigzag(y0 - cursor.1));
+                cursor = (x0, y0);
                 if ring.len() > 1 {
                     geometry.push(command(2, (ring.len() - 1) as u32));
-                    let mut prev = (x0, y0);
                     for &(x, y) in &ring[1..] {
-                        geometry.push(zigzag(x - prev.0));
-                        geometry.push(zigzag(y - prev.1));
-                        prev = (x, y);
+                        geometry.push(zigzag(x - cursor.0));
+                        geometry.push(zigzag(y - cursor.1));
+                        cursor = (x, y);
                     }
                 }
                 geometry.push(command(7, 1));
@@ -1112,6 +1375,8 @@ mod test {
             from_points: true,
             from_lines: false,
             from_polygons: false,
+            placement: PointPlacement::Point,
+            spacing_px: 250.0,
         }
     }
 
@@ -1172,6 +1437,7 @@ mod test {
                 coords,
                 batch_indices,
                 encoded_coords,
+                ..
             } => {
                 assert_eq!(coords.len(), 2);
                 assert_eq!(batch_indices, &vec![0, 1]);
@@ -1572,6 +1838,419 @@ mod test {
         match &groups[0].geometry {
             ParsedGeometry::Points { coords, .. } => {
                 assert_eq!(coords.len(), 3);
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn point_placed_labels_mark_a_line_once_at_its_start_inside_the_tile() {
+        // As MapLibre places a symbol at a point on a line: once, at the first
+        // vertex, and not at all when that vertex is in the tile's buffer,
+        // where clipping cut the line rather than where it starts.
+        let mut config = point_config();
+        config.point_emitters[0].kind = LayerParseKind::Billboard;
+        config.point_emitters[0].from_points = false;
+        config.point_emitters[0].from_lines = true;
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![
+                linestring_feature(&[(10, 10), (50, 50), (100, 0)], vec![]),
+                linestring_feature(&[(-20, 100), (50, 100), (90, 120)], vec![]),
+            ],
+        )]);
+        let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[config]);
+        assert_eq!(groups.len(), 1);
+        match &groups[0].geometry {
+            ParsedGeometry::Points { coords, .. } => assert_eq!(coords.len(), 1),
+            _ => panic!("expected points"),
+        }
+    }
+
+    /// A config whose single emitter places anchors along lines, with
+    /// `spacing_px` scaled so the finest level repeats every `finest_tile` tile
+    /// units at the test tile's extent (4096 over a nominal 512px tile, i.e. 8
+    /// tile units per pixel).
+    fn line_placed_config(placement: PointPlacement, finest_tile: f64) -> LayerParseConfig {
+        let mut config = point_config();
+        config.point_emitters[0].from_points = false;
+        config.point_emitters[0].from_lines = true;
+        config.point_emitters[0].placement = placement;
+        config.point_emitters[0].spacing_px = (finest_tile * 2f64.powi(FINER_LEVELS) / 8.0) as f32;
+        config
+    }
+
+    #[test]
+    fn line_placement_nests_anchors_around_the_midpoint() {
+        // 1000 tile units along the equator, finest level every 100: positions
+        // at 100..900, each shown up to the coarsest level it belongs to.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(&[(0, 2048), (1000, 2048)], vec![])],
+        )]);
+        let groups = parse_mvt_tile(
+            &bin,
+            xyz(),
+            Vec3::ZERO,
+            &[line_placed_config(PointPlacement::Line, 100.0)],
+        );
+        assert_eq!(groups.len(), 1);
+        match &groups[0].geometry {
+            ParsedGeometry::Points {
+                coords,
+                scale_bands,
+                ..
+            } => {
+                assert_eq!(coords.len(), 9);
+                let max: Vec<f32> = (0..9).map(|a| scale_bands[a * 2 + 1]).collect();
+                assert!((0..9).all(|a| scale_bands[a * 2] == 0.0));
+                // The finest level is `FINER_LEVELS` zooms past the tile's
+                // own, in ground metres per pixel at the equator.
+                let finest = (40_075_016.685_578_49 / 512.0 / 2f64.powi(FINER_LEVELS)) as f32;
+                for a in [1, 3, 5, 7] {
+                    assert!((max[a] - finest).abs() < finest * 1e-4, "{max:?}");
+                }
+                for a in [0, 2, 6, 8] {
+                    assert!((max[a] - 2.0 * finest).abs() < finest * 1e-4, "{max:?}");
+                }
+                assert_eq!(max[4], f32::INFINITY);
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn line_placement_drops_anchors_in_the_tile_buffer() {
+        // The line starts 64 units into the left neighbour's side of the
+        // buffer. Of the 21 positions every 50 units along its 1064, the first
+        // lands at x = -32: the neighbouring tile's to draw, not this one's.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(&[(-64, 100), (1000, 100)], vec![])],
+        )]);
+        let groups = parse_mvt_tile(
+            &bin,
+            xyz(),
+            Vec3::ZERO,
+            &[line_placed_config(PointPlacement::Line, 50.0)],
+        );
+        match &groups[0].geometry {
+            ParsedGeometry::Points { coords, .. } => {
+                assert_eq!(coords.len(), 20);
+                // Tile x 0 is longitude -180 at z0.
+                assert!(coords.iter().all(|c| c.x > -180.0), "{coords:?}");
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn line_placement_falls_back_to_the_midpoint_for_short_lines() {
+        // Shorter than one interval: a named road still deserves its one label
+        // rather than none at all.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(&[(0, 0), (50, 0)], vec![])],
+        )]);
+        let groups = parse_mvt_tile(
+            &bin,
+            xyz(),
+            Vec3::ZERO,
+            &[line_placed_config(PointPlacement::Line, 1000.0)],
+        );
+        match &groups[0].geometry {
+            ParsedGeometry::Points { coords, .. } => assert_eq!(coords.len(), 1),
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn line_center_placement_emits_one_anchor_however_long_the_line() {
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(&[(0, 0), (4000, 0)], vec![])],
+        )]);
+        let groups = parse_mvt_tile(
+            &bin,
+            xyz(),
+            Vec3::ZERO,
+            &[line_placed_config(PointPlacement::LineCenter, 100.0)],
+        );
+        match &groups[0].geometry {
+            ParsedGeometry::Points { coords, .. } => assert_eq!(coords.len(), 1),
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn line_placement_bearings_follow_the_line() {
+        // An L: east along the first leg, then south down the second. Tile y
+        // grows downward, so +y is south and the bearings are 90° and 180°.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(
+                &[(0, 0), (1000, 0), (1000, 600)],
+                vec![],
+            )],
+        )]);
+        let groups = parse_mvt_tile(
+            &bin,
+            xyz(),
+            Vec3::ZERO,
+            &[line_placed_config(PointPlacement::Line, 400.0)],
+        );
+        match &groups[0].geometry {
+            ParsedGeometry::Points {
+                coords, bearings, ..
+            } => {
+                // Anchors at arc length 400, 800, 1200 of 1600.
+                assert_eq!(coords.len(), 3);
+                assert_eq!(bearings.len(), 3);
+                assert!((bearings[0] - 90.0).abs() < 1e-3, "{:?}", bearings);
+                assert!((bearings[1] - 90.0).abs() < 1e-3, "{:?}", bearings);
+                assert!((bearings[2] - 180.0).abs() < 1e-3, "{:?}", bearings);
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn point_placement_emits_no_bearings() {
+        let mut config = point_config();
+        config.point_emitters[0].from_lines = true;
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(&[(0, 0), (50, 50), (100, 0)], vec![])],
+        )]);
+        let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[config]);
+        match &groups[0].geometry {
+            ParsedGeometry::Points {
+                coords, bearings, ..
+            } => {
+                assert_eq!(coords.len(), 3);
+                assert!(bearings.is_empty());
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn line_placement_samples_a_path_for_text_only() {
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(&[(0, 0), (2000, 0)], vec![])],
+        )]);
+
+        // A text emitter bends its glyphs along the line, so it gets a path.
+        let mut text = line_placed_config(PointPlacement::Line, 500.0);
+        text.point_emitters[0].kind = LayerParseKind::Text;
+        let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[text]);
+        match &groups[0].geometry {
+            ParsedGeometry::Points {
+                coords,
+                path_samples,
+                path_meta,
+                ..
+            } => {
+                // Positions at 500/1000/1500; the midpoint belongs to three
+                // levels, and gets an anchor with its own path for each.
+                assert_eq!(coords.len(), 5);
+                assert_eq!(path_meta.len(), 5 * PATH_META_STRIDE);
+                assert_eq!(path_samples.len(), 5 * 2 * PATH_SAMPLES);
+                // The line runs due east, so every sample sits on the east
+                // axis with zero northing, and the eastings increase by one
+                // step. Samples are relative to the anchor, so the middle pair
+                // straddles zero.
+                let first = &path_samples[..2 * PATH_SAMPLES];
+                for k in 0..PATH_SAMPLES {
+                    assert!(first[k * 2 + 1].abs() < 1e-3, "northing at {k}");
+                }
+                let step = path_meta[0];
+                assert!(step > 0.0);
+                for k in 1..PATH_SAMPLES {
+                    let d = first[k * 2] - first[(k - 1) * 2];
+                    assert!(
+                        (d - step).abs() < step * 1e-3,
+                        "spacing at {k}: {d} vs {step}"
+                    );
+                }
+                // The distance to the nearer end runs 500/1000/1000/1000/500
+                // — the outer two have half the room for a label.
+                let extent: Vec<f32> = (0..5)
+                    .map(|a| path_meta[a * PATH_META_STRIDE + 1])
+                    .collect();
+                assert!(extent[0] > 0.0);
+                assert!((extent[0] - extent[4]).abs() < extent[0] * 1e-3);
+                for a in 1..4 {
+                    assert!((extent[a] - extent[0] * 2.0).abs() < extent[0] * 1e-3);
+                }
+                // Each midpoint anchor's path spans its own level: 1x, 2x, 4x.
+                let steps: Vec<f32> = (1..4).map(|a| path_meta[a * PATH_META_STRIDE]).collect();
+                assert!((steps[1] - steps[0] * 2.0).abs() < steps[0] * 1e-3);
+                assert!((steps[2] - steps[0] * 4.0).abs() < steps[0] * 1e-3);
+            }
+            _ => panic!("expected points"),
+        }
+
+        // A sprite is one quad at the anchor: the tangent bearing is all it
+        // needs, and a path would be pure waste.
+        let sprite = line_placed_config(PointPlacement::Line, 500.0);
+        let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[sprite]);
+        match &groups[0].geometry {
+            ParsedGeometry::Points {
+                bearings,
+                path_samples,
+                path_meta,
+                ..
+            } => {
+                assert_eq!(bearings.len(), 3);
+                assert!(path_samples.is_empty());
+                assert!(path_meta.is_empty());
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn line_placement_extrapolates_a_path_past_the_line_ends() {
+        // The line is far shorter than one path span, so most samples fall off
+        // its ends. They must continue along the end tangent rather than pile
+        // up on the endpoint, which would give the shader a zero-length segment
+        // to normalize.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![linestring_feature(&[(0, 0), (40, 0)], vec![])],
+        )]);
+        let mut config = line_placed_config(PointPlacement::Line, 2000.0);
+        config.point_emitters[0].kind = LayerParseKind::Text;
+        let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[config]);
+        match &groups[0].geometry {
+            ParsedGeometry::Points {
+                path_samples,
+                path_meta,
+                ..
+            } => {
+                let step = path_meta[0];
+                for k in 1..PATH_SAMPLES {
+                    let d = path_samples[k * 2] - path_samples[(k - 1) * 2];
+                    assert!(
+                        (d - step).abs() < step * 1e-3,
+                        "extrapolated spacing at {k}: {d} vs {step}"
+                    );
+                }
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    /// A config whose single `kind` emitter derives from polygons only.
+    fn polygon_anchor_config(kind: LayerParseKind, placement: PointPlacement) -> LayerParseConfig {
+        let mut config = line_placed_config(placement, 100.0);
+        config.point_emitters[0].kind = kind;
+        config.point_emitters[0].from_lines = false;
+        config.point_emitters[0].from_polygons = true;
+        config
+    }
+
+    /// Longitude of tile x `x` on the z0 test tile (extent 4096).
+    fn lon_of(x: f64) -> f64 {
+        x * 360.0 / 4096.0 - 180.0
+    }
+
+    #[test]
+    fn labels_mark_each_polygon_once_at_its_pole() {
+        // Two squares of one multipolygon feature: one anchor each, at its
+        // center, with no along-line data.
+        for kind in [LayerParseKind::Text, LayerParseKind::Billboard] {
+            let bin = encode_tile(vec![make_layer(
+                "l",
+                vec![polygon_with_holes_feature(
+                    &[
+                        &[(1000, 1000), (2000, 1000), (2000, 2000), (1000, 2000)],
+                        &[(3000, 1000), (3500, 1000), (3500, 1500), (3000, 1500)],
+                    ],
+                    vec![],
+                )],
+            )]);
+            let config = polygon_anchor_config(kind, PointPlacement::Point);
+            let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[config]);
+            match &groups[0].geometry {
+                ParsedGeometry::Points {
+                    coords, bearings, ..
+                } => {
+                    assert_eq!(coords.len(), 2, "{kind:?}");
+                    assert!(bearings.is_empty());
+                    let unit = lon_of(1.0) - lon_of(0.0);
+                    assert!((coords[0].x - lon_of(1500.0)).abs() < unit);
+                    assert!((coords[1].x - lon_of(3250.0)).abs() < unit);
+                }
+                _ => panic!("expected points"),
+            }
+        }
+    }
+
+    #[test]
+    fn polygon_label_avoids_holes() {
+        // The hole fills all but a strip on the right, centred on x = 1900.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![polygon_with_holes_feature(
+                &[
+                    &[(1000, 1000), (2000, 1000), (2000, 2000), (1000, 2000)],
+                    &[(1050, 1050), (1050, 1950), (1800, 1950), (1800, 1050)],
+                ],
+                vec![],
+            )],
+        )]);
+        let config = polygon_anchor_config(LayerParseKind::Text, PointPlacement::Point);
+        let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[config]);
+        match &groups[0].geometry {
+            ParsedGeometry::Points { coords, .. } => {
+                assert_eq!(coords.len(), 1);
+                let unit = lon_of(1.0) - lon_of(0.0);
+                assert!((coords[0].x - lon_of(1900.0)).abs() < 20.0 * unit);
+            }
+            _ => panic!("expected points"),
+        }
+    }
+
+    #[test]
+    fn polygon_label_in_the_tile_buffer_is_dropped() {
+        // The neighbouring tile holds the rest of this polygon and labels it.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![polygon_feature(
+                &[(-400, 1000), (-100, 1000), (-100, 1300), (-400, 1300)],
+                vec![],
+            )],
+        )]);
+        let config = polygon_anchor_config(LayerParseKind::Text, PointPlacement::Point);
+        assert!(parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[config]).is_empty());
+    }
+
+    #[test]
+    fn line_placement_walks_polygon_rings_but_not_clip_edges() {
+        // The left edge lies on the tile border, where clipping drew it: no
+        // anchor may sit on it. The other three sides are real boundary.
+        let bin = encode_tile(vec![make_layer(
+            "l",
+            vec![polygon_feature(
+                &[(0, 1000), (1000, 1000), (1000, 2000), (0, 2000)],
+                vec![],
+            )],
+        )]);
+        let config = polygon_anchor_config(LayerParseKind::Text, PointPlacement::Line);
+        let groups = parse_mvt_tile(&bin, xyz(), Vec3::ZERO, &[config]);
+        match &groups[0].geometry {
+            ParsedGeometry::Points {
+                coords, bearings, ..
+            } => {
+                assert!(coords.len() > 4, "{} anchors", coords.len());
+                assert_eq!(bearings.len(), coords.len());
+                let unit = lon_of(1.0) - lon_of(0.0);
+                for c in coords {
+                    assert!(c.x > lon_of(0.0) + unit, "anchor on the clip edge");
+                }
             }
             _ => panic!("expected points"),
         }

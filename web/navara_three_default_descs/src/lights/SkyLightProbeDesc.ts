@@ -32,6 +32,7 @@ export class SkyLightProbeDesc extends LightDesc<
     const skyLightProbeConfig = this.config.skyLightProbe || {};
 
     const skyLightProbe = new SkyLightProbe(skyLightProbeConfig);
+    skyLightProbe.raw.ellipsoid = this.view.atmosphere.ellipsoid;
 
     // Set up atmosphere integration
     this.view.atmosphere.onTexturesReady((t) => skyLightProbe.setTextures(t), {

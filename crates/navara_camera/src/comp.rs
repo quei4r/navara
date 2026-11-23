@@ -51,6 +51,16 @@ impl CameraFrustum {
         this
     }
 
+    /// Whether `fov_deg` (vertical field of view in **degrees**) can be used
+    /// as a perspective fov: 1° up to (not including) 180°.
+    ///
+    /// 180° or more is not a perspective projection (`tan(fov / 2)` is
+    /// infinite), and NaN would poison the planes and the SSE. NaN fails
+    /// the range check, so it is rejected too.
+    pub fn is_valid_fov_deg(fov_deg: FloatType) -> bool {
+        (1.0..180.0).contains(&fov_deg)
+    }
+
     pub fn update_sse_denominator(&mut self) {
         self.sse_denominator = 2. * (self.fov * 0.5).tan();
     }
@@ -187,8 +197,14 @@ pub struct CameraController {
     pub enable_look: bool,
     pub enable_translate: bool,
     pub auto_adjust_near_far: bool,
+    /// Distance from the globe center below which zoom and translate stop,
+    /// lowered by [`Self::surface_floor`].
     pub minimum_zoom_distance: FloatType,
     pub maximum_zoom_distance: FloatType,
+    /// Height (meters above the ellipsoid, never positive) the rendered
+    /// sea level is moved to by the terrain exaggeration, so the camera can
+    /// follow terrain sunk below the ellipsoid. Kept in sync by the tile plugin.
+    pub surface_floor: FloatType,
     pub spin_speed: FloatType,
     pub zoom_speed: FloatType,
     pub spin_duration: f32,
@@ -200,6 +216,22 @@ pub struct CameraController {
     pub follow_target_pre: Option<Vec3>,
     pub follow_offset: Option<Vec3>,
     pub terrain_hit_distance: Option<f64>,
+}
+
+impl CameraController {
+    /// Distance from the globe center the camera may not go below.
+    pub fn minimum_camera_radius(&self) -> FloatType {
+        self.minimum_zoom_distance + self.surface_floor
+    }
+
+    /// Whether a move from `from` to `to` (positions from the globe center)
+    /// ends below [`Self::minimum_camera_radius`] without moving away from the
+    /// center. The floor rises when the exaggeration is reduced, and a camera
+    /// left below it must still be able to move out.
+    pub fn sinks_below_floor(&self, from: Vec3, to: Vec3) -> bool {
+        let radius = to.length();
+        radius <= self.minimum_camera_radius() && radius < from.length()
+    }
 }
 
 impl Default for CameraController {
@@ -214,6 +246,7 @@ impl Default for CameraController {
             auto_adjust_near_far: true,
             minimum_zoom_distance: WGS84_B_64,
             maximum_zoom_distance: WGS84_B_64 * 10.0,
+            surface_floor: 0.,
             spin_speed: 2.0,
             zoom_speed: 0.6,
             spin_duration: 500.,
@@ -372,11 +405,13 @@ impl Orbit {
         self.local_position = inverse * direction;
 
         if tilt {
-            self.local_up = Vec3::Z;
+            // Preserve the current up direction (which contains roll) instead of forcing to Z
+            self.local_up = inverse * transform.up();
             self.horizontal_rotation_axis = Vec3::Z;
 
             if self.local_up.dot(self.local_forward).abs() >= 0.99999 {
-                self.local_up = inverse * transform.up();
+                // When looking nearly straight up/down, fall back to Z
+                self.local_up = Vec3::Z;
                 self.vertical_rotation_axis = self.local_forward.cross(self.local_up);
             } else {
                 self.vertical_rotation_axis = inverse * transform.right();
@@ -921,6 +956,20 @@ mod test {
             .distance,
             epsilon = EPSILON5
         );
+    }
+
+    #[test]
+    fn is_valid_fov_deg_accepts_only_perspective_range() {
+        assert!(CameraFrustum::is_valid_fov_deg(1.));
+        assert!(CameraFrustum::is_valid_fov_deg(60.));
+        assert!(CameraFrustum::is_valid_fov_deg(179.9));
+
+        assert!(!CameraFrustum::is_valid_fov_deg(0.));
+        assert!(!CameraFrustum::is_valid_fov_deg(0.5));
+        assert!(!CameraFrustum::is_valid_fov_deg(180.));
+        assert!(!CameraFrustum::is_valid_fov_deg(-60.));
+        assert!(!CameraFrustum::is_valid_fov_deg(f64::NAN as _));
+        assert!(!CameraFrustum::is_valid_fov_deg(f64::INFINITY as _));
     }
 
     #[test]

@@ -1,0 +1,1126 @@
+{
+  "layer": {
+    "fill": {
+      "status": "⚠️",
+      "paint": {
+        "fill-color": {
+          "status": "✅"
+        },
+        "fill-opacity": {
+          "status": "✅"
+        },
+        "fill-antialias": {
+          "status": "❌"
+        },
+        "fill-outline-color": {
+          "status": "❌"
+        },
+        "fill-translate": {
+          "status": "❌"
+        },
+        "fill-translate-anchor": {
+          "status": "❌"
+        },
+        "fill-pattern": {
+          "status": "❌"
+        },
+        "fill-layer-opacity": {
+          "status": "❌"
+        },
+        "fill-layer-blend": {
+          "status": "❌"
+        }
+      },
+      "layout": {
+        "visibility": {
+          "status": "✅"
+        },
+        "fill-sort-key": {
+          "status": "❌"
+        }
+      }
+    },
+    "fill-extrusion": {
+      "status": "⚠️",
+      "paint": {
+        "fill-extrusion-color": {
+          "status": "✅"
+        },
+        "fill-extrusion-opacity": {
+          "status": "✅"
+        },
+        "fill-extrusion-height": {
+          "status": "✅"
+        },
+        "fill-extrusion-base": {
+          "status": "✅"
+        },
+        "fill-extrusion-translate": {
+          "status": "❌"
+        },
+        "fill-extrusion-translate-anchor": {
+          "status": "❌"
+        },
+        "fill-extrusion-pattern": {
+          "status": "❌"
+        },
+        "fill-extrusion-vertical-gradient": {
+          "status": "❌"
+        }
+      },
+      "layout": {
+        "visibility": {
+          "status": "✅"
+        },
+        "fill-extrusion-rounded-corner-distance": {
+          "status": "❌"
+        }
+      }
+    },
+    "line": {
+      "status": "⚠️",
+      "paint": {
+        "line-color": {
+          "status": "✅"
+        },
+        "line-opacity": {
+          "status": "✅"
+        },
+        "line-width": {
+          "status": "✅"
+        },
+        "line-gap-width": {
+          "status": "❌"
+        },
+        "line-offset": {
+          "status": "❌"
+        },
+        "line-blur": {
+          "status": "❌"
+        },
+        "line-dasharray": {
+          "status": "❌"
+        },
+        "line-pattern": {
+          "status": "❌"
+        },
+        "line-gradient": {
+          "status": "❌"
+        },
+        "line-layer-opacity": {
+          "status": "❌"
+        },
+        "line-layer-blend": {
+          "status": "❌"
+        },
+        "line-translate": {
+          "status": "❌"
+        },
+        "line-translate-anchor": {
+          "status": "❌"
+        }
+      },
+      "layout": {
+        "line-cap": {
+          "status": "❌"
+        },
+        "line-join": {
+          "status": "❌"
+        },
+        "line-miter-limit": {
+          "status": "❌"
+        },
+        "line-round-limit": {
+          "status": "❌"
+        },
+        "visibility": {
+          "status": "✅"
+        },
+        "line-sort-key": {
+          "status": "❌"
+        }
+      }
+    },
+    "circle": {
+      "status": "⚠️",
+      "paint": {
+        "circle-color": {
+          "status": "✅"
+        },
+        "circle-opacity": {
+          "status": "✅"
+        },
+        "circle-radius": {
+          "status": "✅"
+        },
+        "circle-blur": {
+          "status": "❌"
+        },
+        "circle-stroke-color": {
+          "status": "❌"
+        },
+        "circle-stroke-opacity": {
+          "status": "❌"
+        },
+        "circle-stroke-width": {
+          "status": "❌"
+        },
+        "circle-translate": {
+          "status": "❌"
+        },
+        "circle-translate-anchor": {
+          "status": "❌"
+        },
+        "circle-pitch-scale": {
+          "status": "❌"
+        },
+        "circle-pitch-alignment": {
+          "status": "❌"
+        }
+      },
+      "layout": {
+        "visibility": {
+          "status": "✅"
+        },
+        "circle-sort-key": {
+          "status": "❌"
+        }
+      }
+    },
+    "symbol": {
+      "status": "⚠️",
+      "paint": {
+        "icon-color": {
+          "status": "✅"
+        },
+        "icon-opacity": {
+          "status": "✅"
+        },
+        "text-color": {
+          "status": "✅"
+        },
+        "text-opacity": {
+          "status": "✅"
+        },
+        "text-halo-color": {
+          "status": "✅"
+        },
+        "text-halo-width": {
+          "status": "✅"
+        },
+        "text-halo-blur": {
+          "status": "✅"
+        },
+        "icon-halo-color": {
+          "status": "❌"
+        },
+        "icon-halo-width": {
+          "status": "❌"
+        },
+        "icon-halo-blur": {
+          "status": "❌"
+        },
+        "icon-translate": {
+          "status": "⚠️ Follows zoom, but is the same for every feature in the layer. With the `map` anchor it turns with the camera heading but, unlike MapLibre, is not foreshortened by pitch"
+        },
+        "icon-translate-anchor": {
+          "status": "✅"
+        },
+        "text-translate": {
+          "status": "⚠️ Follows zoom, but is the same for every feature in the layer. With the `map` anchor it turns with the camera heading but, unlike MapLibre, is not foreshortened by pitch"
+        },
+        "text-translate-anchor": {
+          "status": "✅"
+        }
+      },
+      "layout": {
+        "icon-image": {
+          "status": "✅"
+        },
+        "icon-size": {
+          "status": "✅"
+        },
+        "text-field": {
+          "status": "✅"
+        },
+        "text-size": {
+          "status": "✅"
+        },
+        "text-font": {
+          "status": "✅"
+        },
+        "text-letter-spacing": {
+          "status": "✅"
+        },
+        "text-anchor": {
+          "status": "✅"
+        },
+        "icon-anchor": {
+          "status": "✅"
+        },
+        "text-offset": {
+          "status": "✅"
+        },
+        "text-variable-anchor": {
+          "status": "⚠️ With overlap allowed and every anchor taken, the label overlaps at the anchor it is at rather than the first"
+        },
+        "text-variable-anchor-offset": {
+          "status": "⚠️ With overlap allowed and every anchor taken, the label overlaps at the anchor it is at rather than the first"
+        },
+        "text-radial-offset": {
+          "status": "✅"
+        },
+        "icon-offset": {
+          "status": "✅"
+        },
+        "text-rotate": {
+          "status": "✅"
+        },
+        "icon-rotate": {
+          "status": "✅"
+        },
+        "symbol-sort-key": {
+          "status": "⚠️ Sets placement priority only, not draw order"
+        },
+        "symbol-placement": {
+          "status": "⚠️ Line placement labels line geometry only, not polygon outlines"
+        },
+        "symbol-spacing": {
+          "status": "⚠️ Evaluated once at layer construction"
+        },
+        "text-transform": {
+          "status": "✅"
+        },
+        "text-max-width": {
+          "status": "⚠️ Follows zoom, but is the same for every feature in the layer"
+        },
+        "text-justify": {
+          "status": "✅"
+        },
+        "text-max-angle": {
+          "status": "✅"
+        },
+        "text-keep-upright": {
+          "status": "✅"
+        },
+        "text-rotation-alignment": {
+          "status": "✅"
+        },
+        "text-pitch-alignment": {
+          "status": "✅"
+        },
+        "icon-rotation-alignment": {
+          "status": "⚠️ Evaluated once at layer construction on line placement"
+        },
+        "icon-pitch-alignment": {
+          "status": "⚠️ On-screen icons turn by ground bearing on lines"
+        },
+        "text-allow-overlap": {
+          "status": "✅"
+        },
+        "icon-allow-overlap": {
+          "status": "✅"
+        },
+        "text-overlap": {
+          "status": "✅"
+        },
+        "icon-overlap": {
+          "status": "✅"
+        },
+        "text-ignore-placement": {
+          "status": "✅"
+        },
+        "icon-ignore-placement": {
+          "status": "✅"
+        },
+        "text-padding": {
+          "status": "✅"
+        },
+        "icon-padding": {
+          "status": "⚠️ Follows zoom, but is the same for every feature in the layer"
+        },
+        "text-optional": {
+          "status": "✅"
+        },
+        "icon-optional": {
+          "status": "✅"
+        },
+        "text-line-height": {
+          "status": "✅"
+        },
+        "visibility": {
+          "status": "✅"
+        },
+        "symbol-avoid-edges": {
+          "status": "❌"
+        },
+        "symbol-z-order": {
+          "status": "❌"
+        },
+        "icon-text-fit": {
+          "status": "❌"
+        },
+        "icon-text-fit-padding": {
+          "status": "❌"
+        },
+        "icon-keep-upright": {
+          "status": "❌"
+        },
+        "text-writing-mode": {
+          "status": "❌"
+        },
+        "symbol-height-offset": {
+          "status": "❌"
+        },
+        "symbol-height-anchor": {
+          "status": "❌"
+        }
+      }
+    },
+    "raster": {
+      "status": "⚠️ Layer only, no properties supported",
+      "paint": {
+        "raster-opacity": {
+          "status": "❌"
+        },
+        "raster-brightness-min": {
+          "status": "❌"
+        },
+        "raster-brightness-max": {
+          "status": "❌"
+        },
+        "raster-contrast": {
+          "status": "❌"
+        },
+        "raster-saturation": {
+          "status": "❌"
+        },
+        "raster-fade-duration": {
+          "status": "⚠️ Ignored; tiles appear without fading"
+        },
+        "raster-hue-rotate": {
+          "status": "❌"
+        },
+        "raster-resampling": {
+          "status": "❌"
+        },
+        "resampling": {
+          "status": "❌"
+        }
+      },
+      "layout": {
+        "visibility": {
+          "status": "✅"
+        }
+      }
+    },
+    "hillshade": {
+      "status": "⚠️ Layer only, no properties supported",
+      "paint": {
+        "hillshade-illumination-direction": {
+          "status": "❌"
+        },
+        "hillshade-illumination-anchor": {
+          "status": "❌"
+        },
+        "hillshade-exaggeration": {
+          "status": "❌"
+        },
+        "hillshade-shadow-color": {
+          "status": "❌"
+        },
+        "hillshade-highlight-color": {
+          "status": "❌"
+        },
+        "hillshade-accent-color": {
+          "status": "❌"
+        },
+        "hillshade-illumination-altitude": {
+          "status": "❌"
+        },
+        "hillshade-method": {
+          "status": "❌"
+        },
+        "resampling": {
+          "status": "❌"
+        }
+      },
+      "layout": {
+        "visibility": {
+          "status": "✅"
+        }
+      }
+    },
+    "color-relief": {
+      "status": "✅",
+      "paint": {
+        "color-relief-color": {
+          "status": "✅"
+        },
+        "color-relief-opacity": {
+          "status": "✅"
+        },
+        "resampling": {
+          "status": "✅"
+        }
+      },
+      "layout": {
+        "visibility": {
+          "status": "✅"
+        }
+      }
+    },
+    "background": {
+      "status": "⚠️",
+      "paint": {
+        "background-color": {
+          "status": "✅"
+        },
+        "background-opacity": {
+          "status": "✅"
+        },
+        "background-pattern": {
+          "status": "❌"
+        }
+      },
+      "layout": {
+        "visibility": {
+          "status": "✅"
+        }
+      }
+    },
+    "sky": {
+      "status": "❌"
+    },
+    "heatmap": {
+      "status": "❌"
+    }
+  },
+  "source": {
+    "geojson": {
+      "status": "⚠️ Only data is applied; other options are ignored",
+      "properties": {
+        "data": {
+          "status": "✅"
+        },
+        "maxzoom": {
+          "status": "❌"
+        },
+        "attribution": {
+          "status": "❌"
+        },
+        "buffer": {
+          "status": "❌"
+        },
+        "filter": {
+          "status": "❌"
+        },
+        "tolerance": {
+          "status": "❌"
+        },
+        "cluster": {
+          "status": "❌"
+        },
+        "clusterRadius": {
+          "status": "❌"
+        },
+        "clusterMaxZoom": {
+          "status": "❌"
+        },
+        "clusterMinPoints": {
+          "status": "❌"
+        },
+        "clusterProperties": {
+          "status": "❌"
+        },
+        "lineMetrics": {
+          "status": "❌"
+        },
+        "generateId": {
+          "status": "❌"
+        },
+        "promoteId": {
+          "status": "❌"
+        }
+      }
+    },
+    "vector": {
+      "status": "⚠️ mlt encoding, bounds and scheme are not supported",
+      "encoding": {
+        "mvt": {
+          "status": "✅"
+        },
+        "mlt": {
+          "status": "❌"
+        }
+      },
+      "properties": {
+        "url": {
+          "status": "✅"
+        },
+        "tiles": {
+          "status": "⚠️ Only the first URL is used"
+        },
+        "bounds": {
+          "status": "❌"
+        },
+        "scheme": {
+          "status": "❌"
+        },
+        "minzoom": {
+          "status": "✅"
+        },
+        "maxzoom": {
+          "status": "✅"
+        },
+        "attribution": {
+          "status": "⚠️ Ignored in the style; a TileJSON document's attribution is shown"
+        },
+        "promoteId": {
+          "status": "❌"
+        },
+        "volatile": {
+          "status": "⚠️ Ignored; it only hints at caching"
+        }
+      }
+    },
+    "raster": {
+      "status": "⚠️ bounds is ignored; tileSize is not applied",
+      "properties": {
+        "url": {
+          "status": "✅"
+        },
+        "tiles": {
+          "status": "⚠️ Only the first URL is used"
+        },
+        "bounds": {
+          "status": "❌"
+        },
+        "minzoom": {
+          "status": "✅"
+        },
+        "maxzoom": {
+          "status": "✅"
+        },
+        "tileSize": {
+          "status": "⚠️ Not applied; tiles are always handled as 256 px"
+        },
+        "scheme": {
+          "status": "✅"
+        },
+        "attribution": {
+          "status": "⚠️ Ignored in the style; a TileJSON document's attribution is shown"
+        },
+        "volatile": {
+          "status": "⚠️ Ignored; it only hints at caching"
+        }
+      }
+    },
+    "raster-dem": {
+      "status": "⚠️ bounds and custom encoding are not supported",
+      "encoding": {
+        "terrarium": {
+          "status": "✅"
+        },
+        "mapbox": {
+          "status": "✅"
+        },
+        "custom": {
+          "status": "❌"
+        }
+      },
+      "properties": {
+        "url": {
+          "status": "✅"
+        },
+        "tiles": {
+          "status": "⚠️ Only the first URL is used"
+        },
+        "bounds": {
+          "status": "❌"
+        },
+        "minzoom": {
+          "status": "✅"
+        },
+        "maxzoom": {
+          "status": "✅"
+        },
+        "tileSize": {
+          "status": "✅"
+        },
+        "attribution": {
+          "status": "⚠️ Ignored in the style; a TileJSON document's attribution is shown"
+        },
+        "redFactor": {
+          "status": "❌"
+        },
+        "greenFactor": {
+          "status": "❌"
+        },
+        "blueFactor": {
+          "status": "❌"
+        },
+        "baseShift": {
+          "status": "❌"
+        },
+        "volatile": {
+          "status": "⚠️ Ignored; it only hints at caching"
+        }
+      }
+    },
+    "image": {
+      "status": "❌"
+    },
+    "video": {
+      "status": "❌"
+    },
+    "canvas": {
+      "status": "❌"
+    }
+  },
+  "expression": {
+    "get": {
+      "status": "✅"
+    },
+    "has": {
+      "status": "✅"
+    },
+    "in": {
+      "status": "✅"
+    },
+    "index-of": {
+      "status": "✅"
+    },
+    "length": {
+      "status": "✅"
+    },
+    "case": {
+      "status": "✅"
+    },
+    "match": {
+      "status": "✅"
+    },
+    "coalesce": {
+      "status": "✅"
+    },
+    "to-boolean": {
+      "status": "✅"
+    },
+    "to-number": {
+      "status": "✅"
+    },
+    "to-string": {
+      "status": "✅"
+    },
+    "to-color": {
+      "status": "✅"
+    },
+    "array": {
+      "status": "✅"
+    },
+    "literal": {
+      "status": "✅"
+    },
+    "typeof": {
+      "status": "✅"
+    },
+    "concat": {
+      "status": "✅"
+    },
+    "upcase": {
+      "status": "✅"
+    },
+    "downcase": {
+      "status": "✅"
+    },
+    "+": {
+      "status": "✅"
+    },
+    "-": {
+      "status": "✅"
+    },
+    "*": {
+      "status": "✅"
+    },
+    "/": {
+      "status": "✅"
+    },
+    "%": {
+      "status": "✅"
+    },
+    "^": {
+      "status": "✅"
+    },
+    "sqrt": {
+      "status": "✅"
+    },
+    "log10": {
+      "status": "✅"
+    },
+    "ln": {
+      "status": "✅"
+    },
+    "abs": {
+      "status": "✅"
+    },
+    "ceil": {
+      "status": "✅"
+    },
+    "floor": {
+      "status": "✅"
+    },
+    "round": {
+      "status": "✅"
+    },
+    "min": {
+      "status": "✅"
+    },
+    "max": {
+      "status": "✅"
+    },
+    "==": {
+      "status": "✅"
+    },
+    "!=": {
+      "status": "✅"
+    },
+    ">": {
+      "status": "✅"
+    },
+    ">=": {
+      "status": "✅"
+    },
+    "<": {
+      "status": "✅"
+    },
+    "<=": {
+      "status": "✅"
+    },
+    "!": {
+      "status": "✅"
+    },
+    "all": {
+      "status": "✅"
+    },
+    "any": {
+      "status": "✅"
+    },
+    "zoom": {
+      "status": "✅"
+    },
+    "geometry-type": {
+      "status": "✅"
+    },
+    "id": {
+      "status": "✅"
+    },
+    "properties": {
+      "status": "✅"
+    },
+    "pitch": {
+      "status": "❌"
+    },
+    "distance-from-center": {
+      "status": "❌"
+    },
+    "let": {
+      "status": "✅"
+    },
+    "var": {
+      "status": "✅"
+    },
+    "semiliteral": {
+      "status": "✅"
+    },
+    "number": {
+      "status": "✅"
+    },
+    "boolean": {
+      "status": "✅"
+    },
+    "string": {
+      "status": "✅"
+    },
+    "object": {
+      "status": "✅"
+    },
+    "collator": {
+      "status": "✅"
+    },
+    "format": {
+      "status": "❌"
+    },
+    "image": {
+      "status": "❌"
+    },
+    "number-format": {
+      "status": "✅"
+    },
+    "at": {
+      "status": "✅"
+    },
+    "slice": {
+      "status": "✅"
+    },
+    "global-state": {
+      "status": "✅"
+    },
+    "within": {
+      "status": "✅"
+    },
+    "step": {
+      "status": "✅"
+    },
+    "interpolate": {
+      "status": "✅"
+    },
+    "interpolate-hcl": {
+      "status": "✅"
+    },
+    "interpolate-lab": {
+      "status": "✅"
+    },
+    "ln2": {
+      "status": "✅"
+    },
+    "pi": {
+      "status": "✅"
+    },
+    "e": {
+      "status": "✅"
+    },
+    "log2": {
+      "status": "✅"
+    },
+    "sin": {
+      "status": "✅"
+    },
+    "cos": {
+      "status": "✅"
+    },
+    "tan": {
+      "status": "✅"
+    },
+    "asin": {
+      "status": "✅"
+    },
+    "acos": {
+      "status": "✅"
+    },
+    "atan": {
+      "status": "✅"
+    },
+    "distance": {
+      "status": "✅"
+    },
+    "to-rgba": {
+      "status": "✅"
+    },
+    "rgb": {
+      "status": "✅"
+    },
+    "rgba": {
+      "status": "✅"
+    },
+    "feature-state": {
+      "status": "❌"
+    },
+    "line-progress": {
+      "status": "❌"
+    },
+    "accumulated": {
+      "status": "❌"
+    },
+    "heatmap-density": {
+      "status": "❌"
+    },
+    "elevation": {
+      "status": "✅"
+    },
+    "is-supported-script": {
+      "status": "✅"
+    },
+    "resolved-locale": {
+      "status": "✅"
+    },
+    "split": {
+      "status": "✅"
+    },
+    "join": {
+      "status": "✅"
+    }
+  },
+  "root": {
+    "version": {
+      "status": "✅"
+    },
+    "name": {
+      "status": "✅"
+    },
+    "metadata": {
+      "status": "✅"
+    },
+    "center": {
+      "status": "✅"
+    },
+    "centerAltitude": {
+      "status": "⚠️ Camera positions correctly, but zoom calculation uses sea-level distance"
+    },
+    "zoom": {
+      "status": "✅"
+    },
+    "bearing": {
+      "status": "✅"
+    },
+    "pitch": {
+      "status": "✅"
+    },
+    "roll": {
+      "status": "✅"
+    },
+    "sources": {
+      "status": "⚠️"
+    },
+    "layers": {
+      "status": "⚠️"
+    },
+    "state": {
+      "status": "❌"
+    },
+    "light": {
+      "status": "❌"
+    },
+    "sky": {
+      "status": "⚠️ Only atmosphere-blend, which is ignored"
+    },
+    "projection": {
+      "status": "⚠️ Ignored; always renders a globe"
+    },
+    "terrain": {
+      "status": "✅"
+    },
+    "sprite": {
+      "status": "❌"
+    },
+    "glyphs": {
+      "status": "❌"
+    },
+    "font-faces": {
+      "status": "✅"
+    },
+    "transition": {
+      "status": "⚠️ Ignored; style changes apply immediately"
+    }
+  },
+  "light": {
+    "anchor": {
+      "status": "❌"
+    },
+    "position": {
+      "status": "❌"
+    },
+    "color": {
+      "status": "❌"
+    },
+    "intensity": {
+      "status": "❌"
+    }
+  },
+  "sky": {
+    "sky-color": {
+      "status": "❌"
+    },
+    "horizon-color": {
+      "status": "❌"
+    },
+    "fog-color": {
+      "status": "❌"
+    },
+    "fog-ground-blend": {
+      "status": "❌"
+    },
+    "horizon-fog-blend": {
+      "status": "❌"
+    },
+    "sky-horizon-blend": {
+      "status": "❌"
+    },
+    "atmosphere-blend": {
+      "status": "⚠️ Ignored; MapLibre's globe atmosphere is not drawn"
+    }
+  },
+  "terrain": {
+    "source": {
+      "status": "✅"
+    },
+    "exaggeration": {
+      "status": "❌"
+    }
+  },
+  "projection": {
+    "type": {
+      "status": "⚠️ Ignored; always renders a globe"
+    }
+  },
+  "transition": {
+    "duration": {
+      "status": "⚠️ Ignored; style changes apply immediately"
+    },
+    "delay": {
+      "status": "⚠️ Ignored; style changes apply immediately"
+    }
+  },
+  "sprite": {
+    "status": "❌"
+  },
+  "glyphs": {
+    "status": "❌"
+  },
+  "font-faces": {
+    "status": "✅"
+  },
+  "state": {
+    "status": "❌"
+  },
+  "types": {
+    "color": {
+      "status": "✅"
+    },
+    "formatted": {
+      "status": "❌"
+    },
+    "resolvedImage": {
+      "status": "✅"
+    },
+    "string": {
+      "status": "✅"
+    },
+    "boolean": {
+      "status": "✅"
+    },
+    "number": {
+      "status": "✅"
+    },
+    "array": {
+      "status": "✅"
+    },
+    "Point": {
+      "status": "✅"
+    },
+    "enum": {
+      "status": "✅"
+    },
+    "padding": {
+      "status": "✅"
+    },
+    "projectionDefinition": {
+      "status": "❌"
+    },
+    "numberArray": {
+      "status": "✅"
+    },
+    "colorArray": {
+      "status": "✅"
+    }
+  }
+}

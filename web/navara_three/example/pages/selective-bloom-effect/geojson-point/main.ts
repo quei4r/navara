@@ -43,7 +43,7 @@ const run = async () => {
   // Selective bloom effect
   const bloomEffect = view.addEffect({
     selectiveBloom: {
-      strength: 1.0,
+      strength: 4.0,
       radius: 0.5,
       threshold: 0.0,
     },
@@ -83,7 +83,7 @@ const run = async () => {
       sizeInMeters: true,
       clampToGround: true,
       color: new Color().setHex(0x0066ff),
-      center: { x: 0, y: -0.5 },
+      anchor: "bottom",
       effectIds: [bloomEffect.id],
       emissiveIntensity: 0.5,
     },

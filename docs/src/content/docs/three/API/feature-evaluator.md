@@ -144,16 +144,33 @@ The callback function can return an object containing the following properties:
 | `extrudedHeight` | `number` | Polygon extrusion height (meters) |
 | `text` | `string` | Label text content (for text/label features) |
 | `width` | `number` | Line width (pixels, for polyline features) |
+| `dashArray` | `number[]` | Dash and gap lengths in line widths (for polyline features). An empty array draws the feature solid. Overrides the material's [`dashArray`](../../../three/material/polyline-material/#dasharray) |
+| `cap` | `"butt" \| "round" \| "square"` | Shape of the ends of each dash (for polyline features). Overrides the material's [`cap`](../../../three/material/polyline-material/#cap) |
 | `size` | `number` | Point/text size (meters or pixels, for point/text features) |
+| `letterSpacing` | `number` | Extra space between characters in ems (for text features). Overrides the material's [`letterSpacing`](../../../three/material/text-material/#letterspacing) |
 | `opacity` | `number` | Feature opacity, range 0.0-1.0 (for polygons/points/billboards/models/text) |
-| `declutterPriority` | `number` | Placement priority for decluttering. Higher wins an overlap (for points/billboards/text with [`declutter`](../../../three/material/text-material/#declutter) enabled). Overrides the layer's `declutterPriority` |
+| `declutterPriority` | `number` | Placement priority for decluttering. Higher wins an overlap (for points/billboards/text with [`declutter`](../../../three/material/text-material/#declutter) enabled). Overrides the layer's `declutterPriority`, but never the material's [`declutterRank`](../../../three/material/text-material/#declutterrank), which is compared first |
 | `image` | `string \| null` | Image URL (for billboard features). Each distinct URL is loaded once and packed into the layer's texture atlas. Return `null` to clear a previous per-feature image and revert to the billboard material's default `url` (the feature becomes invisible if the material has no `url`) |
+| `facing` | `"upright" \| "flat"` | Whether the point, billboard, or label lies in the screen plane (`"upright"`) or on the globe surface (`"flat"`) (for points/billboards/text). Overrides the value the material's `pointFacing`/`billboardFacing`/`textFacing` resolves to |
+| `rotateWithCamera` | `boolean` | Whether the point, billboard, or label turns with the camera (`true`) or with the map (`false`) (for points/billboards/text). Along a line, `false` makes a label follow the line, and `true` draws it straight unless `spreadGlyphs` is set. Overrides the value the material's `rotateWithCamera` resolves to |
+| `spreadGlyphs` | `boolean` | Whether the label places each glyph on its own along its line (for text placed along a line). Overrides the material's `spreadGlyphs`, for example to keep cursive scripts or fonts word by word in a layer that spreads the rest |
+| `rotation` | `number` | In-plane rotation, in degrees, clockwise as seen from the front (for points/billboards/text). It turns the feature around its anchor, except that a label following a line spins each glyph about its own center. Lets every feature in one layer point a different way. Overrides the material's `rotation` |
+| `anchor` | `"center" \| "left" \| "right" \| "top" \| "bottom" \| "top-left" \| "top-right" \| "bottom-left" \| "bottom-right"` | Which part of the point, billboard, or label sits on its position (for points/billboards/text). Overrides the material's `anchor` (see [`anchor`](../../../three/material/text-material/#anchor)) |
+| `offset` | `{ x: number, y: number }` | Shift from the anchor point, `x` right and `y` down: in ems for text, in the unit of `size` for points and billboards. Overrides the material's `offset` (see [`offset`](../../../three/material/text-material/#offset)) |
+| `variableAnchors` | `{ anchor: Anchor, offset?: { x: number, y: number } }[]` | Placements the declutter pass tries in order for this label (for text features), offsets in ems. Overrides the material's [`variableAnchors`](../../../three/material/text-material/#variableanchors) |
+| `textAlign` | `"left" \| "center" \| "right" \| "auto"` | Line justification (for text features). `"auto"` follows the label's `anchor`. Overrides the material's [`textAlign`](../../../three/material/text-material/#textalign) |
+| `outlineColor` | `Color` | Outline color (for text features). Overrides the material's [`outlineColor`](../../../three/material/text-material/#outlinecolor) |
+| `outlineOpacity` | `number` | Outline opacity, range 0.0-1.0 (for text features). Overrides the material's [`outlineOpacity`](../../../three/material/text-material/#outlineopacity) |
+| `outlineWidth` | `number` | Outline thickness in 1/64 em (for text features). Overrides the material's [`outlineWidth`](../../../three/material/text-material/#outlinewidth) |
+| `outlineBlur` | `number` | Width over which the outline fades out, in 1/64 em (for text features). Overrides the material's [`outlineBlur`](../../../three/material/text-material/#outlineblur) |
 | `emissive` | `Color` | Emissive color (for batched polygons/3D Tiles models/points/billboards/text, ignored on models without batch/feature ids). Pairs with `emissiveIntensity` and drives selective bloom. On text only the glyph fill glows, while the outline and background stay dark |
 | `emissiveIntensity` | `number` | Emissive intensity multiplier (for batched polygons/3D Tiles models/points/billboards/text) |
 
 :::note
 Evaluated styles override the layer's default styles.
 :::
+
+Per-feature `facing` and `rotateWithCamera` are not resolved like MapLibre's `"auto"`. Each replaces only its own half of the orientation the material resolved, so returning only `rotateWithCamera: false` for a point label keeps it upright, turned with the camera heading. Return `facing: "flat"` as well for a north-up label on the surface.
 
 **Example:**
 
@@ -311,6 +328,9 @@ type EvaluatedValue = {
   width?: number;
   /** Point/text size (meters or pixels, for point/text features) */
   size?: number;
+  /** Extra space between characters in ems (for text features). Overrides
+   * the material's `letterSpacing` */
+  letterSpacing?: number;
   /** Feature opacity, range 0.0-1.0 (for polygons/points/billboards/models/text) */
   opacity?: number;
   /** Placement priority for decluttering; higher wins an overlap (for
@@ -321,6 +341,58 @@ type EvaluatedValue = {
    * packed into the layer's texture atlas. `null` clears a previous
    * per-feature image, reverting to the billboard material's default url */
   image?: string | null;
+  /** Whether the point, billboard, or label lies in the screen plane
+   * ("upright") or on the globe surface ("flat") (for points/billboards/text).
+   * Overrides the material's facing option */
+  facing?: "upright" | "flat";
+  /** Whether the point, billboard, or label turns with the camera (`true`) or
+   * with the map (`false`) (for points/billboards/text). Along a line, `false`
+   * makes a label follow the line */
+  rotateWithCamera?: boolean;
+  /** Whether the label places each glyph on its own along its line (for
+   * text placed along a line) */
+  spreadGlyphs?: boolean;
+  /** In-plane rotation, in degrees, clockwise as seen from the front (for
+   * points/billboards/text). A label following a line spins each glyph about
+   * its own center */
+  rotation?: number;
+  /** Which part of the point, billboard, or label sits on its position (for
+   * points/billboards/text). Overrides the material's `anchor` */
+  anchor?:
+    | "center"
+    | "left"
+    | "right"
+    | "top"
+    | "bottom"
+    | "top-left"
+    | "top-right"
+    | "bottom-left"
+    | "bottom-right";
+  /** Shift from the anchor point, `x` right and `y` down: in ems for text, in
+   * the unit of `size` for points and billboards. Overrides the material's
+   * `offset` */
+  offset?: { x: number; y: number };
+  /** Placements the declutter pass tries in order (for text features),
+   * offsets in ems. Overrides the material's `variableAnchors` */
+  variableAnchors?: {
+    anchor: NonNullable<EvaluatedValue["anchor"]>;
+    offset?: { x: number; y: number };
+  }[];
+  /** Line justification (for text features); `"auto"` follows `anchor`.
+   * Overrides the material's `textAlign` */
+  textAlign?: "left" | "center" | "right" | "auto";
+  /** Outline color (for text features). Overrides the material's
+   * `outlineColor` */
+  outlineColor?: Color;
+  /** Outline opacity, range 0.0-1.0 (for text features). Overrides the
+   * material's `outlineOpacity` */
+  outlineOpacity?: number;
+  /** Outline thickness in 1/64 em (for text features). Overrides the
+   * material's `outlineWidth` */
+  outlineWidth?: number;
+  /** Width over which the outline fades out, in 1/64 em (for text
+   * features). Overrides the material's `outlineBlur` */
+  outlineBlur?: number;
   /** Emissive color (for batched polygons/3D Tiles models/points/billboards/
    * text; ignored on models without batch/feature ids). Pairs with
    * `emissiveIntensity` and drives selective bloom. On text only the glyph

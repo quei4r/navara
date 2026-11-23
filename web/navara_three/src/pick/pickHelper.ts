@@ -1,18 +1,29 @@
 import {
+  AlwaysDepth,
   WebGLRenderer,
   WebGLRenderTarget,
+  Frustum,
+  Matrix4,
+  Mesh,
   PerspectiveCamera,
   Object3D,
+  PlaneGeometry,
   RGBAFormat,
   Color,
   Scene,
+  ShaderMaterial,
+  Sphere,
   Vector2,
+  WebGLCoordinateSystem,
+  type Texture,
 } from "three";
 
 import { BufferView } from "../bufferView";
+import { DrapedMesh } from "../mesh/DrapedMesh";
 import { isPickableMesh, type PickableMesh } from "../mesh/pickableMesh";
 import { TileScene } from "../scene";
 import type { MeshCache } from "../type";
+import type { RefThree } from "../uniforms";
 
 export type PickHelperOptions = {
   debug: boolean;
@@ -33,6 +44,36 @@ type WebGPURendererLike = {
     height: number,
   ): Promise<Uint8Array>;
 };
+
+/**
+ * Writes the packed globe depth into the depth buffer, so draped meshes can
+ * be stencil-clipped against the terrain as in the main pass.
+ */
+function createGlobeDepthScene(globeDepth: RefThree<Texture>): Scene {
+  const material = new ShaderMaterial({
+    uniforms: { tGlobeDepth: globeDepth },
+    vertexShader: /* glsl */ `
+      void main() {
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      #include <packing>
+      uniform sampler2D tGlobeDepth;
+      void main() {
+        vec2 uv = gl_FragCoord.xy / vec2(textureSize(tGlobeDepth, 0));
+        gl_FragDepth = unpackRGBAToDepth(texture2D(tGlobeDepth, uv));
+      }
+    `,
+    colorWrite: false,
+    depthFunc: AlwaysDepth,
+  });
+  const quad = new Mesh(new PlaneGeometry(2, 2), material);
+  quad.frustumCulled = false;
+  const scene = new Scene();
+  scene.add(quad);
+  return scene;
+}
 
 /**
  * Travel tolerance in CSS pixels between pointerdown and pointerup to count as a click.
@@ -84,6 +125,43 @@ type WebGPUPickRequest = {
 const MAX_QUEUED_CLICK_PICKS = 16;
 
 /**
+ * Margin in CSS pixels around the search window within which meshes stay in
+ * the pick render. Screen-space geometry such as pixel-width lines draws
+ * beyond its bounding sphere.
+ */
+const PICK_CULL_MARGIN = 32;
+
+const cullSphere = new Sphere();
+
+/**
+ * Whether anything `object` or its visible descendants draw may reach
+ * `frustum`, by the bounding-sphere test three's own culling uses. A
+ * container such as a 3D Tiles model is judged by the meshes inside it.
+ * Objects three never culls, sprites, and geometry without a computed
+ * bounding sphere count as reaching it.
+ */
+function mayReachFrustum(object: Object3D, frustum: Frustum): boolean {
+  if (!object.visible) return false;
+  const drawable = object as Partial<Mesh> & {
+    boundingSphere?: Sphere | null;
+    isSprite?: boolean;
+  };
+  if (drawable.isSprite) return true;
+  if (drawable.geometry) {
+    if (!object.frustumCulled) return true;
+    // Instanced and skinned meshes keep their own bounds.
+    const bounds =
+      "boundingSphere" in drawable
+        ? drawable.boundingSphere
+        : drawable.geometry.boundingSphere;
+    if (!bounds) return true;
+    cullSphere.copy(bounds).applyMatrix4(object.matrixWorld);
+    if (frustum.intersectsSphere(cullSphere)) return true;
+  }
+  return object.children.some((child) => mayReachFrustum(child, frustum));
+}
+
+/**
  * GPU picking using a dedicated render pass over a small search window.
  *
  * The pick pass does NOT reuse the main render pipeline (globe / MRT /
@@ -100,7 +178,8 @@ const MAX_QUEUED_CLICK_PICKS = 16;
  *
  * Two gestures trigger a pick: a click or touch tap (pointerdown/pointerup
  * within {@link CLICK_PIXEL_TOLERANCE} / {@link TAP_PIXEL_TOLERANCE}) and
- * hovering, throttled to at most one pick per animation frame. Both are
+ * hovering, picked at most once per animation frame by
+ * {@link PickHelper.pickHover}. Both are
  * lazy: a pick runs only while the matching `shouldClickPick` /
  * `shouldHoverPick` gate returns true (i.e. someone is listening for the
  * result). The gestures are detected from pointer events, which fire for
@@ -130,11 +209,21 @@ export class PickHelper {
 
   /** Dedicated scene used only during the pick render. */
   private readonly pickScene = new Scene();
+  /** The terrain tiles, drawn before the draped pickables. */
+  private readonly groundScene = new Scene();
+  /** The main pass's globe scene, which holds the terrain tiles. */
+  private readonly globeScene: Scene;
+  /** Holds one draped pickable at a time for its stencil passes. */
+  private readonly drapedScene = new Scene();
+  private readonly globeDepthScene: Scene;
 
   private debugBufferView?: BufferView;
   private debugRenderTarget?: WebGLRenderTarget;
   /** Full-size render target used for click picking with scissor restriction. */
   private pickRenderTarget: WebGLRenderTarget;
+  /** The camera frustum narrowed to the search window plus its margin. */
+  private readonly cullFrustum = new Frustum();
+  private readonly cullMatrix = new Matrix4();
 
   /** Click picks run only while this returns true (e.g. featureClick listeners exist). */
   private shouldClickPick: () => boolean;
@@ -149,7 +238,6 @@ export class PickHelper {
   private hoverLeaveHandler: () => void;
   /** Latest pointermove position awaiting a hover pick, in client coords. */
   private hoverPosition?: Vector2;
-  private hoverRafId?: number;
 
   constructor(
     element: HTMLElement,
@@ -160,6 +248,8 @@ export class PickHelper {
     onHoverCallback: (pickArr: number[]) => void,
     shouldClickPick: () => boolean,
     shouldHoverPick: () => boolean,
+    globeDepth: RefThree<Texture>,
+    globeScene: Scene,
     options?: PickHelperOptions,
   ) {
     this.element = element;
@@ -171,6 +261,8 @@ export class PickHelper {
     this.onHoverCallback = onHoverCallback;
     this.shouldClickPick = shouldClickPick;
     this.shouldHoverPick = shouldHoverPick;
+    this.globeDepthScene = createGlobeDepthScene(globeDepth);
+    this.globeScene = globeScene;
 
     this.pointerDownHandler = (event: PointerEvent) =>
       this.onPointerDown(event);
@@ -202,7 +294,7 @@ export class PickHelper {
     this.pickRenderTarget = new WebGLRenderTarget(width, height, {
       format: RGBAFormat,
       depthBuffer: true,
-      stencilBuffer: false,
+      stencilBuffer: true,
     });
 
     if (options?.debug) {
@@ -210,7 +302,7 @@ export class PickHelper {
       this.debugRenderTarget = new WebGLRenderTarget(width, height, {
         format: RGBAFormat,
         depthBuffer: true,
-        stencilBuffer: false,
+        stencilBuffer: true,
       });
     }
   }
@@ -271,51 +363,53 @@ export class PickHelper {
       );
       this.element.removeEventListener("pointermove", this.hoverMoveHandler);
       this.element.removeEventListener("pointerleave", this.hoverLeaveHandler);
-      this.cancelPendingHoverPick();
+      this.hoverPosition = undefined;
     }
   }
 
   /**
-   * Hover picking: schedules at most one GPU pick per animation frame from
-   * the latest pointermove position. Suppressed while any button is pressed
-   * (Camera drags would otherwise trigger a pick per frame. For touch,
-   * contact itself sets `buttons`, so touch never hover-picks) and while
-   * `shouldHoverPick` returns false, so pages without hover listeners pay
-   * nothing.
+   * Records the latest pointermove position for {@link pickHover}. Ignored
+   * while any button is pressed (camera drags would otherwise pick every
+   * frame; for touch, contact itself sets `buttons`, so touch never
+   * hover-picks) and while `shouldHoverPick` returns false, so pages without
+   * hover listeners pay nothing.
    */
   private onHoverPointerMove(event: PointerEvent) {
     if (event.buttons !== 0 || !this.shouldHoverPick()) return;
 
     if (!this.hoverPosition) this.hoverPosition = new Vector2();
     this.hoverPosition.set(event.clientX, event.clientY);
+  }
 
-    if (this.hoverRafId !== undefined) return;
-    this.hoverRafId = requestAnimationFrame(() => {
-      this.hoverRafId = undefined;
-      const position = this.hoverPosition;
-      if (!position) return;
-      this.hoverPosition = undefined;
+  /**
+   * Picks at the latest pointermove position since the previous call, if
+   * any, and reports the result. The view calls this at the start of a
+   * frame, before its render, so the readback waits for the pick render
+   * alone rather than for that frame's render.
+   */
+  pickHover() {
+    const position = this.hoverPosition;
+    if (!position) return;
+    this.hoverPosition = undefined;
 
-      // Listeners may have been removed between the pointermove that
-      // scheduled this frame and now. Re-check so no orphan pick runs.
-      if (!this.shouldHoverPick()) return;
+    // Listeners may have been removed since the pointermove.
+    if (!this.shouldHoverPick()) return;
 
-      if (this.isWebGPU) {
-        this.requestWebGPUPick(
-          position.x,
-          position.y,
-          PICK_RADIUS,
-          this.onHoverCallback,
-        );
-        return;
-      }
-      const batchId = this.pickBatchIdAt(position.x, position.y);
-      this.onHoverCallback(batchId > 0 ? [batchId] : []);
-    });
+    if (this.isWebGPU) {
+      this.requestWebGPUPick(
+        position.x,
+        position.y,
+        PICK_RADIUS,
+        this.onHoverCallback,
+      );
+      return;
+    }
+    const batchId = this.pickBatchIdAt(position.x, position.y);
+    this.onHoverCallback(batchId > 0 ? [batchId] : []);
   }
 
   private onHoverPointerLeave() {
-    this.cancelPendingHoverPick();
+    this.hoverPosition = undefined;
     // Report "nothing hovered" so diff-based enter/leave synthesis can
     // close out the current hover when the cursor exits the canvas.
     if (this.shouldHoverPick()) {
@@ -323,23 +417,23 @@ export class PickHelper {
     }
   }
 
-  private cancelPendingHoverPick() {
-    if (this.hoverRafId !== undefined) {
-      cancelAnimationFrame(this.hoverRafId);
-      this.hoverRafId = undefined;
-    }
-    this.hoverPosition = undefined;
-  }
-
   /**
    * Moves every pickable raw (visible, currently parented) into the
    * dedicated `pickScene` and activates the picking uniforms on its
-   * wrapper. Returns a teardown callback that restores original parents
-   * and deactivates the uniforms.
+   * wrapper. Terrain tiles go to `groundScene` instead, and draped meshes
+   * are returned, to be stencil-clipped between the two. `teardown` restores
+   * original parents and deactivates the uniforms.
    */
-  private stagePickables(pickingCoord?: Vector2): () => void {
+  private stagePickables(
+    pickingCoord?: Vector2,
+    cullFrustum?: Frustum,
+  ): {
+    teardown: () => void;
+    draped: [DrapedMesh, Object3D][];
+  } {
     const restoreParents: [Object3D, Object3D][] = [];
     const activated: PickableMesh[] = [];
+    const draped: [DrapedMesh, Object3D][] = [];
 
     for (const [_key, obj] of this._meshes) {
       if (!isPickableMesh(obj)) continue;
@@ -351,6 +445,16 @@ export class PickHelper {
       // hidden or detached isn't rendered in the main view, so picking
       // it would be surprising.
       if (!originalParent || !raw.visible) continue;
+
+      // Meshes that cannot reach the search window are left out. Those in a
+      // TileScene (below) are drawn into their tile's atlas, so they stay.
+      if (
+        cullFrustum &&
+        !(originalParent instanceof TileScene) &&
+        !mayReachFrustum(raw, cullFrustum)
+      ) {
+        continue;
+      }
 
       obj.onBeforePicking(pickingCoord);
       activated.push(obj);
@@ -365,6 +469,19 @@ export class PickHelper {
       // pickScene, where they depth-fight with the terrain.
       if (originalParent instanceof TileScene) continue;
 
+      // Drawn as is, the stencil volume would be pickable over its whole
+      // height range rather than where it meets the ground.
+      if (raw instanceof DrapedMesh && raw.enabled()) {
+        draped.push([raw, originalParent]);
+        continue;
+      }
+
+      if (originalParent === this.globeScene) {
+        this.groundScene.add(raw);
+        restoreParents.push([raw, originalParent]);
+        continue;
+      }
+
       // Scene.add auto-removes from the previous parent. Both parents
       // are pass scenes with identity world transforms, so the raw's
       // world matrix is unaffected.
@@ -372,30 +489,73 @@ export class PickHelper {
       restoreParents.push([raw, originalParent]);
     }
 
-    return () => {
-      for (const [raw, parent] of restoreParents) parent.add(raw);
-      for (const w of activated) w.onAfterPicking();
+    return {
+      teardown: () => {
+        for (const [raw, parent] of restoreParents) parent.add(raw);
+        for (const w of activated) w.onAfterPicking();
+      },
+      draped,
     };
+  }
+
+  /**
+   * Draws each draped pickable where its volume meets the globe, then puts
+   * back the depth of the pickable terrain alone, so the remaining pickables
+   * are occluded the same with or without draped ones.
+   */
+  private renderDraped(draped: readonly [DrapedMesh, Object3D][]) {
+    this._renderer.clear(false, true, true);
+    this._renderer.render(this.globeDepthScene, this._camera);
+
+    for (const [mesh, parent] of draped) {
+      this.drapedScene.add(mesh);
+      mesh.process(() => this._renderer.render(this.drapedScene, this._camera));
+      parent.add(mesh);
+    }
+
+    this._renderer.clear(false, true, true);
+    if (this.groundScene.children.length > 0) {
+      // Locked, since every material sets its own `colorWrite`.
+      const colorBuffer = this._renderer.state.buffers.color;
+      colorBuffer.setMask(false);
+      colorBuffer.setLocked(true);
+      this._renderer.render(this.groundScene, this._camera);
+      colorBuffer.setLocked(false);
+      colorBuffer.setMask(true);
+    }
   }
 
   /**
    * Dedicated picking render: clears the target to black (batchId=0) and
    * renders only the pickable raws, regardless of which pass scene they
-   * normally live in.
+   * normally live in, leaving out those outside `cullFrustum` when given.
    */
-  public processRender(target: WebGLRenderTarget, pickingCoord?: Vector2) {
+  public processRender(
+    target: WebGLRenderTarget,
+    pickingCoord?: Vector2,
+    cullFrustum?: Frustum,
+  ) {
     const origClearColor = new Color();
     this._renderer.getClearColor(origClearColor);
     const origClearAlpha = this._renderer.getClearAlpha();
     const origRenderTarget = this._renderer.getRenderTarget();
     const origAutoClear = this._renderer.autoClear;
 
-    const teardown = this.stagePickables(pickingCoord);
+    const { teardown, draped } = this.stagePickables(pickingCoord, cullFrustum);
 
     this._renderer.setClearColor(0x000000, 1);
     this._renderer.setRenderTarget(target);
-    this._renderer.autoClear = true;
-    this._renderer.clear(true, true, false);
+    // Terrain, then draped, then the rest, as in the main pass: a draped
+    // mesh draws without a depth test, so it must cover the terrain but come
+    // before the pickables that stand in front of it.
+    this._renderer.autoClear = false;
+    this._renderer.clear(true, true, true);
+    if (this.groundScene.children.length > 0) {
+      this._renderer.render(this.groundScene, this._camera);
+    }
+    if (draped.length > 0) {
+      this.renderDraped(draped);
+    }
     this._renderer.render(this.pickScene, this._camera);
 
     teardown();
@@ -582,7 +742,8 @@ export class PickHelper {
     this._renderer.setScissor(w.minX, w.minY, w.width, w.height);
     this._renderer.setScissorTest(true);
 
-    this.processRender(this.pickRenderTarget, w.pickingCoord);
+    this.updateCullFrustum(w.minX, w.minY, w.width, w.height, this._renderer.getPixelRatio());
+    this.processRender(this.pickRenderTarget, w.pickingCoord, this.cullFrustum);
 
     if (this.pixelBuffer.length < w.width * w.height * 4) {
       this.pixelBuffer = new Uint8Array(w.width * w.height * 4);
@@ -673,6 +834,54 @@ export class PickHelper {
       }
     }
     return bestId;
+  }
+
+  /**
+   * Narrows the camera frustum to the search window (device pixels, WebGL
+   * y-up) plus {@link PICK_CULL_MARGIN}, by scaling the window to fill the
+   * clip space of the unchanged projection.
+   */
+  private updateCullFrustum(
+    minX: number,
+    minY: number,
+    width: number,
+    height: number,
+    pixelRatio: number,
+  ) {
+    const { drawingBufferWidth, drawingBufferHeight } =
+      this._renderer.getContext();
+    const margin = PICK_CULL_MARGIN * pixelRatio;
+    const toNdc = (v: number, size: number) =>
+      (Math.min(Math.max(v, 0), size) / size) * 2 - 1;
+    const x0 = toNdc(minX - margin, drawingBufferWidth);
+    const x1 = toNdc(minX + width + margin, drawingBufferWidth);
+    const y0 = toNdc(minY - margin, drawingBufferHeight);
+    const y1 = toNdc(minY + height + margin, drawingBufferHeight);
+    const cx = (x0 + x1) / 2;
+    const cy = (y0 + y1) / 2;
+    const sx = (x1 - x0) / 2;
+    const sy = (y1 - y0) / 2;
+
+    // The renderer updates the camera the same way before the pick render.
+    const camera = this._camera;
+    if (camera.parent === null && camera.matrixWorldAutoUpdate) {
+      camera.updateMatrixWorld();
+    }
+    // prettier-ignore
+    this.cullMatrix.set(
+      1 / sx, 0, 0, -cx / sx,
+      0, 1 / sy, 0, -cy / sy,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+    );
+    this.cullMatrix
+      .multiply(camera.projectionMatrix)
+      .multiply(camera.matrixWorldInverse);
+    this.cullFrustum.setFromProjectionMatrix(
+      this.cullMatrix,
+      WebGLCoordinateSystem,
+      camera.reversedDepth,
+    );
   }
 
   public dispose() {

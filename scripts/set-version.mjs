@@ -1,8 +1,8 @@
 // Stamp a single version into every publishable @navaramap/* package.
 // All Navara packages are released in lockstep, so the version passed in
 // (usually derived from a `vX.Y.Z` git tag) is applied to every package.
-// Run after the WASM build, because web/wasm/*/package.json files are
-// generated from crates/*/_package.json during the build.
+// Includes the tracked web/wasm/*/package.json manifests of the WASM packages
+// and the web/experimental packages, which only nightlies publish.
 //
 // Usage: node scripts/set-version.mjs <version>
 import { existsSync, globSync, readFileSync, writeFileSync } from "node:fs";
@@ -13,7 +13,11 @@ if (!version || !/^\d+\.\d+\.\d+(-[0-9A-Za-z-.]+)?$/.test(version)) {
   process.exit(1);
 }
 
-const packageJsonPaths = globSync(["web/*/package.json", "web/wasm/*/package.json"]);
+const packageJsonPaths = globSync([
+  "web/*/package.json",
+  "web/wasm/*/package.json",
+  "web/experimental/*/package.json",
+]);
 let stamped = 0;
 for (const path of packageJsonPaths) {
   if (!existsSync(path)) continue;
@@ -26,6 +30,6 @@ for (const path of packageJsonPaths) {
 }
 
 if (stamped === 0) {
-  console.error("No packages stamped. Did the WASM build run?");
+  console.error("No packages stamped.");
   process.exit(1);
 }

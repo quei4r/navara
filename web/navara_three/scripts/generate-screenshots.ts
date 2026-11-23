@@ -105,6 +105,10 @@ const PAGE_CONFIGS: Record<string, PageConfig> = {
   "cloud-fog": {
     waitTime: 10000,
   },
+  "debug-deferred-lighting": {
+    // Quantized-mesh terrain plus the PLATEAU building tileset.
+    waitTime: 20000,
+  },
   "custom-shader": {
     waitTime: 10000,
   },
@@ -128,6 +132,14 @@ const PAGE_CONFIGS: Record<string, PageConfig> = {
   },
   "use-cases-interior-explore": {
     waitTime: 60000,
+  },
+  "showcase/night-city": {
+    // Vector tile buildings plus 25 road tiles streamed in around the camera.
+    waitTime: 90000,
+  },
+  "mesh/text-3d": {
+    // Quantized-mesh terrain plus the Re:Earth Buildings 3D Tiles.
+    waitTime: 30000,
   },
   "mesh/arcline": {
     waitTime: 12000,
@@ -169,7 +181,7 @@ const PAGE_CONFIGS: Record<string, PageConfig> = {
     waitTime: 10000,
   },
   "effect/ssr": {
-    waitTime: 15000,
+    waitTime: 60000,
   },
 };
 

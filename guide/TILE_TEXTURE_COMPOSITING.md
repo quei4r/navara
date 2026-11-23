@@ -15,7 +15,7 @@ Every terrain tile can carry several overlays at once. Compositing them **per
 fragment, every frame** would cost N texture lookups for each pixel of every
 tile. Instead the overlays are baked **once, off-screen**, into a small per-tile
 atlas whenever something changes; the terrain's main shader then samples just
-that atlas (3 lookups) no matter how many overlays the tile has.
+that atlas (2–3 lookups) no matter how many overlays the tile has.
 
 So two shaders are involved, and the rest of this document follows one tile's
 overlays through them, end to end:
@@ -23,7 +23,7 @@ overlays through them, end to end:
 - **Composite pass** — an off-screen full-screen-quad pass that bakes N source
   textures into the tile's MRT atlas. Runs only when the tile is _dirty_.
 - **Main TileMesh shader** — the on-screen terrain material. Samples the atlas's
-  three attachments once per fragment and applies lighting / water / picking.
+  attachments once per fragment and applies lighting / water / picking.
 
 ## The pipeline
 
@@ -99,7 +99,12 @@ to a slot. What each source is, and how much prep it needs:
   surface normal; decoded during the bake (see [Hillshade](#hillshade-a-worked-example)).
   No prep as an input.
 - **Elevation DEM** — encoded heights. Decoded and mapped through the shared
-  colormap during the bake by the elevation heatmap enhancer. On Geographic
+  colormap during the bake by the elevation heatmap enhancer. The colormap is
+  an atlas of color ramps, one row per layer (`colorMapAtlas.ts`): each stop is
+  a premultiplied color texel plus a position texel, and the shader
+  binary-searches the positions (`sampleColorRamp`), so `colorStops` hit their
+  exact elevations; plain colorMaps use evenly spaced 0..1 positions matched
+  against the min/max-normalized height. On Geographic
   terrain it runs through the same raster mosaic first, copied
   value-preserving so the encoded texels survive.
 - **Watermask** — a single-channel land/water mask (quantized-mesh). A tile-wide
@@ -120,9 +125,9 @@ resolvers** (`mesh/tile/drapeResolver.ts`), created per `TileMesh`:
   runtime scheme flip rebuilds every tile, so the choice never changes
   mid-life).
 
-Each resolver refreshes its Rust-resolved slots when its resolve revision
-(`vectorRevision()` / `rasterRevision()`) moved, and re-bakes when its
-slot/content signature changed.
+Each resolver refreshes its Rust-resolved slots when Rust signals a change (the
+`vector_drape_changed` event listing the tile / a moved `rasterRevision()`), and
+re-bakes when its slot/content signature changed.
 
 Vector tiles are draped meshes (`PolygonMesh` / `PolylineMesh`, themselves
 Material-Enhancer materials). Each tile reserves a block of **vector-region**
@@ -134,11 +139,11 @@ slot:
 - One `WebGLRenderTarget` (512×512) per vector slot, kept in the
   `VectorDrapeResolver`'s render-target pool (lazily sized to the draped-layer
   count). The bake accumulates each slot's sources into the compositor's ONE
-  shared multisampled target (`DRAPE_BAKE_SAMPLES`× MSAA, no depth/stencil —
-  the flat bake shaders have no analytic edge AA, so geometric edges are
-  resolved at bake time; multisample contents persist across the per-source
-  `render()` calls on WebGL2) and copies the resolved image into the slot's
-  plain RT. Setting `samples` on the per-tile targets instead quintupled
+  shared multisampled target (`DRAPE_BAKE_SAMPLES`× MSAA with a
+  depth-stencil buffer for the source clip below — the flat bake shaders have
+  no analytic edge AA, so geometric edges are resolved at bake time;
+  multisample contents persist across the per-source `render()` calls on
+  WebGL2) and copies the resolved image into the slot's plain RT. Setting `samples` on the per-tile targets instead quintupled
   every drape target's GPU footprint, starving the tile memory budget and
   stalling terrain refinement (the drape then stayed coarse however far the
   camera zoomed); the shared target is a single fixed allocation, reported to
@@ -154,10 +159,26 @@ slot:
     `NormalBlending + transparent: false` to no blending), a sub-1
     per-feature opacity would land STRAIGHT in the target and the divide
     would brighten it by 1/α.
+  - **A translucent layer's sources draw only inside the texels they
+    claimed.** Sources overlap: an MVT tile carries its neighbors' features
+    in a buffer past its edge, and a coarser ancestor backing one region
+    spans the finer sources too. Drawn twice, a translucent layer blends
+    twice along every tile seam; an opaque duplicate only covers an identical
+    texel. So in a layer with a `transparent` mesh
+    (`TileScene.hasTransparentMesh`, read from `DrapeBakedMesh.drapeTransparent`
+    since the bake material itself always blends, and cached until the
+    scene's `revision` moves), each source first draws a color-less quad over its own
+    `[-1, 1]` square that writes its stencil ref where no earlier source
+    wrote one, then draws its scene with the stencil test equal to that ref. Sources go finest
+    first with descending refs, so an ancestor fills only what the finer
+    sources left. A blend mode cannot replace this: it sees only the color
+    already in the target, not which source drew it, and an ancestor's
+    simplified outline doesn't match the finer copy anyway.
   - **Pick bakes bypass MSAA** (`antialias: false`, driven by
     `VectorDrapeResolver.setPickBake`): their fragments encode batch ids as
     colors, and averaging them along feature edges decodes to ids that don't
-    exist. They render straight into the slot RT, hard-edged.
+    exist. They render straight into the slot RT, hard-edged, and unclipped
+    since that RT has no stencil.
 
   Do NOT batch a slot's sources into a single `render()` by reparenting their
   scenes under one wrapper: `TileScene`s live as children of their
@@ -187,7 +208,7 @@ flowchart TD
   LOOP --> CLR["clear RT[i] once<br/>(autoClear off → accumulate)"]
   CLR --> SRC{"for each source"}
   SRC -->|"scene not in cache yet"| SKIP["skip → sub-rect stays transparent"]
-  SRC -->|"scene ready"| DRAW["render via one fixed [-1,1] camera<br/>reframed to the source's<br/>uvOffset/uvScale sub-rect"]
+  SRC -->|"scene ready<br/>(finest first)"| DRAW["transparent layer: claim the source's<br/>square in the stencil, then<br/>render via one fixed [-1,1] camera<br/>reframed to the source's<br/>uvOffset/uvScale sub-rect"]
   DRAW --> RT["RenderTarget[i].texture<br/>(spans the terrain tile's extent)"]
   SKIP --> RT
   RT --> BIND["bindSlots():<br/>textures[boundary+i], identity UV,<br/>copy representative mesh attrs"]
@@ -322,7 +343,7 @@ graph LR
 
 The **absolute** slot index is carried through and baked into the composite
 shader as `winningSlot`, so the main shader can still index its per-slot uniform
-arrays (reflectivity, water speed, …) by the winner decoded from the atlas. The
+arrays (reflectivity, water params, …) by the winner decoded from the atlas. The
 `SlotPlan` and the derived `CompositeFeatures` are everything the bake needs.
 
 ## 4. Baking the atlas
@@ -376,8 +397,8 @@ factory into `createCompositeLayerEnhancers()`. Nothing else changes.
 
 ### What the bake produces
 
-The atlas is one `WebGLRenderTarget` with three RGBA8 attachments (512×512),
-owned per tile by `TileTextureCache`. The single quad draw writes all three:
+The atlas is one `WebGLRenderTarget` with RGBA8 attachments (512×512), owned
+per tile by `TileTextureCache`. The single quad draw writes all of them:
 
 | Attachment | Channels | Meaning |
 | --- | --- | --- |
@@ -385,14 +406,37 @@ owned per tile by `TileTextureCache`. The single quad draw writes all three:
 | `attr` | r / g / b / a | `isWater` / `isTexturized` / `0` / `(winningSlot+1)/255` |
 | `normal` | rgb / a | Hillshade normal in `[0,1]` / `1` when present else `0` |
 
+Only the main shader's hillshade branch reads `normal`, so the atlas has that
+attachment only while the tile's main material compiles that branch
+(`USE_HILLSHADE`, 2 MB at 512² instead of 3 MB). The shape follows the main
+material rather than the bake's own layer list, which counts a hillshade layer
+only once its texture has loaded, so the atlas does not change shape when that
+texture arrives. Without the attachment, the composite shader does not declare
+its location 2 output and the tile's `normal` output is `null`: three binds an
+all-zero texture (`a = 0`, as if no hillshade slot won).
+
+A tile has no atlas until its first bake. `runCompositePassIfDirty` asks the
+cache for an atlas of the needed shape (`prepareAtlasForBake`): the current one
+when it fits, otherwise a pooled one of that shape or a new one, and the
+replaced atlas goes back to the pool. The tile's outputs object reads the
+entry's current atlas, and `atlasUniforms` reads the outputs on every upload,
+so every mesh holding the handle follows a swap. The pool keeps the most
+recently released atlases of either shape.
+
 That `attr.a` is how the absolute winning slot survives into the main shader,
 and `attr.g` is how raster and vector pixels stay distinguishable — both used in
 the next stage.
 
+`attr` is sampled with `NearestFilter`, while `color` and `normal` stay linear.
+A filtered fetch on the edge between two slots would blend their indices into a
+slot that never won the texel (often an unused one with zeroed uniforms), and
+the interpolated `attr.r` / `attr.g` flags would no longer describe the slot
+`attr.a` names.
+
 ## 5. Sampling on screen
 
 The terrain's main shader (injected via `material/macro/tileShader.ts`) is now
-thin: it samples the three atlas attachments once at `vOrigUv` and reads
+thin: it samples each atlas attachment it needs once at `vOrigUv` and reads
 per-slot uniforms by the decoded winner instead of looping over every slot.
 
 - **Color** — `color` is composited over the base via a premultiplied "over".
@@ -459,7 +503,7 @@ sequenceDiagram
   participant C as TileTextureCompositor
   participant Cache as TileTextureCache
 
-  TM->>TM: vectorDrape.update(): vectorRevision() changed? → refreshSlots()
+  TM->>TM: vectorDrape.update(): listed in vector_drape_changed? → refreshSlots()
   TM->>TM: rasterDrape.update(): rasterRevision() changed? → refreshSlots()
   alt a resolver's slot/content signature changed
     TM->>C: renderVectorScenes() / renderRasterTiles() → per-layer RTs
@@ -480,7 +524,25 @@ sequenceDiagram
 Dirty reasons are coalesced per tile (`DirtyReason`: `material`,
 `texture-binding`, `vector-revision`, `raster-revision`, `hillshade`) so one bake services many
 changes, and the atlas Textures persist across passes — only `needsUpdate` flips
-when a new bake overwrites them.
+when a new bake overwrites them, except when the main material gains or loses
+hillshade and the atlas is swapped (see
+[What the bake produces](#what-the-bake-produces)), or when the tile stops
+being drawn and gives the atlas back (see
+[Undrawn tiles hold no drape memory](#undrawn-tiles-hold-no-drape-memory)).
+
+### Undrawn tiles hold no drape memory
+
+After each rendered frame the view calls
+`TileMesh.releaseDrapeGpuMemoryUnlessDrawn()` on every tile. A tile the frame
+did not draw (hidden, or outside every camera) disposes its resolvers' render
+targets (`DrapeResolver.release`), returns its atlas to the pool
+(`TileTextureCache.releaseAtlas`), and reports the smaller footprint to the
+memory ledger. The atlas stays while the mesh being replaced still holds the
+handle's cache entry, since that mesh may still draw with it. A released tile
+keeps its Rust-resolved slots: its next `onBeforeRender` allocates the render
+targets again, bakes them and repaints the atlas before the draw. Rust's
+`active` flag cannot stand in for "drawn": a tile outside the frustum stays
+active.
 
 ## Quantized-mesh and watermask
 
@@ -489,19 +551,39 @@ like hillshade) and an optional **watermask** extension. The watermask is a
 slot-independent global rather than a per-slot layer: `tileWatermaskEnhancer`
 declares it in `globalUniformDecls`, samples it once in `postLoop`, and OR's the
 result into `isWater`. So even an open-ocean tile with no raster/vector overlays
-still bakes water into `attr.r` for the main shader's reflection — which is why
-the bake runs for a watermask-only tile even though it has zero slots.
+still bakes water into `attr.r` for the main shader — which is why the bake runs
+for a watermask-only tile even though it has zero slots.
 
-Because raster imagery now drapes on quantized-mesh tiles, a watermask tile can
-also have a **winning raster slot**. The watermask flags water independently of
-which slot wins the blend, so the main shader (`generateTileMapFragment`) OR's
-`useWater` into `useSpecular` rather than gating it on the winner's own specular
-flag — otherwise a draped raster slot (`uSpeculars == false`) would suppress the
-watermask glint. Per-slot water specular params (`shininess`,
-`specularStrength`) only exist for **vector** water layers, so when the winner is
-a raster slot the shader falls back to the default water appearance (the same
-one the no-winner open-ocean path uses) instead of reading the raster slot's
-zeroed params.
+**Smoothing.** The mask is binary at its texel size, so it is read through a
+cubic B-spline (four bilinear fetches on a `LinearFilter` texture) and
+thresholded at 0.5. The water's edge then follows curves, one-texel-wide
+channels survive (2/3 at their center) and isolated texels drop out (4/9).
+Children below the last level with a mask crop the parent's quadrant and double
+it bilinearly (`upsample_watermask`, Chaikin subdivision), so repeated levels
+converge to a smooth 0.5 contour. Two limits remain: the result is baked into
+the `NearestFilter` attr atlas, so its texel size still shows as a fine step,
+and a tile cannot read its neighbor's mask, so an edge crossing a tile border
+can shift by under a mask texel there.
+
+**Winner rules.** A watermask tile can also have a **winning raster slot**, and
+`attr.r` ORs the watermask into whatever slot wins. The main shader
+(`generateTileMapFragment`) therefore decides `tileWater` as follows:
+
+- A raster winner (or no winner, open ocean) is water whenever `attr.r` says so
+  and takes the watermask's waves (the terrain layer's `waveExaggeration`,
+  `waveStrength`, `waveDirection` and `flowSpeed`).
+- A vector winner is water only through the water flag (y) of its per-slot
+  `uWaterParams` and takes its `waveExaggeration` (x), so a non-water vector
+  layer drawn over the sea stays dry. It reads the waves of its own slot
+  ([WATER.md](WATER.md)).
+- Water pixels go through the shared water chunk ([WATER.md](WATER.md)) with
+  the winner's color as the body color. The terrain layer's `waterMaskColor`
+  (`RasterTileInternalMaterial.water_mask_color` → `uWaterMaskColor.rgb`, alpha
+  1 when set) replaces that color on the watermask's water (no vector winner).
+
+The water branch compiles when `hasWater || hasWatermask`, so a
+`replaceGeometry` that adds or removes the watermask recompiles the tile, and
+any watermask change rebakes its atlas.
 
 ## N:M draping: stitching and Mercator reprojection
 

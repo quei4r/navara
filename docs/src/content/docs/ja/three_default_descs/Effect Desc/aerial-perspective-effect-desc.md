@@ -24,8 +24,11 @@ sidebar:
 **Default:** `true`
 
 **Example:**
+
 ```typescript
-{ visible: true }
+{
+  visible: true,
+}
 ```
 
 ### inscatter
@@ -68,7 +71,7 @@ sidebar:
 
 **Type:** `boolean | undefined`
 
-**Description:** ポストプロセッシング段階でマテリアルを照らすために使用されます。透明度をサポートしていません。影付きで雲をレンダリングする場合にこのフラグを有効にします。
+**Description:** フォワードライティングの代わりに、事前計算した太陽と空の放射照度で G-buffer の法線を使ってポストプロセスでシーンをライティングします。[`view.lit = false`](../../../three/api/threeview-properties/#lit) と対にしてください。そうしないとフォワードパスとこのオプションでライティングが二重に適用されてしまいます。このライティングは拡散のみで、太陽の影と鏡面ハイライトは [`shadow`](#shadow) と [`specular`](#specular) で追加します。雲の影にはこのオプションが必要です。透明なマテリアルは再ライティングされません。`DefaultPlugin.addDefaultPhotorealScene({ deferredLighting: true })` は両方をまとめて設定します。
 
 **Default:** `false`
 
@@ -77,7 +80,7 @@ sidebar:
 ```typescript
 {
   aerialPerspective: {
-    irradiance: false,
+    irradiance: true,
   }
 }
 ```
@@ -140,7 +143,7 @@ sidebar:
 
 **Type:** `boolean | undefined`
 
-**Description:** エフェクトに法線バッファをバインドするかどうかを指定します。これは、このパスでマテリアルに対する deferred lighting（irradiance の適用）を行うかどうかの切り替えとして機能します。`false` の場合、法線バッファはエフェクトに渡されず、マテリアルにポストプロセスのライティングは適用されません（大気の in-scatter と transmittance の計算自体は引き続き行われますが、このパスによってマテリアルがライティングし直されることはありません）。シーンのジオメトリが信頼できる法線バッファを出力しない場合（例: 法線情報を持たないタイル glTF アセットなど）に無効化し、マテリアルのライティングをそのまま保ちたいときに使用します。
+**Description:** エフェクトに法線バッファをバインドするかどうかを指定します。これは、このパスでマテリアルに対する deferred lighting（irradiance の適用）を行うかどうかの切り替えとして機能します。`false` の場合、法線バッファはエフェクトに渡されず、マテリアルにポストプロセスのライティングは適用されません（大気の in-scatter と transmittance の計算自体は引き続き行われますが、このパスによってマテリアルがライティングし直されることはありません）。シーンのジオメトリが信頼できる法線バッファを出力しない場合（例: 法線情報を持たないタイル glTF アセットなど）に無効化し、マテリアルのライティングをそのまま保ちたいときに使用します。`false` の場合、このエフェクトは法線 G-buffer を必要としないため、ビューは他のエフェクトやメッシュが必要とするときだけそれを確保します。また [`shadow`](#shadow) と [`specular`](#specular) の項は効果を持ちません。
 
 **Default:** `true`
 
@@ -168,6 +171,130 @@ sidebar:
 {
   aerialPerspective: {
     albedoScale: 2 / Math.PI,
+  }
+}
+```
+
+### shadow
+
+**Type:** `boolean | undefined`
+
+**Description:** [`irradiance`](#irradiance) でライティングされるシーンで太陽の影を有効にします。影のピクセルは太陽の光を失い天空光は保つため、晴れた日中の影は明るく、夕方に向かって深くなります。雲が落とす影については clouds エフェクトの `shadows` オプションを参照してください。
+
+必要な設定:
+
+- この Descriptor の `irradiance: true` と [`useNormalBuffer`](#usenormalbuffer) が有効であること。
+- `ThreeView` のコンストラクタでの `shadow: true` と、太陽光の `castShadow: true`。
+- 地形には頂点法線（`quantized-mesh` ソースの `requestVertexNormals: true`）か hillshade マテリアルが必要です。
+
+`lit: true` のオブジェクトはフォワードシェーディングを保ち、透明な面は対象外です。以下の `shadowIntensity`、`shadowSoftness`、`shadowSamples` がこの項を調整し、項が無効な間も保持されます。
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  aerialPerspective: {
+    irradiance: true,
+    shadow: true,
+  }
+}
+```
+
+### shadowIntensity
+
+**Type:** `number | undefined`
+
+**Description:** [`shadow`](#shadow) の項の強さをスケールします。`shadow` を無効にする場合と違い、`0` ではシェーダが再コンパイルされません。
+
+**Default:** `1`
+
+**Example:**
+
+```typescript
+{
+  aerialPerspective: {
+    shadowIntensity: 0.6,
+  }
+}
+```
+
+### shadowSoftness
+
+**Type:** `number | undefined`
+
+**Description:** 影の輪郭に適用するスクリーンスペースブラーの半径をピクセル単位で指定します。
+
+**Default:** `1.5`
+
+**Example:**
+
+```typescript
+{
+  aerialPerspective: {
+    shadowSoftness: 3,
+  }
+}
+```
+
+### shadowSamples
+
+**Type:** `number | undefined`
+
+**Description:** [`shadowSoftness`](#shadowsoftness) のブラーのタップ数です。
+
+**Default:** `12`
+
+**Example:**
+
+```typescript
+{
+  aerialPerspective: {
+    shadowSamples: 16,
+  }
+}
+```
+
+### specular
+
+**Type:** `boolean | undefined`
+
+**Description:** 太陽の鏡面反射を GGX のマイクロファセットローブで加算します。[`irradiance`](#irradiance) のライティングパスは拡散光だけなので、このオプションが無いと反射的なマテリアルもつや消しのままになります。ハイライトは [`shadow`](#shadow) の項が弱めるのと同じ太陽光で照らされるため、影の中や雲の影の下では消えます。
+
+面がどれだけ反射するかはエフェクトのオプションではなくマテリアルの性質です。model と 3D Tiles では glTF の metalness、それ以外では material の reflectivity がそのまま垂直入射時の反射率として使われ、roughness がハイライトの広がりを決めます。反射率が `0.01` 未満の面は計算されないため、地形、polyline、sprite、text はマテリアルが指定しない限りつや消しのままです。
+
+[`shadow`](#shadow) と同様に `irradiance: true` と [`useNormalBuffer`](#usenormalbuffer) が必要です。[`albedoScale`](#albedoscale) は反射と拡散光を一緒に暗くします。
+
+[SSR エフェクト](../ssr-effect-desc/) とは役割が重なりません。SSR は画面に映っているものを反射し、空はミスとして扱うため、太陽そのもののハイライトは作れません。
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  aerialPerspective: {
+    irradiance: true,
+    specular: true,
+  }
+}
+```
+
+### specularIntensity
+
+**Type:** `number | undefined`
+
+**Description:** [`specular`](#specular) の反射の強さをスケールします。`specular` を無効にする場合と違い、`0` ではシェーダが再コンパイルされません。
+
+**Default:** `1`
+
+**Example:**
+
+```typescript
+{
+  aerialPerspective: {
+    specularIntensity: 0.5,
   }
 }
 ```
@@ -228,3 +355,44 @@ view.addEffect<CloudsEffectDesc>({
   },
 });
 ```
+
+### カスケードシャドウ付きの deferred ライティング
+
+```typescript
+import ThreeView from "@navaramap/three";
+import {
+  DefaultPlugin,
+  type DefaultDescriptions,
+} from "@navaramap/three-default-plugin";
+
+// シャドウマップを描画する。コンストラクタでのみ設定できる
+const view = new ThreeView<DefaultDescriptions>({ shadow: true });
+const plugin = new DefaultPlugin();
+view.addPlugin(plugin);
+await view.init();
+
+// 大気がシーンをライティングし（irradiance + view.lit = false）、
+// 太陽の影を有効にする
+const layers = plugin.addDefaultPhotorealScene({
+  deferredLighting: true,
+  shadow: true,
+});
+layers.sun.update({ sun: { castShadow: true } });
+view.toneMappingExposure = 3;
+
+// 地形が shadow バッファに書き込むには頂点法線が必要
+const terrainSource = view.addSource({
+  type: "quantized-mesh",
+  url: "https://example.com/terrain",
+  requestVertexNormals: true,
+});
+view.addLayer({
+  type: "terrain",
+  source: terrainSource,
+  terrain: { castShadow: true, receiveShadow: true },
+});
+```
+
+## See Also
+
+- [Color クラス](../../../three/api/color/) - 色の設定方法

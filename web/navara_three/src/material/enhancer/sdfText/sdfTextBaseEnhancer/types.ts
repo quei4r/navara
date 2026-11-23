@@ -5,7 +5,8 @@ import type { UniformValue } from "../../../types";
 import type { Mutates } from "../../MaterialEnhancer";
 
 /** Pixel range covered by a quality's atlas distance field; defines how
- *  outline-width pixels translate to a distance-value delta. SDF (`useMsdf=false`)
+ *  outline widths in atlas pixels (1/64 em) translate to a distance-value
+ *  delta (`sdfText.vert.glsl`). SDF (`useMsdf=false`)
  *  uses the classic 35 px radius from `sdf_glyph_renderer`; MSDF uses
  *  `MSDF_RANGE_PX` (16 px). See [`atlasRangePx`] in `@navaramap/font`. */
 export const sdfRadiusFor = (useMsdf: boolean): number => atlasRangePx(useMsdf);
@@ -20,11 +21,14 @@ export const sdfRadiusFor = (useMsdf: boolean): number => atlasRangePx(useMsdf);
  * here because the enhancer owns the shader.
  */
 export const LabelRow = {
-  /** xyz = anchor high (RTE) or RTC-relative anchor, w = reserved. */
+  /**
+   * xyz = anchor high (RTE) or RTC-relative anchor, w = x of the block's
+   * shift from its anchor, in ems (`anchorShiftEm` in layout.ts).
+   */
   POSITION_HIGH: 0,
-  /** xyz = anchor low (RTE only), w = reserved. */
+  /** xyz = anchor low (RTE only), w = y of the block's shift, in ems. */
   POSITION_LOW: 1,
-  /** x = textWidth, y = textHeight, z = bgMinY, w = bgMaxY (all in ems). */
+  /** x = textWidth, y = reserved, z = bgMinY, w = bgMaxY (all in ems). */
   BOX: 2,
   /**
    * x = declutterHide, y = batchId, z = show, w = batchIndex.
@@ -32,6 +36,17 @@ export const LabelRow = {
    * style (color/opacity/size/height) — see guide/BATCH_TEXTURE.md.
    */
   STATE: 3,
+  /**
+   * Along-line placement only, all zero otherwise.
+   *
+   * x = first texel of this label's run in the *path* texture (`uPathData`),
+   * y = metres between adjacent path samples,
+   * z = flip (non-zero reverses the walk, so `keepUpright` can turn a label
+   *     that would otherwise read right-to-left),
+   * w = rejected (non-zero culls the label: it overruns its line or bends too
+   *     sharply). Starts at 1 until the placement pass first judges it.
+   */
+  PATH: 4,
 } as const;
 
 /** Texels per label. Derived from {@link LabelRow} so the two can't disagree. */
@@ -52,14 +67,42 @@ export type SdfTextBaseProps = {
   /** When `true` the fragment shader samples the atlas as 4-channel MTSDF
    *  (median of RGB + true SDF in alpha) instead of single-channel R8. */
   useMsdf?: boolean;
+  /** Bend each glyph along the line its anchor was placed on, reading the
+   *  resampled path from `uPathData`. Immutable because it decides which
+   *  branch the shader compiles; placement is a layer-level property, never
+   *  per feature. */
+  linePlacement?: boolean;
+  /** Samples per label in the path texture. Must match the Rust constant that
+   *  produced the data; injected as a GLSL define. */
+  pathSamples?: number;
 
   // Mutable state
-  center?: [number, number];
+  /** `false` (the default) keeps the quad in the screen plane; `true` lays it
+   *  on the globe surface around the anchor, wrapped to its curvature, so
+   *  labels read as painted on the globe. Resolved by the mesh. */
+  flatFacing?: boolean;
+  /** `true` (the default) keeps the quad reading left-to-right — a
+   *  screen-aligned billboard, or for `flatFacing` a yaw around the surface
+   *  normal. `false` aligns it with the map: x-axis east. Resolved by the
+   *  mesh. */
+  rotateWithCamera?: boolean;
+  /** Spin of the quad inside its own plane about the anchor, in **degrees**,
+   *  clockwise seen from the front. Converted to radians in state. */
+  rotation?: number;
   sizeInMeters?: boolean;
+  /** Perpendicular shift away from the line, in the same units as the font
+   *  size. Positive is left of the direction of travel. Line placement only. */
+  lineOffset?: number;
+  /** Screen-pixel shift of the whole label, x right and y down. */
+  translate?: [number, number];
+  /** `true` keeps `translate` on the screen axes; `false` turns it with the
+   *  camera heading (MapLibre's `*-translate-anchor: map`). */
+  translateViewport?: boolean;
+  /** Each glyph of an along-line label is its own piece; with
+   *  `rotateWithCamera` it also turns to the camera, and without it the
+   *  label is drawn straight at its anchor. Line placement only. */
+  spreadGlyphs?: boolean;
   offsetDepth?: boolean;
-  outlineWidth?: number; // raw width, converted in state via sdfRadiusFor(useMsdf)
-  outlineColor?: number; // hex
-  outlineOpacity?: number;
   showBackground?: boolean;
   backgroundColor?: number; // hex
   backgroundOutlineColor?: number; // hex
@@ -74,6 +117,9 @@ export type SdfTextBaseProps = {
   // Material properties (set directly on material, not via uniforms)
   depthTest?: boolean;
   transparent?: boolean;
+  /** Cull faces seen from behind (`FrontSide`); `false` (the default) draws
+   *  both sides (`DoubleSide`). */
+  backfaceCulling?: boolean;
 
   // External uniform refs / values (may change over time)
   rtcCenter?: [number, number, number];
@@ -87,14 +133,19 @@ export type SdfTextBaseState = Readonly<{
   // Immutable after mount
   useRTE: boolean;
   useMsdf: boolean;
+  linePlacement: boolean;
+  pathSamples: number;
 
   // Mutable
-  center: [number, number];
+  flatFacing: boolean;
+  rotateWithCamera: boolean;
+  rotation: number; // pre-converted: degrees -> radians
   sizeInMeters: boolean;
+  lineOffset: number;
+  translate: [number, number];
+  translateViewport: boolean;
+  spreadGlyphs: boolean;
   offsetDepth: boolean;
-  outlineWidth: number; // pre-converted: raw / sdfRadiusFor(useMsdf)
-  outlineColor: Color;
-  outlineOpacity: number;
   showBackground: boolean;
   backgroundColor: Color;
   backgroundOutlineColor: Color;
@@ -107,6 +158,7 @@ export type SdfTextBaseState = Readonly<{
   // Material properties
   depthTest: boolean;
   transparent: boolean;
+  backfaceCulling: boolean;
 }>;
 
 /**
@@ -115,13 +167,12 @@ export type SdfTextBaseState = Readonly<{
  * Internal type - not exposed externally.
  */
 export type SdfTextBaseRefs = {
-  uCenter: UniformValue<Vector2>;
+  uFlatFacing: UniformValue<boolean>;
+  uRotateWithCamera: UniformValue<boolean>;
+  uRotation: UniformValue<number>;
   uSizeInMeters: UniformValue<boolean>;
   uOffsetDepth: UniformValue<boolean>;
   uSdfThreshold: UniformValue<number>;
-  uOutlineWidth: UniformValue<number>;
-  uOutlineColor: UniformValue<Color>;
-  uOutlineOpacity: UniformValue<number>;
   uShowBackground: UniformValue<boolean>;
   uBackgroundColor: UniformValue<Color>;
   uBackgroundOutlineColor: UniformValue<Color>;
@@ -152,6 +203,16 @@ export type SdfTextBaseRefs = {
   /** Dimensions of `uLabelData` in texels, for the shader's index-to-texel
    *  math. Read as an `ivec2`. */
   uLabelTexSize: UniformValue<Vector2>;
+  /** Per-label resampled line, as east/north metre offsets from the anchor.
+   *  Only bound under line placement. */
+  uPathData: UniformValue<DataTexture | null>;
+  /** Dimensions of `uPathData` in texels. */
+  uPathTexSize: UniformValue<Vector2>;
+  /** Perpendicular shift from the line, in the same units as the font size. */
+  uLineOffset: UniformValue<number>;
+  uTranslate: UniformValue<Vector2>;
+  uTranslateViewport: UniformValue<boolean>;
+  uSpreadGlyphs: UniformValue<boolean>;
   /** Shared batch data texture ref (per-feature style); growth swaps its
    *  `.value` in place. */
   batchDataTexture?: UniformValue<DataTexture | null>;
@@ -198,6 +259,12 @@ export type SdfTextBaseMutates = Mutates<
      * whenever the mesh grows it, since growing allocates a new texture.
      */
     setLabelDataTexture: (
+      texture: DataTexture | null,
+      width: number,
+      height: number,
+    ) => void;
+    /** Same, for the per-label path texture used by line placement. */
+    setPathDataTexture: (
       texture: DataTexture | null,
       width: number,
       height: number,

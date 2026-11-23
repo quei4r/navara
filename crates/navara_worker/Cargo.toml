@@ -24,3 +24,5 @@ navara_event_store.workspace = true
 navara_feature_component.workspace = true
 navara_material.workspace = true
 navara_parser.workspace = true
+navara_worker_component.workspace = true
+rustc-hash.workspace = true

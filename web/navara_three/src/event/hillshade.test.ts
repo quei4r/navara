@@ -424,9 +424,6 @@ describe("hillshade normal map generation", () => {
       textureOptions: mockTextureOptions as any,
       tileHandler: mockTileHandler as any,
       hillshadeContext,
-      eventManager: {
-        stacks: { hillshade_backfilled: [] },
-      },
     } as unknown as EventContext;
   });
 
@@ -759,78 +756,5 @@ describe("hillshade normal map generation", () => {
     ).not.toThrow();
     expect(hillshadeContext.pendingEdges.size).toBe(0);
     expect(loadedTexs.size).toBe(0);
-  });
-
-  it("drops pending backfills targeting the canceled entity but keeps others", () => {
-    // Source X has init + 2 edge updates queued. A neighbor Z also has an init
-    // queued. Canceling X should drop X's init only; X→Y edge update (keyed by
-    // target Y) and Z's init must survive.
-    const initX = {
-      ind: 10,
-      gen: 1,
-      tile_handle: 1n,
-      original_handle: 42,
-      edge_data_handle: -1,
-      edge_direction: 255,
-      target_entity_ind: undefined,
-      target_entity_gen: undefined,
-      free: vi.fn(),
-    } as unknown as HillshadeBackfilledEvent;
-    const edgeXtoY = {
-      ind: 10,
-      gen: 1,
-      tile_handle: 1n,
-      original_handle: -1,
-      edge_data_handle: 100,
-      edge_direction: 0,
-      target_entity_ind: 20,
-      target_entity_gen: 1,
-      free: vi.fn(),
-    } as unknown as HillshadeBackfilledEvent;
-    const edgeXtoX = {
-      ind: 10,
-      gen: 1,
-      tile_handle: 1n,
-      original_handle: -1,
-      edge_data_handle: 101,
-      edge_direction: 1,
-      target_entity_ind: 10,
-      target_entity_gen: 1,
-      free: vi.fn(),
-    } as unknown as HillshadeBackfilledEvent;
-    const initZ = {
-      ind: 30,
-      gen: 2,
-      tile_handle: 2n,
-      original_handle: 43,
-      edge_data_handle: -1,
-      edge_direction: 255,
-      target_entity_ind: undefined,
-      target_entity_gen: undefined,
-      free: vi.fn(),
-    } as unknown as HillshadeBackfilledEvent;
-
-    const stack: HillshadeBackfilledEvent[] = [
-      initX,
-      edgeXtoY,
-      edgeXtoX,
-      initZ,
-    ];
-    (mockContext.eventManager as any).stacks.hillshade_backfilled = stack;
-
-    processHillshadeCanceled(mockContext, {
-      ind: 10,
-      gen: 1,
-    } as EntityEvent);
-
-    // initX (id "10_1") and edgeXtoX (target "10_1") are dropped.
-    // edgeXtoY (target "20_1") and initZ (id "30_2") survive.
-    expect(
-      (mockContext.eventManager as any).stacks.hillshade_backfilled,
-    ).toEqual([edgeXtoY, initZ]);
-    expect(initX.free).toHaveBeenCalledTimes(1);
-    expect(edgeXtoX.free).toHaveBeenCalledTimes(1);
-    expect(edgeXtoY.free).not.toHaveBeenCalled();
-    expect(initZ.free).not.toHaveBeenCalled();
   });
 });

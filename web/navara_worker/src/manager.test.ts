@@ -19,14 +19,18 @@ it("should get correct concurrency states", () => {
   expect(manager.idles()).toBe(0);
 
   expect(manager.canIncrement()).toBeFalsy();
+  // Oversubscription still counts, so each decrement stays matched.
   manager.increment();
-  expect(manager.actives()).toBe(1);
+  expect(manager.actives()).toBe(2);
   expect(manager.idles()).toBe(0);
 
   // Decrement
 
   expect(manager.canDecrement()).toBeTruthy();
 
+  manager.decrement();
+  expect(manager.actives()).toBe(1);
+  expect(manager.canIncrement()).toBeFalsy();
   manager.decrement();
   expect(manager.actives()).toBe(0);
   expect(manager.idles()).toBe(1);

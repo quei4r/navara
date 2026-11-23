@@ -13,6 +13,12 @@ pub struct UpsampleTerrainMeshMarker;
 #[derive(Component, Clone, Debug, Serialize)]
 pub struct UpsampleTerrainMeshParameters {
     pub tile_handle: TileHandle,
+    /// The ancestor whose mesh is clipped down to this tile (see
+    /// `TerrainTile::find_upsample_source`).
+    pub source_tile_handle: TileHandle,
+    /// DEM tile width in pixels (raster DEM only): the resampled grid and the
+    /// martini instance the upsampled tile is meshed with use this size.
+    pub tile_size: u32,
     /// Whether to render skirts along tile boundaries.
     pub skirt: bool,
     pub pole_sides: (bool, bool),
@@ -74,6 +80,7 @@ mod test {
                 skirt_uvs: None,
                 skirt_indices: None,
                 skirt_normals: None,
+                skirt_heights: None,
             },
             heights: buf.new_f32(vec![0.]),
             min_height: 0.,

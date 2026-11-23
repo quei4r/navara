@@ -1,8 +1,7 @@
 import type {
   Color as CoreColor,
-  ColorMap,
   EventHandler,
-  EventManager,
+  JobDispatcher,
 } from "@navaramap/core";
 import type {
   DelegatedWorkerTasksResult,
@@ -21,6 +20,7 @@ import type { Texture } from "three";
 
 import type { ViewEvents } from "..";
 import type { ThreeViewCamera } from "../camera";
+import type { ColorMapAtlas } from "../colorMapAtlas";
 import type { ViewContext } from "../core";
 import type { DeclutterManager } from "../declutter";
 import type { LayersManager } from "../layersManager";
@@ -28,13 +28,7 @@ import type { TileMesh } from "../mesh/tile";
 import type { Scenes, TexturizedSceneByTileCoordinates } from "../scene";
 import type { TextureOptions } from "../textures";
 import type { TileTextureCompositor } from "../tileTexture";
-import type {
-  AbortControllers,
-  MeshCache,
-  WorkerPoolPromises,
-  RenderFlag,
-  TileMapByHandle,
-} from "../type";
+import type { MeshCache, RenderFlag, TileMapByHandle } from "../type";
 import type { CommonUniforms } from "../uniforms";
 import type { TextureSlot } from "../utils";
 
@@ -78,7 +72,7 @@ export type BufferLoader = {
    * `InMemoryBufferStore`; called once per frame. */
   drainRemovedExternalHandles: () => void;
   triggerDataRequesterLoaded: (bits: bigint, handle: number) => void;
-  triggerDataRequesterFailed: (bits: bigint) => void;
+  triggerDataRequesterFailed: (bits: bigint, handle: number) => void;
 };
 
 export type TextureFragmentHandler = {
@@ -104,10 +98,13 @@ export type WorkerTaskHandler = {
 export type TileHandler = {
   getMartini: (bits: ReconstructableEntity) => TransferableMartini | undefined;
   getTile: (handle: bigint) => TransferableTile | undefined;
-  getParentTile: (handle: bigint) => TransferableTile | undefined;
   getTileElevationDecoder: (handle: bigint) => ElevationDecoder | undefined;
+  /** Buffer handle of a tile's loaded raw DEM bytes, the data a raster-DEM
+   * upsample of a descendant resamples from. */
+  getTerrainDemBytes: (handle: bigint) => number | undefined;
+  /** The vector drape sources handed over for a terrain tile; re-read when the
+   * `vector_drape_changed` event lists the tile. */
   getVectorTileStates: (handle: bigint) => VectorTileState[] | undefined;
-  vectorRevision: () => number;
   /** The WM raster tiles to bake into per-layer drape render targets for a
    * terrain tile (Geographic terrain only; empty on WebMercator terrain). */
   getRasterTileStates: (handle: bigint) => RasterTileState[] | undefined;
@@ -142,7 +139,6 @@ export type GlobeHandler = {
   getUseNormal: () => boolean | undefined;
   getOpacity: () => number | undefined;
   getWireframe: () => boolean | undefined;
-  getElevationColormap: () => Float32Array | undefined;
   setTransparent: (value: boolean) => void;
   setMaxSse: (value: number) => void;
   setSegments: (value: number) => void;
@@ -151,7 +147,6 @@ export type GlobeHandler = {
   setUseNormal: (value: boolean) => void;
   setOpacity: (value: number) => void;
   setWireframe: (value: boolean) => void;
-  setElevationColormap: (value: ColorMap) => void;
 };
 
 export type FeatureHandler = {
@@ -197,11 +192,10 @@ export type LayerHandler = {
 };
 
 type EventContextArgs = {
-  eventManager: EventManager;
+  dispatcher: JobDispatcher;
   scenes: Scenes;
   camera: ThreeViewCamera;
   meshes: MeshCache;
-  abortControllers: AbortControllers;
   buf: BufferLoader;
   texFragment: TextureFragmentHandler;
   tileHandler: TileHandler;
@@ -209,7 +203,6 @@ type EventContextArgs = {
   meshHandler: MeshHandler;
   featureHandler: FeatureHandler;
   loadedTexs: Map<string, Texture>;
-  workerPoolPromises: WorkerPoolPromises;
   uniforms: CommonUniforms;
   texturizedSceneByTileCoordinates: TexturizedSceneByTileCoordinates;
   tileTextureCompositor: TileTextureCompositor;
@@ -226,6 +219,7 @@ type EventContextArgs = {
   tileMeshToFragmentIds?: Map<TileMesh, Set<string>>;
   hillshadeContext?: HillshadeContext;
   declutter?: DeclutterManager;
+  colorMapAtlas?: ColorMapAtlas;
 };
 
 /**
@@ -233,11 +227,10 @@ type EventContextArgs = {
  * and propagate them into each processor.
  */
 export class EventContext {
-  readonly eventManager: EventManager;
+  readonly dispatcher: JobDispatcher;
   readonly scenes: Scenes;
   readonly camera: ThreeViewCamera;
   readonly meshes: MeshCache;
-  readonly abortControllers: AbortControllers;
   readonly buf: BufferLoader;
   readonly texFragment: TextureFragmentHandler;
   readonly tileHandler: TileHandler;
@@ -245,7 +238,6 @@ export class EventContext {
   readonly meshHandler: MeshHandler;
   readonly featureHandler: FeatureHandler;
   readonly loadedTexs: Map<string, Texture>;
-  readonly workerPoolPromises: WorkerPoolPromises;
   readonly uniforms: CommonUniforms;
   readonly texturizedSceneByTileCoordinates: TexturizedSceneByTileCoordinates;
   readonly tileTextureCompositor: TileTextureCompositor;
@@ -264,15 +256,16 @@ export class EventContext {
   /** Shared screen-space label declutterer; text/sprite meshes register as
    *  participants on creation. Optional so headless contexts can skip it. */
   readonly declutter?: DeclutterManager;
+  /** ColorMap atlas for elevation heatmap layers. */
+  readonly colorMapAtlas?: ColorMapAtlas;
 
   updatedAt = 0;
 
   constructor(args: EventContextArgs) {
-    this.eventManager = args.eventManager;
+    this.dispatcher = args.dispatcher;
     this.scenes = args.scenes;
     this.camera = args.camera;
     this.meshes = args.meshes;
-    this.abortControllers = args.abortControllers;
     this.buf = args.buf;
     this.texFragment = args.texFragment;
     this.tileHandler = args.tileHandler;
@@ -280,7 +273,6 @@ export class EventContext {
     this.meshHandler = args.meshHandler;
     this.featureHandler = args.featureHandler;
     this.loadedTexs = args.loadedTexs;
-    this.workerPoolPromises = args.workerPoolPromises;
     this.uniforms = args.uniforms;
     this.texturizedSceneByTileCoordinates =
       args.texturizedSceneByTileCoordinates;
@@ -298,5 +290,6 @@ export class EventContext {
     this.tileMeshToFragmentIds = args.tileMeshToFragmentIds;
     this.hillshadeContext = args.hillshadeContext;
     this.declutter = args.declutter;
+    this.colorMapAtlas = args.colorMapAtlas;
   }
 }

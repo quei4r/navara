@@ -27,7 +27,7 @@ All base classes inherit from `BaseDesc` and share a common lifecycle.
 | `constructor(view, ctx, config)` | When the Descriptor is created   | Receives the ThreeView, ViewContext, and configuration                                                 |
 | `onCreate()`                     | When `addMesh()`/`addLight()`/`addEffect()` is called | Calls the factory method to create an instance and adds it to the scene. Implemented by the base class |
 | `onUpdateConfig(updates)`        | When `handle.update()` is called | Processes partial configuration updates                                                                |
-| `onDestroy()`                    | When `handle.delete()` is called | Releases resources and removes from the scene                                                          |
+| `onDestroy()`                    | When `handle.delete()` or `view.dispose()` is called | Releases resources and removes from the scene                                                          |
 | `update(time)`                   | Every frame (optional)           | Animation processing. Only called if implemented                                                       |
 | `onResize(width, height)`        | On viewport resize (optional)    | Mesh Descriptors only. Only called if implemented                                                           |
 
@@ -97,10 +97,26 @@ Use these to inherit the scene's existing configuration instead of duplicating i
 | `ctx.getRenderTarget()`       | Get the main render target (includes G-buffer)   |
 | `ctx.getGlobeDepthTexture()`  | Get the globe depth texture for post-processing  |
 | `ctx.getGlobeNormalTexture()` | Get the terrain-only normal, sampled in screen space. Declare `globeNormal` in `requiredBuffers`. It is kept at 1x1 otherwise |
-| `ctx.getNormalTexture()`      | Get the scene normal texture from the G-buffer   |
+| `ctx.getNormalTexture()`      | Get the scene normal texture from the G-buffer. Declare `normal` in `requiredBuffers` |
 | `ctx.getEffectIdsTexture()`   | Get the effect IDs texture from the G-buffer     |
 | `ctx.getEmissiveTexture()`    | Get the emissive texture from the G-buffer       |
 | `ctx.getShadowTexture()`      | Get the shadow texture (R=shadow amount, 0=lit..1=fully shadowed) from the G-buffer |
+
+#### Shared Uniforms
+
+Each method returns a `{ value }` ref that the view updates every frame. Assign the ref itself to a material's `uniforms`, not its current `value`, so the material follows the updates.
+
+| Method                                    | Description |
+| ----------------------------------------- | ----------- |
+| `ctx.getGlobeDepthTextureUniform()`       | The texture of `ctx.getGlobeDepthTexture()` |
+| `ctx.getGlobeNormalTextureUniform()`      | The texture of `ctx.getGlobeNormalTexture()`. Declare `globeNormal` as a required buffer to sample it |
+| `ctx.getSkyEnvMapTextureUniform()`        | The sky environment map |
+| `ctx.getWaterState()`                     | The view's water state, used by the water shader chunk: `uniforms` holds what water materials share, and `createWaves(conditions)` holds one surface's waves. The first read of `uniforms` generates the wave texture |
+| `ctx.getViewportAndPixelRatioUniform()`   | `[width, height, pixelRatio]`, with the viewport size in CSS pixels |
+| `ctx.getFrustumNearFarUniform()`          | The camera's `[near, far]` |
+| `ctx.getFrustumRatioUniform()`            | The camera frustum's `[top, bottom, right, left]` on the near plane |
+| `ctx.getInverseProjectionMatrixUniform()` | The camera's inverse projection matrix |
+| `ctx.getTimeUniform()`                    | The frame timestamp passed to `preUpdate` |
 
 #### Shadow (Experimental)
 
@@ -113,12 +129,12 @@ Use these to inherit the scene's existing configuration instead of duplicating i
 
 Navara renders into a multiple-render-target (MRT) G-buffer. Depth/normal-based effects (SSAO, SSR, outlines, aerial perspective, clouds) and selective effects (Bloom / Outline) read these attachments, so a mesh participates in those effects only if its material writes the G-buffer.
 
-Only color and normal are always present. The rest are allocated on demand and **packed after them with no gaps**, so their locations shift with the configuration. The shader receives each one's `layout(location = …)` as a stamped define.
+Only color is always present. The rest, normal included, are allocated on demand and **packed after it with no gaps**, so their locations shift with the configuration. The shader receives each one's `layout(location = …)` as a stamped define.
 
 | Attachment | Location | Contents                                                     | Allocated                |
 | ---------- | -------- | ------------------------------------------------------------ | ------------------------ |
 | Color      | 0        | `gl_FragColor`                                                | always                   |
-| Normal     | 1        | View-space normal (plus material properties)                  | always                   |
+| Normal     | 1        | View-space normal (plus material properties)                  | `buffers.normal`         |
 | Effect ID  | packed   | Selective-effect bitmask                                      | `buffers.selectiveEffect` |
 | Emissive   | packed   | Selective-effect additive emissive                            | `buffers.emissive`        |
 | Shadow     | packed   | R = shadow amount (0 = lit .. 1 = shadowed), G = albedo flag  | `buffers.shadow`          |
@@ -243,9 +259,40 @@ view.addMesh<GlowSphereDesc>({
 
 To read these buffers from a custom effect, use the [Buffer / Texture Access](#buffer--texture-access) accessors on `ctx`, or reference the MRT pass from another effect via [`find<MRTPassEffectDesc>("mrt")`](#referencing-other-effect-descs).
 
-The effectIds, emissive, shadow and globeNormal buffers are optional: they exist only while an active effect declares them in its `static requiredBuffers` (e.g. `["selectiveEffect", "emissive"]`, `["shadow"]` or `["globeNormal"]`), and the accessors return `undefined` otherwise.
+The normal, effectIds, emissive, shadow and globeNormal buffers are optional: they exist only while an active effect declares them in its `static requiredBuffers` (e.g. `["normal"]`, `["selectiveEffect", "emissive"]`, `["shadow"]` or `["globeNormal"]`) or a mesh requests them (see [Requesting G-Buffers](#requesting-g-buffers)), and the accessors return `undefined` otherwise.
 
-`globeNormal` is the odd one out: it is a separate screen-space copy of the terrain normal rather than a G-buffer attachment, so it takes no attachment slot and does not count against the device's `MAX_DRAW_BUFFERS`. Undeclared, its target stays 1x1 and `ctx.getGlobeNormalTexture()` returns a texture you cannot sample meaningfully. A custom effect that reads them must declare `requiredBuffers` so the view allocates them. Note that changing the set of allocated buffers reallocates attachments and recompiles shaders, so effects should be added once and tuned via `update()` rather than added and removed repeatedly. Because a configuration change rebuilds the attachments, fetch these textures each frame (in `update()` or the pass's `render()`) instead of caching them at pass creation.
+An effect whose needs depend on its own configuration overrides `getRequiredBuffers()` instead. The override replaces the static entirely, so declare one or the other. It is read before `onCreate()`, so derive the result from the constructor config, and emit `gbufferRequirementsChanged` on `ctx` when an `update()` changes it. The view then re-derives the buffers. When the new attachments would exceed the device's `MAX_DRAW_BUFFERS`, the view logs an error and keeps the previous buffers. `addEffect()` and `addMesh()` throw in that case instead, unless the descriptor's buffers are already allocated.
+
+Meshes that support selective effects render in the G-buffer pass only while a selective effect or an optional buffer is active. An effect composited over the G-buffer output that may need no buffer at all sets `static requiresMrtPass = true` to keep them there, so they still sort with the pass's transparent content (aerial perspective does this).
+
+```typescript
+import { type GBufferName } from "@navaramap/three";
+
+export class MyEffectDesc extends EffectDesc<MyEffectConfig, MyEffectUpdate, MyPostProcessingPass> {
+  static key = "myEffect";
+
+  private shadow: boolean;
+
+  constructor(view: ThreeView, ctx: ViewContext, config: MyEffectConfig) {
+    super(view, ctx, config);
+    this.shadow = config.myEffect?.shadow ?? false;
+  }
+
+  getRequiredBuffers(): readonly GBufferName[] {
+    return this.shadow ? ["normal", "shadow"] : ["normal"];
+  }
+
+  update(config: MyEffectUpdate) {
+    const shadow = config.myEffect?.shadow;
+    if (shadow !== undefined && shadow !== this.shadow) {
+      this.shadow = shadow;
+      this.ctx.emit("gbufferRequirementsChanged");
+    }
+  }
+}
+```
+
+`globeNormal` is the odd one out: it is a separate screen-space copy of the terrain normal rather than a G-buffer attachment, so it takes no attachment slot of its own. It is copied from the normal attachment, so requiring it also allocates `normal`. Undeclared, its target stays 1x1 and `ctx.getGlobeNormalTexture()` returns a texture you cannot sample meaningfully. A custom effect or mesh that reads them must declare them so the view allocates them. Note that changing the set of allocated buffers reallocates attachments and recompiles shaders, so effects should be added once and tuned via `update()` rather than added and removed repeatedly. Because a configuration change rebuilds the attachments, fetch these textures each frame (in `update()` or the pass's `render()`) instead of caching them at pass creation.
 
 Buffer encodings to be aware of when sampling:
 
@@ -296,6 +343,54 @@ You can override `getPassKey()` to change the scene where the mesh is rendered.
 | `"mrt"`         | For selective effects (Bloom / Outline) |
 | `"skyEnvMap"`   | For environment maps                    |
 | `"draped"`      | For terrain-draped rendering            |
+
+In the `"draped"` pass, a `DrapedMesh` is painted onto the terrain where its volume meets the ground. A lit built-in material such as `MeshLambertMaterial` is shaded with the terrain's normal and position under each pixel, while a custom `ShaderMaterial` is shaded on its own volume. A `DrapedMesh` casts no shadow while draped.
+
+### Requesting G-Buffers
+
+A mesh whose material samples an optional buffer, for example the texture of [`ctx.getGlobeNormalTextureUniform()`](#shared-uniforms), declares it by overriding `getRequiredBuffers()`. The view allocates the union of what active effects and meshes request.
+
+By default a mesh in the `"draped"` pass requests `globeNormal`, which its lit material is shaded with, and any other mesh requests nothing. A draped mesh with an unlit material, or with a lit one shaded with the ellipsoid normal through `setDrapeGroundNormals(material, false)`, can return `[]` to skip the full-screen copy of the terrain normal.
+
+`getRequiredBuffers()` is read before `onCreate()`, so derive the result from the constructor config. When an `update()` changes the result, emit `gbufferRequirementsChanged` on `ctx`. Moving a mesh into or out of the `"draped"` pass emits it automatically.
+
+```typescript
+import ThreeView, {
+  MeshDesc,
+  type GBufferName,
+  type MeshConfig,
+  type MeshUpdate,
+  type ViewContext,
+} from "@navaramap/three";
+import type { Mesh } from "three";
+
+type MyMeshConfig = MeshConfig & { myMesh?: { groundShading?: boolean } };
+type MyMeshUpdate = MeshUpdate & { myMesh?: { groundShading?: boolean } };
+
+class MyMeshDesc extends MeshDesc<MyMeshConfig, MyMeshUpdate, Mesh> {
+  private groundShading: boolean;
+
+  constructor(view: ThreeView, ctx: ViewContext, config: MyMeshConfig) {
+    super(view, ctx, config);
+    this.groundShading = config.myMesh?.groundShading ?? false;
+  }
+
+  override getRequiredBuffers(): readonly GBufferName[] {
+    return this.groundShading ? ["globeNormal"] : [];
+  }
+
+  onUpdateConfig(updates: MyMeshUpdate): void {
+    const groundShading = updates.myMesh?.groundShading;
+    if (groundShading !== undefined && groundShading !== this.groundShading) {
+      this.groundShading = groundShading;
+      this.ctx.emit("gbufferRequirementsChanged");
+    }
+    super.onUpdateConfig(updates);
+  }
+
+  // createMesh() omitted
+}
+```
 
 ### Implementation Example
 
@@ -653,6 +748,10 @@ createPass() {
   // ...
 }
 ```
+
+### Disposal
+
+When the effect is deleted (`handle.delete()`, or `view.dispose()` for every descriptor still added), the base `onDestroy()` removes the pass from the pipeline and disposes it: it calls the instance's `dispose()`, or `raw.dispose()` when the instance is a wrapper without one. A postprocessing pass's `dispose()` releases the render targets, materials, and textures held in its own properties and in those of its effects, so return a pass that owns them. Keep a texture shared with other effects (for example the MRT buffers from `find()`) in a uniform, not in a property of the pass or of one of its effects.
 
 ## Custom Light Desc
 

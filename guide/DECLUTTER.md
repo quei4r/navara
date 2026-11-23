@@ -18,13 +18,16 @@ and which get hidden.
 That "something" is split in two. The **orchestration** — collecting
 candidates from the meshes, throttling, dirty tracking, and driving the fades —
 is the `DeclutterManager`, one shared TypeScript instance per `ThreeView`
-(`web/navara_three/src/index.ts:447`). The **numeric kernel** it calls each pass
+(`web/navara_three/src/index.ts`). The **numeric kernel** it calls each pass
 — projecting anchors to screen space, sorting, and the greedy grid placement —
 lives in Rust: `declutterPlace` in `crates/navara_wasm_api/src/declutter.rs`,
 exposed to TypeScript through the `@navaramap/engine-api` WASM bindings. Rust
-also carries the two per-material config fields — `declutter: bool` and
-`declutter_priority: f32` (`crates/navara_material/src/appearance.rs`) — through
-to the bindings.
+also carries the per-material config fields — `declutter: bool`,
+`declutter_rank: f32`, `declutter_priority: f32`, `declutter_padding: [f32; 4]`,
+`overlap: Overlap` and `ignore_placement: bool`
+(`crates/navara_material/src/appearance.rs`) — through to the bindings. Along-line labels and sprites go through a second kernel,
+`crates/navara_wasm_api/src/line_label.rs`, which participants call at the
+start of each pass (see [step 0](#0-line-placement)).
 
 The split follows the seam where the work changes character: everything that
 touches Three.js objects (meshes, the camera, the render loop) stays in
@@ -50,14 +53,20 @@ a **candidate**, and ends with each one marked shown or hidden:
 
 ```mermaid
 flowchart TD
+  Z["<b>0 · Prepare & place along lines</b><br/>promote parked labels; pick each<br/>line anchor's level, fit, flip, box"] --> A
   A["<b>1 · Collect</b><br/>every participant contributes its<br/>visible candidates"] --> B["<b>2 · Project & cull</b><br/>world anchor → screen-pixel AABB<br/>horizon / near-plane culling"]
   B --> C["<b>3 · Sort</b><br/>priority desc, then hysteresis<br/>tiebreak, then deterministic"]
   C --> D["<b>4 · Place greedily</b><br/>walk the sorted list, claim space<br/>in a screen-space grid"]
   D --> E["<b>5 · Fade</b><br/>losers fade out, winners fade in<br/>over DECLUTTER_FADE_MS"]
 ```
 
+0. **Prepare & place along lines** — participants start font preparation for
+   parked labels now in view, and decide along-line placement, so an anchor
+   rejected here never competes. → [Line placement](#0-line-placement)
 1. **Collect** — every registered participant (a text batch or a sprite mesh)
-   appends its candidates. → [Candidates and participants](#1-candidates-and-participants)
+   appends its candidates. Along-line candidates bring the rotated box line
+   placement computed instead of their unrotated one.
+   → [Candidates and participants](#1-candidates-and-participants)
 2. **Project & cull** — each candidate's world anchor becomes a screen-pixel
    box; labels behind the camera or beyond the horizon are excluded.
    → [Projecting to screen space](#2-projecting-to-screen-space)
@@ -69,7 +78,8 @@ flowchart TD
    animates smoothly toward it. → [Fading, not popping](#5-fading-not-popping)
 
 Steps 2–4 (project, sort, place) run inside the Rust kernel; steps 1 and 5
-(collect, fade) stay in TypeScript. The whole pass is throttled and only reruns
+(collect, fade) stay in TypeScript. Step 0 is driven by each participant, with
+its numerics in `line_label.rs`. The whole pass is throttled and only reruns
 when something actually changed — see
 [Running in the frame loop](#running-in-the-frame-loop).
 
@@ -84,12 +94,17 @@ graph TD
     DM -->|"candidate shape"| Types
     WasmK -.implements.-> Kernel
   end
-  subgraph rs["Rust · crates/navara_wasm_api/src/declutter.rs"]
-    Place["declutterPlace()<br/>project + horizon cull + sort + grid"]
+  subgraph rs["Rust · crates/navara_wasm_api/src/"]
+    Place["declutter.rs · declutterPlace()<br/>project + horizon cull + sort + grid"]
+    Line["line_label.rs · lineLabelFit() / lineLabelPlace()<br/>lineAnchorPlace()"]
   end
   WasmK -->|"@navaramap/engine-api (WASM)"| Place
   Text["Text batches<br/>(mesh/sdfText/)"] -->|"register() / collectDeclutterCandidates()"| DM
   Sprites["Instanced sprites"] -->|"register() / collectDeclutterCandidates()"| DM
+  DM -->|"placeLineLabels()"| Text
+  DM -->|"placeLineLabels()"| Sprites
+  Text -->|"lineLabelFit / lineLabelPlace"| Line
+  Sprites -->|"lineAnchorPlace"| Line
 ```
 
 Injecting the kernel through the `DeclutterKernel` interface keeps the manager
@@ -99,10 +114,33 @@ and drive only the orchestration. Placement correctness — projection, the grid
 hysteresis — is covered by Rust `#[cfg(test)]` tests in `declutter.rs`, where
 that logic now lives.
 
+## 0. Line placement
+
+Before collecting, `_run` gives every participant two optional hooks, in this
+order, with the camera the pass will use:
+
+- `prepareDeferredLabels(camera)` — text batches park font loading and shaping
+  for labels whose anchor is out of view; this promotes the ones that came into
+  view. Preparation is asynchronous, so they join a *later* pass.
+- `placeLineLabels(camera, heightPx)` — decides along-line placement. Which
+  level of a line's anchors is on screen, whether a text label fits its line or
+  bends too sharply, which way it reads, and the box a turned label covers all
+  depend on the camera, so none can be baked at parse time. Running this before
+  `collectDeclutterCandidates` means a rejected anchor never claims space.
+
+Both participants are registered whether or not the layer declutters, so line
+placement runs for a `declutter: false` layer too; only candidate collection is
+gated by `declutter` (see [Overlap modes](#overlap-modes) for the one other
+setting that keeps a layer out). Text batches call `lineLabelFit` then `lineLabelPlace`;
+sprites call `lineAnchorPlace`, which only picks the level and the box. The
+mechanics (nested levels, scale bands, the two-phase kernel, flip hysteresis,
+level handoff) are in
+[LINE_PLACEMENT.md](LINE_PLACEMENT.md).
+
 ## 1. Candidates and participants
 
-A `DeclutterCandidate` (`declutter/types.ts:10-37`) is one label or sprite
-competing for space in a single pass:
+A `DeclutterCandidate` (`declutter/types.ts`) is one label or sprite competing
+for space in a single pass:
 
 ```ts
 export type DeclutterCandidate = {
@@ -110,34 +148,75 @@ export type DeclutterCandidate = {
   addHeight: number;               // surface-normal height offset (meters)
   minX: number; maxX: number; minY: number; maxY: number; // local box, px or meters
   sizeInMeters: boolean;
+  rank: number;        // compared before priority; higher places first
   priority: number;    // higher wins an overlap
   isShown: boolean;    // currently visible — feeds hysteresis
+  overlap: "never" | "always" | "cooperative"; // see Overlap modes
+  ignorePlacement: boolean; // test, but leave the box out of the grid
+  padding: readonly number[]; // screen px: top, right, bottom, left
+  pairGroup: number;   // 0 = never paired
+  featureIndex: number;
+  pairRole: "label" | "billboard";
+  standalone: boolean; // may show while its pair partner is hidden
+  flatFacing: boolean; rotateWithCamera: boolean; rotation: number; // quad orientation
+  translate: readonly [number, number]; translateViewport: boolean; // screen-px shift
+  variants?: number;   // variable anchors: group size on the first row, 0 after
+  variant?: number;    // participant's tag for the row, handed back
   owner: DeclutterParticipant;
   handle: number;      // label slot (text) or instance index (sprites)
+  contentKey?: string; // label text; feeds the tile-swap handoff
 };
 ```
 
+The local box is anchor-relative, +Y up. For a point label or sprite it is
+the unrotated block, sent with the quad's effective orientation (facing,
+`rotateWithCamera`, `rotation`, per-feature overrides included, plus the line
+bearing a sprite on a line adds without scale bands); the kernel turns it with
+`quad_screen_basis` and `basis_box` from `line_label.rs`, the CPU mirror of the
+shaders' `nvr_quadBasis`, so a rotated, flat, or map-aligned quad claims the
+box it is drawn over. For an along-line candidate it is the screen-axis box of
+the turned label or quad, as step 0 resolved it, in the same units, with a
+screen-aligned orientation. The kernel projects and scales both the same
+way, then moves the projected anchor by the material's `translate`: by the
+screen pixels as given for `translateViewport`, otherwise turned with the
+camera heading (`quad_screen_basis` with the map-aligned upright basis), as
+the shaders' `nvr_translateOffset` moves the drawn quad. A text label created since the last pass has no line box yet and falls
+back to its unrotated block.
+
 Any mesh type that wants to participate — batched SDF text, instanced sprites
-— implements `DeclutterParticipant` (`types.ts:43-61`): three methods the
-manager calls every pass:
+— implements `DeclutterParticipant` (`declutter/types.ts`):
 
 | Method | Called | Purpose |
 | --- | --- | --- |
-| `collectDeclutterCandidates(out)` | once, at pass start | append this mesh's visible, declutter-enabled labels |
-| `applyDeclutter(handle, hidden)` | once per candidate, every pass | set the fade *target* for this label |
+| `prepareDeferredLabels?(camera)` | once, at pass start | start preparation for parked labels now in view |
+| `placeLineLabels?(camera, heightPx)` | once, at pass start, before collection | along-line level, fit, flip and box ([step 0](#0-line-placement)) |
+| `collectDeclutterCandidates(out)` | once per pass | append this mesh's visible, declutter-enabled labels |
+| `applyDeclutter(handle, hidden, variant)` | once per label, every pass | set the fade *target* for this label, and the variable anchor it is placed with |
 | `stepDeclutterFade(deltaMs)` | every `update()` call | advance actual visibility toward the target; returns `true` while still fading |
 
 This keeps the manager itself geometry-agnostic — it never touches a
-`BufferGeometry` or a Three.js `Mesh` directly, only these three hooks.
+`BufferGeometry` or a Three.js `Mesh` directly, only these hooks.
+
+**Tile-swap handoff.** After applying results, the manager files every shown
+candidate's anchor under its `contentKey`. When a tile swap activates a
+replacement batch, `setActive` asks `recentlyShownVariant(text, anchor)` for
+each label. A label whose identical text was shown within
+`HANDOFF_TOLERANCE_M` starts granted rather than fading in from hidden, at
+the variable anchor it was shown with. Without that, every swap
+would blink the tile's labels out for a pass plus a fade.
 
 Once collected, each candidate is flattened into the kernel's packed input: a
-`Float64Array` with `CANDIDATE_STRIDE = 11` values per candidate
+`Float64Array` with `CANDIDATE_STRIDE = 29` values per candidate
 (`declutter/kernel.ts`), in the field order the Rust side reads — anchor (3),
-`addHeight`, the four box edges, `sizeInMeters`, `priority`, `isShown`. Booleans
-become `0.0`/`1.0`. The buffer is reused across passes and grown only when the
+`addHeight`, the four box edges, `sizeInMeters`, `priority`, `isShown`,
+`overlap`, `ignorePlacement`, `rank`, `padding` (4), `pairGroup`,
+`featureIndex`, `pairRole`, `standalone`, `flatFacing`, `rotateWithCamera`,
+`rotation`, `translate` (2), `translateMap` (`!translateViewport`), `variants`
+(`1` when omitted). Booleans become `0.0`/`1.0`; `overlap` becomes
+`0`/`1`/`2` (never/always/cooperative, `OVERLAP_CODES`). The buffer is reused across passes and grown only when the
 label count rises. The kernel returns a `Uint8Array` of `hidden` flags, one per
-candidate in input order, which the manager feeds straight back to
-`applyDeclutter`.
+candidate in input order. The manager hands each label one result: the row of
+its group the pass showed, or its first row if none.
 
 ## 2. Projecting to screen space
 
@@ -166,7 +245,11 @@ they must track the shader, not the engine's own ellipsoid:
 
 Separately, `is_beyond_horizon` mirrors `horizon_culling_pars_vertex.glsl`: a
 cheap ellipsoid test for whether the anchor is geometrically hidden behind the
-Earth from the camera's viewpoint. This matters because **a label the GPU will
+Earth from the camera's viewpoint. Like the shader, it shrinks the ellipsoid by
+the `nvrHorizonMinHeight` uniform value (never positive, set from the terrain
+exaggeration), which `ThreeView` passes to `DeclutterManager.update` and on to
+`declutterPlace` every frame, and scales it down further to pass through the
+anchor or the camera when either lies below it. This matters because **a label the GPU will
 cull must not claim screen space** — otherwise a label on the far side of the
 planet could sit at the same projected pixel as a real, visible label and evict
 it.
@@ -181,18 +264,25 @@ for why that direction matters.
 
 Before placement, `declutterPlace` sorts the candidate indices by:
 
-1. **`priority` descending** — the layer's `declutterPriority` (or a
-   per-feature override). Higher always wins an overlap.
-2. **`isShown` — currently-shown labels sort first** on an exact priority tie.
+1. **`rank` descending** — the material's `declutterRank`. A coarse order
+   above priority: every candidate of a higher rank places before any of a
+   lower one, so a per-feature priority can never lift a label past a
+   higher-ranked layer. The MapLibre plugin sets it to the style layer's index,
+   since MapLibre places symbols from the top-most layer down and confines
+   `symbol-sort-key` to its own layer. Defaults to `0`, so it changes nothing
+   unless set.
+2. **`priority` descending** — the layer's `declutterPriority` (or a
+   per-feature override). Higher always wins an overlap within a rank.
+3. **`isShown` — currently-shown labels sort first** on an exact priority tie.
    This is the first half of hysteresis: an "incumbent" label keeps its claim
    over a brand-new competitor at equal priority, instead of losing a coin
    flip every frame.
-3. **Anchor position** (`anchorX`, then `anchorY`, then `anchorZ`) — a
+4. **Anchor position** (`anchorX`, then `anchorY`, then `anchorZ`) — a
    deterministic, **camera-independent** tiebreak for genuinely fresh ties.
    Without this, ties would resolve by array order, which reshuffles as tiles
    load asynchronously — an easy way to make labels flicker for a completely
    different reason than the one hysteresis targets.
-4. **Candidate index** — a final fallback, never actually reached in practice
+5. **Candidate index** — a final fallback, never actually reached in practice
    since anchors are distinct.
 
 ## 4. Placing greedily: the collision grid
@@ -219,11 +309,13 @@ Screen (CSS px), divided into 64px cells, plus a 128px margin ring:
 
 - Each cell holds a list of indices into a flat `boxes` array (4 numbers per
   box: `minX, minY, maxX, maxY`).
-- `try_claim(minX, minY, maxX, maxY, testShrinkPx)` is the one operation
-  placement needs: test the box against every box already registered in the
-  cells it spans; if nothing overlaps, register it into those same cells and
-  return `Claim::Claimed`; otherwise return `Claim::Blocked` (collision, don't
-  claim) and leave the grid untouched.
+- `try_claim(minX, minY, maxX, maxY, testShrinkPx, overlap, claimSpace)` is
+  the one operation placement needs: test the box against every box already
+  registered in the cells it spans; if nothing it may not overlap is hit,
+  register it into those same cells (unless `claimSpace` is false) and return
+  `Claim::Claimed`; otherwise return `Claim::Blocked` (collision, don't claim)
+  and leave the grid untouched. Each registered box remembers the `overlap`
+  mode it was claimed with — see [Overlap modes](#overlap-modes).
 - Boxes are tested with **strict inequalities**, so two boxes that exactly
   touch edges do not count as colliding.
 - A box entirely outside `viewport ± margin` returns `Claim::OutsideArea`
@@ -237,9 +329,84 @@ Screen (CSS px), divided into 64px cells, plus a 128px margin ring:
   on-screen neighbor — a second, unrelated source of flicker that the margin
   heads off before hysteresis even comes into play.
 
-Each candidate's box is padded by `PADDING_PX = 2` on every side before the
-test (the manager passes the constant into the kernel), so two placed labels
-never end up sitting pixel-adjacent.
+Each candidate's projected box is padded by its material's `declutterPadding`
+(top, right, bottom, left; 2px on every side by default) before the test, so
+two placed labels never end up sitting pixel-adjacent. Padding is added after
+projection, in screen pixels even for a `sizeInMeters` box, as MapLibre's
+`*-padding` is.
+
+### Overlap modes
+
+Two material fields refine what a candidate does at its turn in the sorted
+walk, mirroring MapLibre's `*-overlap` and `*-ignore-placement`. They are
+independent: `overlap` decides what the candidate *tests* against, and
+`ignorePlacement` whether it *registers* its box afterwards.
+
+| `overlap` | Blocked by an earlier box claimed with |
+| --- | --- |
+| `never` (default) | any mode |
+| `cooperative` | `never` only |
+| `always` | nothing — the test is skipped |
+
+`ignorePlacement: true` runs the test as usual but never registers the box, so
+later candidates can overlap it. An `always` candidate without it still
+registers its box: it is drawn over earlier labels yet keeps later `never`
+labels away, which is what MapLibre's `*-allow-overlap` means.
+
+Because an `always` candidate can never lose, the kernel reports it shown even
+where it claims nothing — beyond the horizon or outside the tracked area —
+instead of applying [hidden by default](#hidden-by-default-why-panning-doesnt-reveal-clutter).
+`always` with `ignorePlacement` can neither lose nor block, so participants
+leave it out of collection altogether, exactly like `declutter: false`
+(`resolveDeclutterSettings` in `declutter/types.ts`) — unless it is not
+`standalone`, since then its partner can still hide it (see below).
+
+### Pairing labels with billboards
+
+MapLibre places a symbol's text and icon as one. A Navara layer that has both
+`text` and `billboard` does the same: a label and the billboard of the same
+feature at the same anchor form a pair, unless both are `standalone`. Each
+candidate carries the pair group (a hash of layer id and tile handle,
+`declutterPairGroup`, computed in `event/feature.ts` and handed to both
+meshes), the feature's batch index, and its role. `pair_partners` in
+`declutter.rs` groups candidates by group and feature, then matches labels to
+billboards closest anchor first. Instance indices cannot pair them (along-line
+text keeps more anchors than sprites), and exact anchors cannot either: each
+mesh rebuilds its anchors from its own position arrays and transform, so they
+can differ by rounding, or for a moment when one mesh has seen a terrain
+update the other has not.
+
+At the first member's turn in the sorted walk, both members are tested
+against the grid before either claims space, so they never collide with each
+other. Then each one shows only if its own test passed and its partner's did
+too, unless it is `standalone`; only members that show claim their boxes.
+`standalone` defaults to `true` on both materials. With both `standalone` there
+is no pair: the label and billboard are placed independently and, like any
+two candidates, block each other where they overlap. The MapLibre plugin sets
+the label's `standalone` from `icon-optional` and the billboard's from
+`text-optional`, so MapLibre's defaults (`false`) pair them fully.
+
+### Variable anchors
+
+A text label with `variableAnchors` (MapLibre's `text-variable-anchor` and
+`text-variable-anchor-offset`) is collected as one row per placement, the
+block's box shifted for each, contiguous and with the placement in use first.
+The first row carries `variants = k` and `isShown`; the rest carry `0` and are
+never sorted or paired on their own. At the group's turn, `choose` in
+`declutter.rs` runs MapLibre's placement passes: every row tested as `never`,
+then, if the label's overlap mode allows overlap, every row again with that
+mode. The first row that fits is the one judged with the pair partner, shown
+and claimed; if none fits, the label is judged at its first row. Because the
+placement in use leads, a label moves only when its spot is taken (MapLibre's
+`prevAnchor`), and the hysteresis shrink applies to it alone. Unlike MapLibre,
+which falls back to the first anchor in the list, a label that overlaps at
+every anchor stays where it is.
+
+The text batch writes the chosen placement's shift (and re-lays out the glyphs
+if `textAlign: "auto"` moves the justification) in `applyDeclutter`, before
+the frame renders. A hidden label keeps its placement. A label that has more
+than one variable anchor participates even with `always` overlap,
+`ignorePlacement` and `standalone`, since it can still pick a free anchor.
 
 ## Hysteresis: why labels don't flicker
 
@@ -262,16 +429,18 @@ claim on the grid.
 
 **Rule 2 — a shown label's collision test shrinks.** This is the subtler
 half, and it's what actually damps flicker rather than just biasing a
-one-time tiebreak. `DeclutterManager.HYSTERESIS_PX = 6`
-(`DeclutterManager.ts:55`) is threaded through the kernel call and passed as
-`insert_if_free`'s `test_shrink_px` — but **only** for candidates where
+one-time tiebreak. `DeclutterManager.HYSTERESIS_PX = 6` is threaded through
+the kernel call and passed as `try_claim`'s `test_shrink_px` — but **only**
+for candidates where
 `isShown` is true:
 
 ```rust
 let claim = grid.try_claim(
-    boxes[o] - pad, boxes[o + 1] - pad,
-    boxes[o + 2] + pad, boxes[o + 3] + pad,
+    boxes[o] - c[17], boxes[o + 1] - c[14],     // left, top padding
+    boxes[o + 2] + c[15], boxes[o + 3] + c[16], // right, bottom padding
     if is_shown { hysteresis_px } else { 0.0 },
+    overlap,
+    c[12] == 0.0, // claim space unless ignorePlacement
 );
 ```
 
@@ -328,7 +497,8 @@ had a claim to that space.
 
 So the kernel is **hidden by default**: `hidden[i] = 0` only when
 `try_claim` returns `Claim::Claimed`. Both `Blocked` and `OutsideArea`, and
-every non-placeable candidate, come back hidden. The invariant is
+every non-placeable candidate, come back hidden — except an `overlap: "always"`
+candidate, which cannot lose and so is always shown. The invariant is
 *a label fades in only after it has actually won screen space*.
 
 This makes the two guards in [the frame loop](#running-in-the-frame-loop) work
@@ -343,12 +513,19 @@ goes false while a label is off screen, so it re-enters as a *challenger* and
 must clear its full padded box (no 6px shrink) to appear. "Prove you deserve
 it" applies to every label arriving from off screen, not just to fresh ones.
 
+Along-line anchors extend the rule to step 0. They start undrawn until a pass
+has judged them: text through `PATH.w = 1`, sprites through an all-set
+out-of-band mask, since every level of a line arrives at once. An anchor that
+step 0 rejects is skipped by collection, so the participant drops its fade
+state to hidden itself (text snaps it, sprites fade it). When it qualifies
+again it re-enters as a challenger, not an incumbent.
+
 ## 5. Fading, not popping
 
 A placement decision is applied as a fade **target**, not an instant
 visibility flip: `applyDeclutter(handle, hidden)` sets the target, and
 `stepDeclutterFade(deltaMs)` advances the actual hide-factor toward it by
-`deltaMs / DECLUTTER_FADE_MS` (300ms, `types.ts:40`) every call. This runs
+`deltaMs / DECLUTTER_FADE_MS` (300ms, `declutter/types.ts`) every call. This runs
 through a channel separate from user-driven `show` — the `declutterHide`
 channel of the per-label data texture for text (see
 [TEXT_BATCHING.md](TEXT_BATCHING.md)), an `instanceDeclutterHide` attribute for
@@ -368,8 +545,7 @@ short-circuit the walk entirely once nothing is mid-fade.
 
 `DeclutterManager.update(camera, widthPx, heightPx, nowMs)` runs from
 `ThreeView._render()`, **before** the render passes, so a placement change
-lands in the same frame it was decided in
-(`web/navara_three/src/index.ts:1786-1801`):
+lands in the same frame it was decided in (`web/navara_three/src/index.ts`):
 
 ```mermaid
 sequenceDiagram
@@ -391,19 +567,26 @@ sequenceDiagram
 
 Two guards keep this cheap on an otherwise-idle camera:
 
-- **Change detection** (`_snapshotChanged`, `DeclutterManager.ts:238-250`) —
-  a pass only reruns when the label set changed (`markDirty()` was called —
-  new/removed labels, text changes) **or** the camera's `matrixWorld` /
-  `projectionMatrix` / viewport size differ from a cached snapshot. A
-  perfectly still camera with an unchanged label set does no placement work
-  at all.
+- **Change detection** (`_snapshotChanged`) — a pass only reruns when the
+  label set changed (`markDirty()` was called — new/removed labels, text
+  changes) **or** the camera's `matrixWorld` / `projectionMatrix` / viewport
+  size / horizon minimum height differ from a cached snapshot. A perfectly still camera with an
+  unchanged label set does no placement work at all.
 - **Throttling** — even when something changed, a full pass runs at most
   once per `MIN_INTERVAL_MS = 150`. Fast camera movement (drag, zoom) would
   otherwise trigger a full re-placement every single frame.
 
+`markDirty(true)` also lifts the throttle, so the next `update()` runs a pass
+even inside the window. A batch with along-line anchors needs this when a tile
+swap activates it: its anchors stay undrawn until judged, and a hidden batch
+is never judged, so waiting out the window would leave its line labels missing
+right after the swap.
+`setActive` on text batches and sprite meshes passes `true` exactly when
+activating such a batch.
+
 Both a throttled pass and an active fade need a **guaranteed future frame** —
 but the render loop only renders when something requests it
-(`_startMainLoop`, `index.ts:2456-2459`):
+(`_startMainLoop`):
 
 ```ts
 const updated = this._update(time);
@@ -414,14 +597,20 @@ this._renderFlag.forceUpdate = false;   // cleared immediately, every tick
 
 Setting `forceUpdate` synchronously from inside `_render()` is a no-op — it
 gets cleared on the very next line after `_render()` returns, before another
-tick can observe it. So `_scheduleDeclutterFrame(delayMs)`
-(`index.ts:1762-1772`) instead arms a `setTimeout` that sets the flag *later*,
-landing between ticks:
+tick can observe it. So `_scheduleDeclutterFrame(delayMs)` instead arms a
+`setTimeout` that sets the flag *later*, landing between ticks:
 
-- A `"throttled"` result schedules a retry after `MIN_INTERVAL_MS` — enough
-  time for the throttle window to clear.
+- A `"throttled"` result schedules a retry after `remainingThrottleMs()` —
+  the rest of the throttle window, not a full `MIN_INTERVAL_MS` from now.
 - An `"animating"` result schedules a retry after `16ms` — roughly one frame,
   to keep the fade animating smoothly.
+- `markDirty()` outside a pass schedules one after `0ms` (the manager's
+  `requestFrame` callback). Meshes mark the pass dirty from async work — a
+  `layer.update()` reaches each mesh through awaited feature-change events,
+  mostly after the frame that delivered it has rendered — and without a frame
+  the pass would sit dirty, showing the old placement, until the camera
+  moved. Inside `update()` the pass consumes the flag itself, so no frame is
+  requested.
 - A pending timer is only replaced by a **shorter** one
   (`if (delayMs >= this._declutterRetryDelay) return;`) — a fade's tight 16ms
   cadence must never be starved by a 150ms throttle retry that got scheduled
@@ -429,7 +618,7 @@ landing between ticks:
 
 ## Public API
 
-Three material types carry the two config fields consumed by this pass —
+Three material types carry the config fields consumed by this pass —
 `text`, `point`, and `billboard` — generated via wasm-bindgen from
 `PointMaterial` / `BillboardMaterial` / `TextMaterial`
 (`crates/navara_wasm_types/src/appearance.rs`):
@@ -437,7 +626,12 @@ Three material types carry the two config fields consumed by this pass —
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `declutter` | `boolean` | `true` | participate in the shared placement pass; set `false` to draw this label/sprite unconditionally |
+| `declutterRank` | `number` | `0` | layer-level order compared before priority; higher places first |
 | `declutterPriority` | `number` | `0` | layer-level priority; higher wins an overlap |
+| `declutterPadding` | `number[]` | `[2]` | screen px around the box, one to four values like CSS padding |
+| `standalone` | `boolean` | `true` | text and billboard only: may show while its pair partner is hidden ([Pairing](#pairing-labels-with-billboards)) |
+| `overlap` | `"never" \| "always" \| "cooperative"` | `"never"` | which earlier boxes may hide this one ([Overlap modes](#overlap-modes)) |
+| `ignorePlacement` | `boolean` | `false` | leave this box out of the grid so later labels may overlap it |
 
 ```ts
 const source = view.addSource({
@@ -472,10 +666,11 @@ A few things worth knowing before enabling it:
   features fetched, evaluated, or uploaded to the GPU. It's a screen-space
   visibility decision, not a data-volume optimization.
   (`example/pages/pmtiles-overture/run.ts:172`)
-- **An icon and its own name label should not both opt in** if they share an
-  anchor: the declutter pass has no notion that two candidates "belong"
-  together, so it can't guarantee they stay paired. Typically only the text
-  label sets `declutter: true`; the icon renders unconditionally.
+- **An icon and its own name label pair only within one layer.** Put them in
+  the same layer (`text` and `billboard`) and set `standalone: false` on both
+  to keep them together. Across separate layers the pass has no notion that
+  two candidates belong together, so there only the text label should set
+  `declutter: true` while the icon renders unconditionally.
   (`example/pages/pmtiles-overture/run.ts:561-563`)
 
 Working examples: `example/pages/styling/mvt-text` (basic per-feature-code
@@ -488,10 +683,13 @@ confidence-driven priority, at real-world label density).
 | File | Role |
 | --- | --- |
 | `crates/navara_wasm_api/src/declutter.rs` | The numeric kernel — `declutterPlace`: projection, horizon cull, sort, `ScreenCollisionGrid`, greedy placement, plus its Rust unit tests |
-| `web/navara_three/src/declutter/DeclutterManager.ts` | Orchestrator — collect, pack candidates, call the kernel, apply results, fade, throttling/dirty state |
+| `crates/navara_wasm_api/src/line_label.rs` | The step-0 kernel — `lineLabelFit` / `lineLabelPlace` for text, `lineAnchorPlace` for sprites |
+| `web/navara_three/src/declutter/DeclutterManager.ts` | Orchestrator — step-0 hooks, collect, pack candidates, call the kernel, apply results, fade, throttling/dirty state, shown-content registry |
 | `web/navara_three/src/declutter/kernel.ts` | `DeclutterKernel` interface + `CANDIDATE_STRIDE` (the packed-input contract with the Rust side) |
 | `web/navara_three/src/declutter/wasmKernel.ts` | `wasmDeclutterKernel` — adapter binding the interface to `declutterPlace` from `@navaramap/engine-api` |
 | `web/navara_three/src/declutter/types.ts` | `DeclutterCandidate`, `DeclutterParticipant`, `DECLUTTER_FADE_MS` |
+| `web/navara_three/src/mesh/sdfText/batchedSdfText.ts`, `web/navara_three/src/mesh/sprite/instancedSprite.ts` | The two participants, including their `placeLineLabels` |
+| `web/navara_three/src/event/feature.ts` | Computes each feature mesh's pair group and hands it to text and billboard meshes |
 | `web/navara_three/src/index.ts` | Registers the shared `DeclutterManager` (wired with `wasmDeclutterKernel`), drives `update()` from `_render()`, `_scheduleDeclutterFrame` / `forceUpdate` scheduling |
-| `crates/navara_material/src/appearance.rs` | `declutter` / `declutter_priority` fields on `PointMaterial` / `BillboardMaterial` / `TextMaterial` |
+| `crates/navara_material/src/appearance.rs` | `declutter` / `declutter_rank` / `declutter_priority` / `declutter_padding` / `overlap` / `ignore_placement` fields on `PointMaterial` / `BillboardMaterial` / `TextMaterial`, and `standalone` on the last two |
 | `crates/navara_wasm_types/src/appearance.rs` | wasm-bindgen mirrors exposed to TypeScript |

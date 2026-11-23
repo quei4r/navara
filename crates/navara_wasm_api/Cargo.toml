@@ -12,6 +12,8 @@ debug = ["navara_wasm_utils/console_error_panic_hook"]
 
 [dependencies]
 wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys.workspace = true
 serde.workspace = true
 serde-wasm-bindgen.workspace = true
 url.workspace = true
@@ -21,6 +23,8 @@ navara_core.workspace = true
 # would pull bevy_ecs into the lightweight API module.
 navara_geometry = { path = "../navara_geometry", default-features = false }
 navara_math.workspace = true
+navara_material.workspace = true
+navara_feature_component.workspace = true
 quantized-mesh.workspace = true
 navara_wasm_types.workspace = true
 navara_window.workspace = true

@@ -1,55 +1,26 @@
-use bevy_ecs::{
-    entity::Entity,
-    query::{With, Without},
-    system::{Commands, Query},
-};
-use navara_component::{Deleted, OrderByDistance, Priority, Requested};
+use bevy_ecs::system::{Commands, ResMut};
+use navara_component::Priority;
 
 use super::{ConstructTerrainMeshMarker, ConstructTerrainMeshParameters};
 use crate::{
     DelegatedWorkerTask, DelegatedWorkerTasksParameters, DelegatedWorkerTasksParametersBundle,
-    WorkerTaskCompleted, WorkerTaskDelegateeMarker, WorkerTaskMarker,
+    WorkerBudget,
+    system::{WaitingTasks, delegate_nearest},
 };
 
-const MAX_PENDINGS: usize = 10;
-
-#[allow(clippy::type_complexity)]
 pub(crate) fn construct_terrain_mesh(
-    mut commands: Commands,
-    constructors: Query<
-        (Entity, &ConstructTerrainMeshParameters, &OrderByDistance),
-        (With<WorkerTaskMarker>, Without<Requested>, Without<Deleted>),
-    >,
-    requested_constructors: Query<
-        (Entity, &ConstructTerrainMeshParameters, &OrderByDistance),
-        (
-            With<WorkerTaskMarker>,
-            With<Requested>,
-            Without<Deleted>,
-            Without<WorkerTaskCompleted>,
-        ),
-    >,
+    commands: Commands,
+    waiting: WaitingTasks<ConstructTerrainMeshParameters>,
+    budget: ResMut<WorkerBudget>,
 ) {
-    let pendings = requested_constructors.iter().count();
-    let num_take = (MAX_PENDINGS as i32 - pendings as i32).max(0) as usize;
-
-    for (e, constructor, _) in constructors
-        .iter()
-        .sort::<&OrderByDistance>()
-        .take(num_take)
-    {
-        let delegatee_id = commands
-            .spawn(DelegatedWorkerTasksParametersBundle::new(
-                ConstructTerrainMeshMarker,
-                DelegatedWorkerTasksParameters::ConstructTerrainMesh(DelegatedWorkerTask::new(
-                    e,
-                    constructor.clone(),
-                )),
-                Priority::High,
-            ))
-            .id();
-        commands
-            .entity(e)
-            .insert((WorkerTaskDelegateeMarker(delegatee_id), Requested));
-    }
+    delegate_nearest(commands, waiting, budget, |e, params| {
+        DelegatedWorkerTasksParametersBundle::new(
+            ConstructTerrainMeshMarker,
+            DelegatedWorkerTasksParameters::ConstructTerrainMesh(DelegatedWorkerTask::new(
+                e,
+                params.clone(),
+            )),
+            Priority::High,
+        )
+    });
 }

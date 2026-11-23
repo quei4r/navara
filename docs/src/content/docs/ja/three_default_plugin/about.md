@@ -13,7 +13,7 @@ sidebar:
 
 ```
 navara_three（コア: ThreeView, Plugin, addPlugin, registerMesh/Effect/Light）
-  ├── three_default_descs（Descriptorの実装: 22 メッシュ, 14 エフェクト, 4 ライト）
+  ├── three_default_descs（Descriptorの実装: メッシュ, エフェクト, ライト）
   └── three_default_plugin（DefaultPlugin: Descriptorの一括登録 + ユーティリティ）
 ```
 
@@ -35,13 +35,7 @@ view.addPlugin(plugin);
 await view.init({ canvas: document.getElementById("canvas") });
 ```
 
-プラグインの `init()` で以下のDescriptorが自動的に登録されます：
-
-**メッシュ（22 種）:** `rain`, `snow`, `sky`, `skyBox`, `stars`, `box`, `sphere`, `glowGlobe`, `cylinder`, `tube`, `plane`, `gltfModel`, `splat`, `axesHelper`, `arrowHelper`, `arcLines`, `smoothLines`, `boxes`, `spheres`, `planes`, `cylinders`, `gltfModels`
-
-**エフェクト（14 種）:** `aerialPerspective`, `rainDrop`, `selectiveBloom`, `selectiveOutline`, `clouds`, `fogLight`, `lensFlare`, `ssao`, `ssr`, `depthOfField`, `colorGradingLUT`, `toneMapping`, `smaa`, `fxaa`
-
-**ライト（4 種）:** `sun`, `ambient`, `skyLightProbe`, `lightProbe`
+プラグインの `init()` は `three_default_descs` のすべてのDescriptorを登録します。利用できるDescriptorは [Mesh Descriptor](../../three_default_descs/mesh-desc/about/)、[Effect Descriptor](../../three_default_descs/effect-desc/about/)、[Light Descriptor](../../three_default_descs/light-desc/about/) を、追加するときのキー（例: `BoxMeshDesc` なら `box`）は各Descriptorのページを参照してください。
 
 ### addDefaultPhotorealScene()
 
@@ -72,3 +66,19 @@ const layers = plugin.addDefaultPhotorealScene();
 | `antialiasing`      | effect | SMAA（デスクトップ）/ FXAA（モバイル） |
 
 モバイル環境では、パフォーマンスのためにレンズフレアがスキップされ、アンチエイリアスに軽量な FXAA が使用されます。
+
+### ディファードライティング
+
+`deferredLighting: true` を渡すと、フォワードパスの代わりに大気がポストプロセスでシーンをライティングします。大気遠近法の [`irradiance`](../../three_default_descs/effect-desc/aerial-perspective-effect-desc/#irradiance) オプションを有効にし、同時に [`view.lit = false`](../../three/api/threeview-properties/#lit) を設定します。そうしないとフォワードパスと大気でライティングが二重に適用されてしまうためです。雲の影にはこの経路が必要です。透明なマテリアルには届かず、`lit: true` を指定したメッシュやマテリアルはフォワードのシェーディングを保ちます。
+
+`shadow: true` と `specular: true` は、大気遠近法の [`shadow`](../../three_default_descs/effect-desc/aerial-perspective-effect-desc/#shadow) と [`specular`](../../three_default_descs/effect-desc/aerial-perspective-effect-desc/#specular) オプションを通して、このライティングでの太陽の影と鏡面ハイライトを有効にします。どちらも `deferredLighting` なしでは何もしません。調整は戻り値の `aerialPerspective` ハンドルから行えます。
+
+```typescript
+const layers = plugin.addDefaultPhotorealScene({
+  deferredLighting: true,
+  shadow: true,
+  specular: true,
+});
+```
+
+このシーンに合う露出はベースマップに依存します。トーンマッピングのページの[露出の選び方](../../three_default_descs/effect-desc/tone-mapping-effect-desc/#露出の選び方)を参照してください。

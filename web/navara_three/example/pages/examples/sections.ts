@@ -21,6 +21,7 @@ export const SECTION_KEYS = [
   "styling",
   "interaction",
   "lighting-effect",
+  "showcase",
 ] as const;
 
 export type SectionKey = (typeof SECTION_KEYS)[number];
@@ -51,6 +52,13 @@ export const localize = (text: Localized | undefined, lang: Lang): string => {
 export const DOCS_URL = "/docs";
 
 /**
+ * A site-root page that exists per language (the landing page is `""`, the
+ * brand assets page `"brand-assets/"`): served at / and /ja/ on navara.world.
+ */
+export const siteUrl = (lang: Lang, path = ""): string =>
+  (lang === "ja" ? "/ja/" : "/") + path;
+
+/**
  * Resolve an example's `docs` value to a full URL. An absolute URL passes
  * through unchanged; otherwise it is treated as a docs-site path and prefixed
  * with {@link DOCS_URL} and the language segment (docs are localized under /ja).
@@ -78,6 +86,7 @@ export const SECTION_LABELS: Record<SectionKey, Record<Lang, string>> = {
     en: "Lighting & Effects",
     ja: "ライティング・エフェクト",
   },
+  showcase: { en: "Showcase", ja: "ショーケース" },
 };
 
 export type ExampleMeta = {
@@ -102,6 +111,13 @@ export type ExampleMeta = {
    * or an absolute URL.
    */
   docs?: string;
+  /**
+   * For an example showing features not in the latest release
+   * (`site/released-version.json`): that release + 0.0.1, e.g. "0.3.2", or
+   * "nightly" while no release is planned to ship them. Marks the example
+   * "Nightly" until a release reaches it.
+   */
+  since?: string;
 };
 
 /** A gallery entry: the example's meta enriched with its resolved path. */

@@ -2,7 +2,14 @@
  * Converts MapLibre Style paint properties to Navara EvaluatedValue.
  */
 
-import { Color, type GeometryType } from "@navaramap/three";
+import { Color as MapLibreColorParser } from "@maplibre/maplibre-gl-style-spec";
+import {
+  Color,
+  type Anchor,
+  type GeometryType,
+  type TextAlign,
+  type VariableAnchor,
+} from "@navaramap/three";
 
 import type { StyleEngine } from "../engine/StyleEngine";
 import {
@@ -10,38 +17,76 @@ import {
   type EvaluationContext,
   type PropertySpec,
   type StyleLayer,
+  type SymbolLayer,
   type ValueExpression,
 } from "../engine/types";
+import { expressionUsesFeatureData } from "../utils/expressionHelpers";
+
+import {
+  fromRadialOffset,
+  isAnchor,
+  resolveVariableAnchors,
+} from "./textAnchor";
 
 type EvaluatedResult = {
   color?: Color;
   opacity?: number;
   width?: number;
   size?: number;
+  letterSpacing?: number;
   height?: number;
   extrudedHeight?: number;
   show?: boolean;
   text?: string;
   image?: string;
+  /** Degrees clockwise, like MapLibre's `text-rotate` / `icon-rotate`. */
+  rotation?: number;
+  declutterPriority?: number;
+  anchor?: Anchor;
+  /** x right, y down: ems for text, pixels for icons. */
+  offset?: { x: number; y: number };
+  variableAnchors?: VariableAnchor[];
+  textAlign?: TextAlign;
+  outlineColor?: Color;
+  outlineOpacity?: number;
+  /** 1/64 em, like `outlineBlur`. */
+  outlineWidth?: number;
+  outlineBlur?: number;
 };
+
+/** Navara's outline unit: pixels of text drawn 64 pixels tall. */
+const OUTLINE_UNITS_PER_EM = 64;
+
+/**
+ * MapLibre fades a halo over `±1.19 × text-halo-blur` around its edge
+ * (`symbol_sdf.fragment.glsl`); Navara's `outlineBlur` is the whole fade.
+ */
+const HALO_BLUR_TO_FADE = 2 * 1.19;
 
 /**
  * Convert MapLibre color value to Navara Color and extract alpha.
  *
  * Returns object { color, alpha } where:
  * - For MapLibreColor objects: alpha is extracted from the `a` field (or defaults to 1.0)
- * - For CSS color strings: alpha is always 1.0 (alpha from rgba/hsla/#RRGGBBAA is NOT parsed)
+ * - For CSS color strings: alpha is parsed using MapLibre's Color.parse (supports rgba/hsla/#RRGGBBAA)
  */
-function toNavaraColor(
+export function toNavaraColor(
   value: unknown,
 ): { color: Color; alpha: number } | undefined {
   try {
     if (typeof value === "string") {
-      // CSS color string from spec.default fallback (e.g., "#000000", "rgb(255, 0, 0)")
-      const color = new Color().setStyle(value);
-      // Alpha from rgba/hsla/#RRGGBBAA is not extracted (Three.js Color doesn't store alpha)
-      // TODO: Parse alpha from CSS strings like rgba(r,g,b,a) or #RRGGBBAA
-      return { color, alpha: 1.0 };
+      // CSS color string - use MapLibre's parser to extract both color and alpha
+      const maplibreColor = MapLibreColorParser.parse(value);
+      if (!maplibreColor) {
+        return undefined;
+      }
+      const color = new Color().setRGB(
+        maplibreColor.r,
+        maplibreColor.g,
+        maplibreColor.b,
+      );
+      const alpha = maplibreColor.a ?? 1.0;
+      return { color, alpha };
     }
     if (isMapLibreColor(value)) {
       // MapLibre Color object with r, g, b, a values (0-1 range)
@@ -84,6 +129,27 @@ function applyColorAndOpacity(
 }
 
 /**
+ * Memoize an evaluator by zoom when its expression reads no feature data, so
+ * a re-evaluation pass (every feature at one camera zoom) evaluates it once
+ * instead of once per feature. Data-driven expressions are returned as is.
+ */
+function cacheByZoom<T>(
+  expr: unknown,
+  evalFn: (ctx: EvaluationContext) => T,
+): (ctx: EvaluationContext) => T {
+  if (expressionUsesFeatureData(expr)) return evalFn;
+  let cachedZoom: number | undefined;
+  let cachedValue: T;
+  return (ctx) => {
+    if (ctx.zoom !== cachedZoom || cachedZoom === undefined) {
+      cachedValue = evalFn(ctx);
+      cachedZoom = ctx.zoom;
+    }
+    return cachedValue;
+  };
+}
+
+/**
  * Create evaluator functions for a style layer's paint properties.
  *
  * @param styleLayer - MapLibre layer definition
@@ -114,7 +180,10 @@ export function createPaintEvaluators(
     const expr = value ?? spec.default;
 
     try {
-      evaluators[key] = engine.createValueFn(expr, spec, featureGeometryType);
+      evaluators[key] = cacheByZoom(
+        expr,
+        engine.createValueFn(expr, spec, featureGeometryType),
+      );
     } catch (err) {
       console.error(`Failed to create evaluator for ${key}:`, err);
       // Fallback to spec.default to preserve MapLibre Style Spec behavior
@@ -159,14 +228,14 @@ export function createLayoutEvaluators(
     try {
       const evalFn = engine.createValueFn(expr, spec, featureGeometryType);
       // Wrap with try/catch to handle per-feature evaluation errors
-      return (ctx: EvaluationContext) => {
+      return cacheByZoom(expr, (ctx: EvaluationContext) => {
         try {
           return evalFn(ctx);
         } catch (_err) {
           // Return undefined on evaluation error (e.g., property missing, type mismatch)
           return undefined;
         }
-      };
+      });
     } catch (err) {
       console.error(`Failed to create layout evaluator for ${key}:`, err);
       // Return evaluator that always returns spec.default
@@ -179,13 +248,18 @@ export function createLayoutEvaluators(
   const supportedProperties = [
     "text-field",
     "text-size",
-    "text-font",
+    "text-letter-spacing",
+    "text-rotate",
+    "text-transform",
+    "text-anchor",
+    "text-offset",
+    "text-justify",
     "icon-image",
     "icon-size",
-    "text-anchor",
+    "icon-rotate",
     "icon-anchor",
-    "text-offset",
     "icon-offset",
+    "symbol-sort-key",
   ];
 
   for (const key of supportedProperties) {
@@ -279,8 +353,8 @@ function processFillExtrusionLayer(
 ): void {
   applyColorAndOpacity(
     result,
-    paintValues["fill-extrusion-color"] ?? paintValues["fill-color"],
-    paintValues["fill-extrusion-opacity"] ?? paintValues["fill-opacity"],
+    paintValues["fill-extrusion-color"],
+    paintValues["fill-extrusion-opacity"],
   );
 
   // Extract base and height values
@@ -341,10 +415,10 @@ function processCircleLayer(
     paintValues["circle-opacity"],
   );
 
-  // Handle circle radius
+  // `circle-radius` is a radius; a point's `size` is its full width.
   const circleRadius = paintValues["circle-radius"];
   if (typeof circleRadius === "number" && Number.isFinite(circleRadius)) {
-    result.size = circleRadius;
+    result.size = circleRadius * 2;
   }
 }
 
@@ -383,6 +457,84 @@ function extractFormattedText(value: unknown): string | undefined {
 }
 
 /**
+ * Apply MapLibre `text-transform` (`toLocale*Case`, as MapLibre does).
+ */
+function applyTextTransform(text: string, transform: unknown): string {
+  if (transform === "uppercase") return text.toLocaleUpperCase();
+  if (transform === "lowercase") return text.toLocaleLowerCase();
+  return text;
+}
+
+/**
+ * Apply `text-halo-*`. MapLibre draws a halo in pixels of the text laid out
+ * at its `text-size` (its shader divides them by the font scale), so they
+ * convert to ems of that size. An unset halo color is transparent.
+ *
+ * MapLibre skips the halo, blur included, when `text-halo-width` reads no
+ * feature data and is 0 (`draw_symbol.ts`: `constantOr(1) !== 0`); a
+ * data-driven width of 0 still draws the blurred edge.
+ */
+function applyTextHalo(
+  result: EvaluatedResult,
+  paintValues: Record<string, unknown>,
+  haloWidthExpr: unknown,
+  textSize: number,
+): void {
+  const color = paintValues["text-halo-color"];
+  const width = paintValues["text-halo-width"];
+  const blur = paintValues["text-halo-blur"];
+  if (color === undefined && width === undefined && blur === undefined) return;
+
+  const halo = color === undefined ? undefined : toNavaraColor(color);
+  if (halo) result.outlineColor = halo.color;
+  result.outlineOpacity = halo?.alpha ?? 0;
+  const toOutlineUnits = (px: unknown) =>
+    typeof px === "number" && Number.isFinite(px) && textSize > 0
+      ? (px / textSize) * OUTLINE_UNITS_PER_EM
+      : 0;
+  result.outlineWidth = toOutlineUnits(width);
+  result.outlineBlur =
+    result.outlineWidth === 0 && !expressionUsesFeatureData(haloWidthExpr)
+      ? 0
+      : toOutlineUnits(blur) * HALO_BLUR_TO_FADE;
+}
+
+/**
+ * Apply the per-feature placement properties shared by icons and text:
+ * `*-anchor`, `*-offset` (multiplied by `offsetScale`), `*-rotate` and
+ * `symbol-sort-key`.
+ */
+function applySymbolPlacement(
+  result: EvaluatedResult,
+  layoutValues: Record<string, unknown> | undefined,
+  prefix: "text" | "icon",
+  offsetScale: number,
+): void {
+  const anchor = layoutValues?.[`${prefix}-anchor`];
+  if (isAnchor(anchor)) result.anchor = anchor;
+  const offset = layoutValues?.[`${prefix}-offset`];
+  if (
+    Array.isArray(offset) &&
+    Number.isFinite(offset[0]) &&
+    Number.isFinite(offset[1])
+  ) {
+    result.offset = {
+      x: offset[0] * offsetScale,
+      y: offset[1] * offsetScale,
+    };
+  }
+  const rotate = layoutValues?.[`${prefix}-rotate`];
+  if (typeof rotate === "number" && Number.isFinite(rotate)) {
+    result.rotation = rotate;
+  }
+  const sortKey = layoutValues?.["symbol-sort-key"];
+  // A lower sort key is placed first in MapLibre; higher priority wins in Navara.
+  if (typeof sortKey === "number" && Number.isFinite(sortKey)) {
+    result.declutterPriority = -sortKey;
+  }
+}
+
+/**
  * Process symbol layer properties.
  *
  * IMPORTANT: Symbol layers require an explicit meshGeomType ("billboard" or "text")
@@ -397,7 +549,7 @@ function processSymbolLayer(
   paintValues: Record<string, unknown>,
   layoutValues: Record<string, unknown> | undefined,
   meshGeomType: GeometryType | undefined,
-  layerId: string,
+  styleLayer: SymbolLayer,
   warnedLayers?: Set<string>, // Set to track layers that have already warned (prevents log spam)
 ): void {
   // Determine what this specific feature has based on evaluated layout values
@@ -413,14 +565,14 @@ function processSymbolLayer(
   // Symbol layers MUST have a valid meshGeomType to avoid ambiguous evaluation
   if (meshGeomType !== "billboard" && meshGeomType !== "text") {
     // Warn once per layer to avoid log spam when evaluating thousands of features
-    if (warnedLayers && !warnedLayers.has(layerId)) {
-      warnedLayers.add(layerId);
+    if (warnedLayers && !warnedLayers.has(styleLayer.id)) {
+      warnedLayers.add(styleLayer.id);
       const reason =
         meshGeomType === undefined
           ? "missing meshGeomType"
           : `invalid meshGeomType "${meshGeomType}"`;
       console.warn(
-        `Symbol layer "${layerId}": ${reason}. Expected "billboard" or "text" from mesh.getGeometryType(). Skipping symbol evaluation (falling back to layer defaults).`,
+        `Symbol layer "${styleLayer.id}": ${reason}. Expected "billboard" or "text" from mesh.getGeometryType(). Skipping symbol evaluation (falling back to layer defaults).`,
       );
     }
     return;
@@ -440,27 +592,81 @@ function processSymbolLayer(
     // Note: createLayoutEvaluators ensures icon-size is always present (using spec.default = 1)
     // The ?? 1 fallback is defensive and should rarely trigger
     const iconSize = layoutValues?.["icon-size"] ?? 1;
-    if (typeof iconSize === "number" && Number.isFinite(iconSize)) {
+    const validIconSize =
+      typeof iconSize === "number" && Number.isFinite(iconSize);
+    if (validIconSize) {
       result.size = iconSize;
     }
+
+    // `icon-offset` is scaled by `icon-size` into pixels, the billboard's
+    // size unit.
+    applySymbolPlacement(
+      result,
+      layoutValues,
+      "icon",
+      validIconSize ? iconSize : 1,
+    );
   }
 
   // Process text properties for text geometry
-  if (meshGeomType === "text" && hasText) {
-    result.text = textField;
+  if (meshGeomType === "text") {
+    if (hasText) {
+      result.text = applyTextTransform(
+        textField,
+        layoutValues?.["text-transform"],
+      );
 
-    applyColorAndOpacity(
-      result,
-      paintValues["text-color"],
-      paintValues["text-opacity"],
-    );
+      applyColorAndOpacity(
+        result,
+        paintValues["text-color"],
+        paintValues["text-opacity"],
+      );
 
-    // Handle text-size from layout
-    // Note: createLayoutEvaluators ensures text-size is always present (using spec.default = 16)
-    // The ?? 16 fallback is defensive and should rarely trigger
-    const textSize = layoutValues?.["text-size"] ?? 16;
-    if (typeof textSize === "number" && Number.isFinite(textSize)) {
-      result.size = textSize;
+      // Handle text-size from layout
+      // Note: createLayoutEvaluators ensures text-size is always present (using spec.default = 16)
+      // The ?? 16 fallback is defensive and should rarely trigger
+      const textSize = layoutValues?.["text-size"] ?? 16;
+      if (typeof textSize === "number" && Number.isFinite(textSize)) {
+        result.size = textSize;
+      }
+      applyTextHalo(
+        result,
+        paintValues,
+        styleLayer.paint?.["text-halo-width"],
+        result.size ?? 16,
+      );
+
+      // Ems, like Navara's `letterSpacing`; always present (spec default 0).
+      const letterSpacing = layoutValues?.["text-letter-spacing"];
+      if (typeof letterSpacing === "number" && Number.isFinite(letterSpacing)) {
+        result.letterSpacing = letterSpacing;
+      }
+
+      // `text-offset` is in ems, like Navara's text `offset`.
+      applySymbolPlacement(result, layoutValues, "text", 1);
+      // The variable-anchor properties only have values when the style sets
+      // them; MapLibre tells "unset" from the default the same way.
+      const variableAnchors = resolveVariableAnchors(layoutValues ?? {});
+      const radial = layoutValues?.["text-radial-offset"];
+      if (variableAnchors) {
+        result.variableAnchors = variableAnchors;
+      } else if (typeof radial === "number" && radial !== 0) {
+        const [x, y] = fromRadialOffset(result.anchor ?? "center", radial);
+        result.offset = { x, y };
+      }
+
+      const justify = layoutValues?.["text-justify"];
+      if (
+        justify === "auto" ||
+        justify === "left" ||
+        justify === "center" ||
+        justify === "right"
+      ) {
+        result.textAlign = justify;
+      }
+    } else {
+      // Hide text features with empty text-field (e.g., from zoom-based step expressions)
+      result.show = false;
     }
   }
 }
@@ -504,13 +710,16 @@ export function toEvaluatedValue(
         paintValues,
         layoutValues,
         meshGeomType,
-        styleLayer.id,
+        styleLayer,
         warnedLayers,
       );
       break;
   }
 
-  result.show = true;
+  // Only set show to true if not already set (e.g., by processSymbolLayer for empty text)
+  if (result.show === undefined) {
+    result.show = true;
+  }
 
   return result;
 }

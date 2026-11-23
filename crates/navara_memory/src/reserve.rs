@@ -112,9 +112,10 @@ fn on_reserved_cost_remove(mut world: DeferredWorld, ctx: HookContext) {
 /// different tile sizes), so each layer entity gets its own EMA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReserveKey {
-    /// Per-layer pool keyed by the vector MVT source layer entity. Split from
-    /// [`Self::Tiles3dLayer`] (rather than one generic layer variant) so the
-    /// cold-start seed is derivable from the key alone — see
+    /// Per-source pool keyed by the vector tile source entity (the one holding
+    /// `VectorTileSourceResources`, shared by every layer of that source).
+    /// Split from [`Self::Tiles3dLayer`] (rather than one generic layer
+    /// variant) so the cold-start seed is derivable from the key alone — see
     /// [`MemoryLedger::reserve_seed`].
     VectorLayer(Entity),
     /// Per-tileset pool keyed by the 3D Tiles layer (tileset) entity —
@@ -130,8 +131,8 @@ pub enum ReserveKey {
     /// would buy nothing). Unlike hillshade the landed cost is NOT a
     /// per-source constant: quantized-mesh payloads vary with vertex count
     /// (terrain roughness), and the resident cost is dominated by the mesh
-    /// geometry plus the composite-atlas seed. Fed the full per-tile mesh
-    /// cost from `attach_terrain_mesh_cost`.
+    /// geometry plus the composite atlas. Fed the per-tile mesh geometry plus
+    /// the atlas hint from `attach_terrain_mesh_cost`.
     Terrain,
 }
 

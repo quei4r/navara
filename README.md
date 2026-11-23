@@ -1,8 +1,10 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/public/logo/white/white_Navara_Vertical_logo_260819.svg">
-    <img src="./docs/public/logo/black/black_Navara_Vertical_logo_260819.svg" alt="Navara logo" width="220">
-  </picture>
+  <a href="https://navara.world">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="./docs/public/logo/svg/white/white_Navara_Vertical_logo.svg">
+      <img src="./docs/public/logo/black/black_Navara_Vertical_logo_260819.svg" alt="Navara logo" width="220">
+    </picture>
+  </a>
 </p>
 
 # Navara
@@ -110,6 +112,11 @@ cargo make dev
 Alternatively, use `web` if you are working on the web side (using release rust builds + debug web builds)
 ```console
 cargo make web
+```
+
+`web` skips wasm-opt to shorten rebuilds. Use `web-release` to run the same optimized WASM binaries as the shipped build.
+```console
+cargo make web-release
 ```
 
 ### Screenshots

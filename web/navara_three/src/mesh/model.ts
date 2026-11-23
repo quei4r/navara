@@ -2,11 +2,13 @@ import { Unimplemented } from "@navaramap/core";
 import {
   ModelMaterial as NavaraModelMaterial,
   ModelMesh as NavaraModelMesh,
+  PointColorsFormat,
   Vec3,
 } from "@navaramap/engine";
 import {
   BufferAttribute,
   BufferGeometry,
+  Box3Helper,
   Color,
   DataTexture,
   DirectionalLight,
@@ -16,7 +18,6 @@ import {
   MeshPhysicalMaterial,
   MeshStandardMaterial,
   Object3D,
-  RGBADepthPacking,
   SkinnedMesh,
   Texture,
   Vector3,
@@ -37,18 +38,19 @@ import {
   type BatchTextureSupport,
 } from "../batchTexture";
 import type { EventContext } from "../event/context";
-import { applyLitOption } from "../material";
+import { applyLitOption, createShadowDepthMaterial } from "../material";
 import {
   createModelMaterialEnhancer,
   createPntsEnhancer,
+  tintBaseColor,
 } from "../material/enhancer/model";
 import type { ModelMaterialProps, PntsProps } from "../material/enhancer/model";
-import type { UniformValue } from "../material/types";
 import type { CustomObject3DEventMap } from "../object3DEvent";
 import { getWebGPU } from "../utils";
 
 import { GEOMETRY_TYPES } from "./constants";
 import type { FeatureMesh } from "./featureMesh";
+import { vertexGlobalBatchIds } from "./modelBatchIds";
 import type { PickableMesh } from "./pickableMesh";
 import { releaseGeometryArraysAfterUpload } from "./releaseGeometryArrays";
 import {
@@ -58,6 +60,16 @@ import {
 } from "./webgpuBatchTexture";
 
 export type ModelMaterial = MeshStandardMaterial | MeshPhysicalMaterial;
+
+/** `CONSTANT_RGBA` (`0xRRGGBBAA`, sRGB) as the PNTS base color. */
+function constantRgba(
+  rgba: number,
+): Pick<PntsProps, "baseColor" | "baseOpacity"> {
+  return {
+    baseColor: new Color().setHex(rgba >>> 8),
+    baseOpacity: (rgba & 0xff) / 0xff,
+  };
+}
 
 // TODO: Height to adjust the height based on its property.
 export type ModelBatchedAttributeName =
@@ -215,21 +227,26 @@ export class ModelMesh
       ...updateProps,
       water: {
         ...updateProps.water,
-        skyEnvMap: uniforms.tSkyEnvMap.value,
-        waterNormalMap: uniforms.waterTexture as UniformValue<Texture | null>,
-        timeUniform: uniforms.time as UniformValue<number>,
-        skyEnvMapUniform: uniforms.tSkyEnvMap as UniformValue<Texture | null>,
+        getWaterState: () => uniforms.water,
       },
     };
 
+    const internal = meshMaterial.__internal__;
     const geodeticNormal: Vec3 =
-      meshMaterial.__internal__?.pointCloudGeodeticNormal ?? new Vec3(0, 0, 0);
+      internal?.pointCloudGeodeticNormal ?? new Vec3(0, 0, 0);
+    const layout = internal?.pointCloudLayout;
     const pntsInitialProps: PntsProps = {
       color: meshMaterial.color ?? 0,
       pointSize: meshMaterial.pointSize ?? 1,
       height: meshMaterial.height ?? 0,
+      opacity: meshMaterial.opacity,
+      transparent: meshMaterial.transparent,
+      depthWrite: meshMaterial.depthWrite,
       geodeticNormal,
-      divideColor: meshMaterial.__internal__?.pointCloud,
+      srgbVertexColor: internal?.pointCloud,
+      ...(layout?.colorsFormat === PointColorsFormat.Constant
+        ? constantRgba(layout.constantColor)
+        : {}),
     };
 
     this.traverse((object: Object3D) => {
@@ -249,13 +266,50 @@ export class ModelMesh
     });
 
     this.visible = meshMaterial.show ?? true;
+    this._syncBoundingBoxes(!!meshMaterial.showBoundingBox);
+  }
+
+  /** One per mesh / point node while `showBoundingBox` is on. */
+  private _boxHelpers: Box3Helper[] = [];
+
+  /**
+   * Adds or removes a bounding-box helper on every mesh (blue) and point
+   * (red) node so they match `show`. Runs at init and on every material
+   * change, so toggling `showBoundingBox` reaches models already loaded.
+   */
+  private _syncBoundingBoxes(show: boolean) {
+    if (!show) {
+      for (const helper of this._boxHelpers) {
+        helper.removeFromParent();
+        helper.dispose();
+      }
+      this._boxHelpers = [];
+      return;
+    }
+    if (this._boxHelpers.length > 0) return;
+    const nodes: (Mesh | Points)[] = [];
+    this.traverse((object) => {
+      if (object instanceof Mesh || object instanceof Points) {
+        nodes.push(object);
+      }
+    });
+    for (const node of nodes) {
+      const box = (node.geometry as BufferGeometry).boundingBox;
+      if (!box) continue;
+      const helper = new Box3Helper(
+        box,
+        node instanceof Points ? 0xff0000 : 0x0000ff,
+      );
+      node.add(helper);
+      this._boxHelpers.push(helper);
+    }
   }
 
   /**
    * Drop the CPU-side typed arrays of a loaded glTF/point-cloud node after its
    * first GPU upload. The GLTFLoader has already computed bounding volumes at
    * parse time (and the point-cloud path assigns them from the WASM AABB), and
-   * `_setupMeshNode` has already read `_batchid.array` before this runs, so no
+   * `_setupMeshNode` has already read `_batchid` before this runs, so no
    * CPU read survives the first upload.
    *
    * Skipped for skinned meshes and geometries with morph targets: those keep
@@ -317,8 +371,8 @@ export class ModelMesh
 
     const enhancer = this._enhancers.get(mesh);
     if (enhancer && attribute === "color") {
-      // When batch color is first used, set material.color to white
-      // (multiplier identity: white * batch color = batch color).
+      // When batch color is first used, untint material.color back to the
+      // base color so the batch color multiplies it like a white layer color.
       if (!enhancer.states().base.batchColorEnabled) {
         enhancer.update({
           base: { batchColorEnabled: true, color: 0xffffff },
@@ -340,40 +394,15 @@ export class ModelMesh
     dataSize: number,
     initialProps: ModelMaterialProps,
   ) {
-    if (!batchIds) return;
-
-    const vertCnt = mesh.geometry.attributes?.position?.count;
-
-    const attrBatchIds = new Float32Array(vertCnt);
-    // B3DM (1.0) uses _batchid; glTF with EXT_mesh_features (1.1) uses _FEATURE_ID_N.
-    // Assign _FEATURE_ID_0 to _batchid so the batch texture shader works unchanged.
-    // Also accept lowercase _feature_id_0 as a compatibility fallback.
-    const attrs = mesh.geometry.attributes;
-    const featureIdAttribute =
-      attrs?.["_FEATURE_ID_0"] ?? attrs?.["_feature_id_0"];
-    if (!attrs?._batchid && featureIdAttribute) {
-      // TODO: Support other feature ID semantics such as `_FEATURE_ID_n`.
-      // Need to clone, since it might be switch to different feature ID attributes.
-      mesh.geometry.setAttribute("_batchid", featureIdAttribute.clone());
-    }
-    const internalBatchIds = attrs?._batchid?.array;
-
-    if (internalBatchIds) {
-      let i = 0;
-      for (const internalBatchId of internalBatchIds) {
-        attrBatchIds[i] = batchIds[internalBatchId] ?? 0;
-        i++;
-      }
-    } else {
-      for (let i = 0; i < vertCnt; i++) {
-        attrBatchIds[i] = batchIds[0];
-      }
+    // Content without features (e.g. GLB in a 1.0 tileset) has no batch IDs.
+    // The shader then reads `batchId` as 0, i.e. nothing to pick.
+    if (batchIds) {
+      this._setBatchIdAttribute(mesh, batchIds, dataSize);
     }
 
-    mesh.geometry.setAttribute(
-      "batchId",
-      new BufferAttribute(attrBatchIds, dataSize),
-    );
+    // The enhancer supports standard/physical only. Unlit materials
+    // (`KHR_materials_unlit`, e.g. Google Photorealistic 3D Tiles) render as is.
+    if (!(mesh.material instanceof MeshStandardMaterial)) return;
 
     mesh.castShadow = !!meshMaterial.castShadow;
     mesh.receiveShadow = !!meshMaterial.receiveShadow;
@@ -407,6 +436,33 @@ export class ModelMesh
     this.ctx.viewContext.applyShadowMaterial(mesh.material);
   }
 
+  private _setBatchIdAttribute(
+    mesh: Mesh<BufferGeometry<NormalBufferAttributes>, ModelMaterial>,
+    batchIds: Uint32Array<ArrayBufferLike>,
+    dataSize: number,
+  ) {
+    // B3DM (1.0) uses _batchid; glTF with EXT_mesh_features (1.1) uses _FEATURE_ID_N.
+    // Assign _FEATURE_ID_0 to _batchid so the batch texture shader works unchanged.
+    // Also accept lowercase _feature_id_0 as a compatibility fallback.
+    const attrs = mesh.geometry.attributes;
+    const featureIdAttribute =
+      attrs?.["_FEATURE_ID_0"] ?? attrs?.["_feature_id_0"];
+    if (!attrs?._batchid && featureIdAttribute) {
+      // TODO: Support other feature ID semantics such as `_FEATURE_ID_n`.
+      // Need to clone, since it might be switch to different feature ID attributes.
+      mesh.geometry.setAttribute("_batchid", featureIdAttribute.clone());
+    }
+    const featureIndices = attrs?._batchid;
+    const attrBatchIds = featureIndices
+      ? vertexGlobalBatchIds(featureIndices, batchIds)
+      : new Float32Array(attrs?.position?.count).fill(batchIds[0]);
+
+    mesh.geometry.setAttribute(
+      "batchId",
+      new BufferAttribute(attrBatchIds, dataSize),
+    );
+  }
+
   private _setupPointsNode(
     points: Points<BufferGeometry<NormalBufferAttributes>, PointsMaterial>,
     initialProps: PntsProps,
@@ -418,7 +474,14 @@ export class ModelMesh
     const enhancer = createPntsEnhancer(points.material);
     this._pntsEnhancers.set(points, enhancer);
 
-    enhancer.mount(initialProps);
+    // glTF points: the layer tints their own base color and alpha instead of
+    // replacing them, as `tintBaseColor` does for meshes.
+    const { color, opacity } = points.material;
+    enhancer.mount(
+      initialProps.srgbVertexColor
+        ? initialProps
+        : { ...initialProps, baseColor: color.clone(), baseOpacity: opacity },
+    );
 
     if (!this.isWebGPUBackend()) {
       points.material.customProgramCacheKey = () => enhancer.programCacheKey();
@@ -739,11 +802,14 @@ export class ModelMesh
       handles.uShininess.value = w.shininess;
       handles.uSpecularStrength.value = w.specularStrength;
       handles.uIor.value = w.ior;
-      handles.uWaterScaleNormal.value = w.waterScaleNormal;
-      handles.uWaterSpeed.value = w.waterSpeed;
-      handles.uReflectivity.value = w.reflectivity;
+      handles.uWaterScaleNormal.value =
+        ({ small: 1, medium: 2, large: 4, ocean: 8 } as Record<string, number>)[
+          w.waterScale
+        ] ?? 1;
+      handles.uWaterSpeed.value = w.flowSpeed;
+      handles.uReflectivity.value = w.specularStrength;
       handles.uTime.value = this.ctx.uniforms?.time?.value ?? 0;
-      const waterTex = this.ctx.uniforms?.waterTexture?.value;
+      const waterTex = (this.ctx.uniforms as any)?.waterTexture?.value;
       if (
         waterTex &&
         handles.waterNormalNode &&
@@ -880,7 +946,7 @@ export class ModelMesh
         s.geodeticNormal.y,
         s.geodeticNormal.z,
       );
-      handles.uDivideColor.value = s.divideColor ? 1 : 0;
+      handles.uDivideColor.value = (s as { divideColor?: boolean }).divideColor ? 1 : 0;
     };
   }
 
@@ -891,32 +957,32 @@ export class ModelMesh
     mesh: Mesh<BufferGeometry<NormalBufferAttributes>, ModelMaterial>,
     enhancer: ModelMaterialEnhancer,
   ) {
-    mesh.customDepthMaterial = mesh.material.clone();
-    mesh.customDepthMaterial.needsUpdate = true;
+    mesh.customDepthMaterial = createShadowDepthMaterial(
+      mesh.material,
+      (shader) => enhancer.transformShader(shader),
+    );
+  }
 
-    const origin = mesh.material;
-    // Attach to the batch texture state so layout allocations bump this
-    // clone's needsUpdate too — its compiled defines come from the origin, so
-    // it must recompile whenever they change.
-    attachBatchedMaterial(origin, mesh.customDepthMaterial);
-    // The clone's compiled defines come from the origin, so key its program on
-    // the origin's key (which includes the per-instance batch layout defines);
-    // the prefix separates it from the origin's own program.
-    mesh.customDepthMaterial.customProgramCacheKey = () =>
-      `nvr-depth:${origin.customProgramCacheKey()}`;
+  /**
+   * Host-app visibility override (LACS 补一一〇 P24).
+   *
+   * `_update` rewrites `this.visible` from the descriptor's material every
+   * frame, so an application that sets `mesh.visible = false` to cull an
+   * object (e.g. sub-pixel models at city scale) has the change silently
+   * reverted on the next update — the object keeps being drawn and the cull
+   * buys nothing. Honouring this flag is inert unless the host sets it.
+   */
+  private _externallyHidden = false;
 
-    mesh.customDepthMaterial.onBeforeCompile = (shader) => {
-      enhancer.transformShader(shader);
-
-      shader.defines ??= {};
-      Object.assign(shader.defines, mesh.material.userData?.defines || {});
-      shader.defines["USE_SHADOWMAP_DEPTH"] = 1;
-      shader.defines["DEPTH_PACKING"] = RGBADepthPacking;
-    };
+  /** Hide/show regardless of the descriptor's material state. */
+  setExternallyHidden(hidden: boolean): void {
+    this._externallyHidden = hidden;
+    if (hidden) this.visible = false;
   }
 
   _update(material: NavaraModelMaterial, active: boolean) {
-    this.visible = (material.show ?? true) && active;
+    this.visible = (material.show ?? true) && active && !this._externallyHidden;
+    this._syncBoundingBoxes(!!material.showBoundingBox);
 
     // Each enhancer map is populated only for its node type, so empty maps
     // iterate trivially. Running both lets mixed-mode glTFs (POINTS + TRIANGLES)
@@ -924,7 +990,7 @@ export class ModelMesh
     const updateProps = this.buildUpdateProps(material);
     for (const [mesh, enhancer] of this._enhancers) {
       // Once per-feature batch colors own the material, `material.color` must
-      // not re-tint the white multiplier identity (mirrors polygon/polyline's
+      // not re-tint the untinted base color (mirrors polygon/polyline's
       // `batchColorEnabled ? undefined : material.color` guard).
       enhancer.update(
         enhancer.states().base.batchColorEnabled
@@ -940,6 +1006,9 @@ export class ModelMesh
       color: material.color,
       pointSize: material.pointSize,
       height: material.height,
+      opacity: material.opacity,
+      transparent: material.transparent,
+      depthWrite: material.depthWrite,
     };
     for (const enhancer of this._pntsEnhancers.values()) {
       enhancer.update(pntsProps);
@@ -967,14 +1036,15 @@ export class ModelMesh
       },
       water: {
         water: material.water,
-        waterScaleNormal: material.waterScaleNormal,
-        waterSpeed: material.waterSpeed,
+        waveExaggeration: material.waveExaggeration,
+        waterScale: material.waterScale,
+        waveStrength: material.waveStrength,
+        waveDirection: material.waveDirection,
+        flowSpeed: material.flowSpeed,
         shininess: material.shininess,
         specularStrength: material.specularStrength,
-        applyWaterNormal: material.applyWaterNormal,
         specular: material.specular,
         ior: material.ior,
-        reflectivity: material.reflectivity,
       },
     };
   }
@@ -993,7 +1063,9 @@ export class ModelMesh
   }
 
   _setFeatureColor(color: Color, m?: ModelMaterial) {
-    m?.color.set(color);
+    if (m) {
+      tintBaseColor(m, color);
+    }
   }
 
   _getFeatureColor(): Color {
@@ -1043,5 +1115,8 @@ export class ModelMesh
     this.traverseMesh((m) => {
       this.ctx.viewContext.removeShadowMaterial(m.material);
     });
+    for (const enhancer of this._enhancers.values()) {
+      enhancer.mutates().water.dispose();
+    }
   }
 }

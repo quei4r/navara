@@ -1,12 +1,16 @@
 // Assembles the unified navara.world static-asset tree (site-dist/) from the
-// docs (Astro, built with base "/docs") and examples (Vite, base "/examples/")
-// build outputs:
+// docs (Astro, built with base "/docs") and examples (Vite, base "/examples/"
+// and "/navara-three-flood-mesh/") build outputs:
 //
 //   site-dist/
 //     index.html, ja/index.html      <- LP, relocated from docs/dist/lp/
+//     brand-assets/index.html, ...   <- brand assets page, relocated likewise
+//     showcases/index.html, ...      <- showcases page, relocated likewise
 //     favicon.png, og.jpg, 404.html  <- copied from docs/dist for the site root
+//     released-version.json          <- copied from site/
 //     docs/...                       <- docs/dist verbatim
 //     examples/...                   <- web/navara_three/dist-example verbatim
+//     navara-three-flood-mesh/...    <- web/experimental/navara_three_flood_mesh/dist-example verbatim
 //
 // The relocated LP keeps working at the site root because base "/docs" makes
 // every _astro asset URL root-absolute (/docs/_astro/...).
@@ -25,9 +29,13 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const docsDist = resolve(root, "docs/dist");
 const examplesDist = resolve(root, "web/navara_three/dist-example");
+const floodMeshDist = resolve(
+  root,
+  "web/experimental/navara_three_flood_mesh/dist-example",
+);
 const out = resolve(root, "site-dist");
 
-for (const dir of [docsDist, examplesDist]) {
+for (const dir of [docsDist, examplesDist, floodMeshDist]) {
   if (!existsSync(dir)) {
     throw new Error(
       `Missing build output: ${dir} — run \`pnpm build:docs\` and \`pnpm build:example\` first (or \`pnpm build:site\`).`,
@@ -40,22 +48,36 @@ mkdirSync(out, { recursive: true });
 
 cpSync(docsDist, resolve(out, "docs"), { recursive: true });
 
-// Relocate the LP pages from /docs/lp/ (root locale) and /docs/<locale>/lp/
-// to the site root. Non-root locales are discovered from the docs build, so a
-// new LP locale (docs/src/pages/<locale>/lp.astro) needs no change here.
+// Relocate the site-root pages out of the docs build: the LP from /docs/lp/
+// (root locale) and /docs/<locale>/lp/ to / and /<locale>/, and the other
+// site pages (docs/src/pages/<name>.astro rendered per locale) from
+// /docs/<name>/ to /<name>/ likewise. Non-root locales are discovered from
+// the docs build, so a new LP locale (docs/src/pages/<locale>/lp.astro) needs
+// no change here.
+const SITE_PAGES = [
+  ["lp", ""],
+  ["brand-assets", "brand-assets"],
+  ["showcases", "showcases"],
+];
 const lpLocales = readdirSync(resolve(out, "docs"), { withFileTypes: true })
   .filter((e) => e.isDirectory() && existsSync(resolve(out, "docs", e.name, "lp/index.html")))
   .map((e) => e.name)
   .sort();
-for (const [from, to] of [
-  ["docs/lp/index.html", "index.html"],
-  ...lpLocales.map((locale) => [`docs/${locale}/lp/index.html`, `${locale}/index.html`]),
-]) {
-  const src = resolve(out, from);
-  if (!existsSync(src)) throw new Error(`LP page not found in docs build: ${from}`);
-  mkdirSync(dirname(resolve(out, to)), { recursive: true });
-  renameSync(src, resolve(out, to));
-  rmSync(dirname(src), { recursive: true });
+for (const [name, dest] of SITE_PAGES) {
+  const destDir = dest ? `${dest}/` : "";
+  for (const [from, to] of [
+    [`docs/${name}/index.html`, `${destDir}index.html`],
+    ...lpLocales.map((locale) => [
+      `docs/${locale}/${name}/index.html`,
+      `${locale}/${destDir}index.html`,
+    ]),
+  ]) {
+    const src = resolve(out, from);
+    if (!existsSync(src)) throw new Error(`Site page not found in docs build: ${from}`);
+    mkdirSync(dirname(resolve(out, to)), { recursive: true });
+    renameSync(src, resolve(out, to));
+    rmSync(dirname(src), { recursive: true });
+  }
 }
 
 // Root-level shared files: default favicon requests and the site og image
@@ -70,7 +92,17 @@ for (const file of ["favicon.png", "og.jpg"]) {
 // serves the nearest 404.html; /docs/* keeps Starlight's own 404).
 cpSync(resolve(root, "site/404.html"), resolve(out, "404.html"));
 
+// The latest release, also read at build time by the docs and examples to
+// mark nightly-only features.
+cpSync(
+  resolve(root, "site/released-version.json"),
+  resolve(out, "released-version.json"),
+);
+
 cpSync(examplesDist, resolve(out, "examples"), { recursive: true });
+cpSync(floodMeshDist, resolve(out, "navara-three-flood-mesh"), {
+  recursive: true,
+});
 
 // The old LP URLs (parked under /lp pre-release) 301 to the site root, with
 // and without the trailing slash (_redirects matches paths exactly).

@@ -23,6 +23,7 @@ import type {
  */
 const DEFAULT_BASE_REFS: PolylineBaseRefs = {
   minMaxHeightAndWidth: { value: [0, 0, 1] },
+  nvr_uGroundHeightRange: { value: [0, 0] },
   maxWidth: { value: 10000 },
   uAddHeight: { value: 0 },
   color: { value: new ThreeColor(0xffffff) },
@@ -30,8 +31,10 @@ const DEFAULT_BASE_REFS: PolylineBaseRefs = {
   uEffectIdsMask: { value: 0 },
   uEmissiveColor: { value: new ThreeVector3(0, 0, 0) },
   uEmissiveIntensity: { value: 0 },
+  uOpacity: { value: 1 },
   nvr_uPickingCoord: { value: new ThreeVector2(-1, -1) },
   uDrapeRtSize: { value: DEFAULT_BASE_PROPS.drapeRtSize },
+  uLineDashRow: { value: DEFAULT_BASE_PROPS.dashRow },
 };
 
 /**
@@ -64,6 +67,10 @@ export const createBaseMutates = (useRTE: boolean): PolylineBaseMutates => {
         state.minMaxHeight[1],
         state.width,
       ];
+      refs.nvr_uGroundHeightRange.value = [
+        state.groundHeightRange[0],
+        state.groundHeightRange[1],
+      ];
       refs.maxWidth.value = state.maxWidth;
       refs.uAddHeight.value = state.addHeight;
       refs.nvr_uPickable.value = state.pickable ? 1 : 0;
@@ -75,7 +82,9 @@ export const createBaseMutates = (useRTE: boolean): PolylineBaseMutates => {
         (c & 0xff) / 255,
       );
       refs.uEmissiveIntensity.value = state.emissiveIntensity;
+      refs.uOpacity.value = state.opacity;
       refs.uDrapeRtSize.value = state.drapeRtSize;
+      refs.uLineDashRow.value = state.dashRow;
 
       // Update color uniform using Color.setHex()
       refs.color.value.setHex(state.color);
@@ -86,6 +95,7 @@ export const createBaseMutates = (useRTE: boolean): PolylineBaseMutates => {
 
       // Assign core uniform refs to shader.uniforms
       uniforms.minMaxHeightAndWidth = refs.minMaxHeightAndWidth;
+      uniforms.nvr_uGroundHeightRange = refs.nvr_uGroundHeightRange;
       uniforms.maxWidth = refs.maxWidth;
       uniforms.uAddHeight = refs.uAddHeight;
       uniforms.color = refs.color;
@@ -93,8 +103,16 @@ export const createBaseMutates = (useRTE: boolean): PolylineBaseMutates => {
       uniforms.uEffectIdsMask = refs.uEffectIdsMask;
       uniforms.uEmissiveColor = refs.uEmissiveColor;
       uniforms.uEmissiveIntensity = refs.uEmissiveIntensity;
+      uniforms.uOpacity = refs.uOpacity;
       uniforms.nvr_uPickingCoord = refs.nvr_uPickingCoord;
       uniforms.uDrapeRtSize = refs.uDrapeRtSize;
+      uniforms.uLineDashRow = refs.uLineDashRow;
+      if (refs.tLineDashAtlas) {
+        uniforms.tLineDashAtlas = refs.tLineDashAtlas;
+      }
+      if (refs.tLineDashSegments) {
+        uniforms.tLineDashSegments = refs.tLineDashSegments;
+      }
 
       // RTE uniforms
       if (
@@ -124,6 +142,22 @@ export const createBaseMutates = (useRTE: boolean): PolylineBaseMutates => {
       if (refs.frustumRatio) {
         uniforms.frustumRatio = refs.frustumRatio;
       }
+      if (refs.nvrHorizonMinHeight) {
+        uniforms.nvrHorizonMinHeight = refs.nvrHorizonMinHeight;
+      }
+
+      // Ground culling reads the globe depth buffer and unprojects it.
+      if (
+        state.groundCulling &&
+        refs.tGlobeDepth &&
+        refs.inverseProjectionMatrix
+      ) {
+        uniforms.tGlobeDepth = refs.tGlobeDepth;
+        uniforms.inverseProjectionMatrix = refs.inverseProjectionMatrix;
+        if (state.useGroundNormals && refs.tGlobeNormal) {
+          uniforms.tGlobeNormal = refs.tGlobeNormal;
+        }
+      }
     },
     setBatchDataTexture: (texture: UniformValue<Texture | null>): void => {
       refs.batchDataTexture = texture;
@@ -140,6 +174,12 @@ export const createBaseMutates = (useRTE: boolean): PolylineBaseMutates => {
       frustumRatio?: {
         value: [x: number, y: number, z: number, w: number] | undefined | null;
       };
+      horizonMinHeight?: { value: number };
+      globeDepth?: { value: Texture | null | undefined };
+      globeNormal?: { value: Texture | null | undefined };
+      inverseProjectionMatrix?: { value: ThreeMatrix4 | null | undefined };
+      lineDashAtlas?: { value: Texture | null | undefined };
+      lineDashSegments?: { value: Texture | null | undefined };
     }): void => {
       if (externalRefs.batchDataTexture) {
         refs.batchDataTexture = externalRefs.batchDataTexture;
@@ -152,6 +192,24 @@ export const createBaseMutates = (useRTE: boolean): PolylineBaseMutates => {
       }
       if (externalRefs.frustumRatio) {
         refs.frustumRatio = externalRefs.frustumRatio;
+      }
+      if (externalRefs.horizonMinHeight) {
+        refs.nvrHorizonMinHeight = externalRefs.horizonMinHeight;
+      }
+      if (externalRefs.globeDepth) {
+        refs.tGlobeDepth = externalRefs.globeDepth;
+      }
+      if (externalRefs.globeNormal) {
+        refs.tGlobeNormal = externalRefs.globeNormal;
+      }
+      if (externalRefs.inverseProjectionMatrix) {
+        refs.inverseProjectionMatrix = externalRefs.inverseProjectionMatrix;
+      }
+      if (externalRefs.lineDashAtlas) {
+        refs.tLineDashAtlas = externalRefs.lineDashAtlas;
+      }
+      if (externalRefs.lineDashSegments) {
+        refs.tLineDashSegments = externalRefs.lineDashSegments;
       }
     },
     updateRteUniforms: (

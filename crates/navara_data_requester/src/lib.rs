@@ -7,16 +7,17 @@ use bevy_ecs::{
     component::Component,
     entity::Entity,
     message::MessageReader,
-    query::{Added, With, Without},
+    query::{Added, Or, With, Without},
     schedule::{IntoScheduleConfigs, SystemSet},
-    system::{Commands, Query, ResMut},
+    system::{Commands, Query, Res, ResMut},
 };
 use navara_buffer_store::{BufferStore, BufferStoreFailedEvent, BufferStoreLoadedEvent, Handle};
-use navara_component::{Deleted, Ignored, Priority, Requested};
+use navara_component::{Deleted, Ignored, Priority, Requested, Resumed, Waiting};
 use navara_event_store::EventStore;
+use navara_worker_component::WorkerLimits;
 use url::Url;
 
-pub use data_manager::DataManager;
+pub use data_manager::{DataManager, Unregistered};
 
 pub struct DataRequesterPlugin;
 
@@ -57,6 +58,50 @@ impl Default for RequestLimits {
     }
 }
 
+/// An image fetch leader whose `data_requested` is held back while the
+/// frontend paused worker intake ([`WorkerLimits::is_paused`]): the frontend
+/// decodes images to pixels on its worker pool, which must drain to recycle.
+/// [`release_deferred_data_requests`] emits it once intake resumes. The requester keeps `Requested`, so it still counts
+/// against its pipeline's [`RequestLimits`] and the consumers sharing its
+/// handle keep waiting on it.
+#[derive(Component)]
+pub struct DeferredDataRequest;
+
+/// Emit `data_requested` for a fetch leader, or hold it back with
+/// [`DeferredDataRequest`] while its payload would need a paused worker.
+fn dispatch_fetch(
+    commands: &mut Commands,
+    events: &mut EventStore,
+    worker_limits: Option<&WorkerLimits>,
+    e: Entity,
+    extension: &DataRequesterExtension,
+) {
+    if worker_limits.is_some_and(|l| l.is_paused()) && extension.is_image() {
+        commands.entity(e).insert(DeferredDataRequest);
+    } else {
+        events.data_requested.push(e);
+    }
+}
+
+/// Mark a pending requester `Requested` and dispatch its fetch, unless
+/// another consumer of the same URL already did this frame.
+fn send_data_request(
+    commands: &mut Commands,
+    events: &mut EventStore,
+    data_manager: &mut DataManager,
+    worker_limits: Option<&WorkerLimits>,
+    e: Entity,
+    data_req: &DataRequester,
+) {
+    if data_req.status != DataRequesterStatus::Pending {
+        return;
+    }
+    commands.entity(e).insert(Requested);
+    if data_manager.try_mark_fetch_enqueued(e) {
+        dispatch_fetch(commands, events, worker_limits, e, &data_req.extension);
+    }
+}
+
 impl bevy_app::Plugin for DataRequesterPlugin {
     fn build(&self, app: &mut bevy_app::App) {
         app.init_resource::<DataManager>()
@@ -75,8 +120,10 @@ impl bevy_app::Plugin for DataRequesterPlugin {
                 (
                     send_data_request_events,
                     send_data_request_events_with_priority,
+                    release_deferred_data_requests,
                     set_data_requester_loaded,
                     set_data_requester_failed,
+                    promote_fetch_leaders,
                     release_landed_reservations,
                 )
                     .chain()
@@ -182,6 +229,12 @@ impl DataRequesterExtension {
             v => unimplemented!("The extension of {} isn't supported", v),
         }
     }
+
+    /// An image payload, which the frontend decodes to pixels on its worker
+    /// pool before storing it.
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Png | Self::WebP)
+    }
 }
 
 impl DataRequester {
@@ -275,6 +328,7 @@ impl DataRequester {
 pub fn set_data_requester_loaded(
     mut commands: Commands,
     mut events: MessageReader<BufferStoreLoadedEvent>,
+    mut data_manager: ResMut<DataManager>,
     mut requests: Query<(Entity, &mut DataRequester), With<Requested>>,
 ) {
     for e in events.read() {
@@ -288,6 +342,9 @@ pub fn set_data_requester_loaded(
             if data_req.handle == loaded_handle && data_req.status == DataRequesterStatus::Pending {
                 commands.entity(entity).remove::<Requested>();
                 data_req.status = DataRequesterStatus::Success;
+                // The shared fetch settled: a later consumer that finds no
+                // buffer must be able to dispatch again.
+                data_manager.reset_fetch_enqueued(entity);
             }
         }
     }
@@ -300,16 +357,11 @@ pub fn set_data_requester_failed(
     mut requests: Query<(Entity, &mut DataRequester), With<Requested>>,
 ) {
     for e in events.read() {
-        // Try to get handle from DataManager first (works even if entity was deleted).
-        // Fall back to querying the entity if it's an unmanaged DataRequester.
-        let failed_handle = if let Some(handle) = data_manager.get_handle_for_entity(e.id) {
-            handle
-        } else if let Ok((_, failed_req)) = requests.get(e.id) {
-            failed_req.handle
-        } else {
-            // Entity is gone and not in DataManager - can't broadcast
-            continue;
-        };
+        // The report carries the handle: the requester may already be
+        // despawned (and unregistered from DataManager) while the consumers
+        // sharing its handle still wait. Handles are never reused, so this
+        // cannot reach an unrelated fetch.
+        let failed_handle = e.handle;
 
         // Broadcast failure to all consumers with the same handle.
         // This ensures all consumers sharing a handle are notified when any one fails,
@@ -360,30 +412,28 @@ pub fn send_data_request_events(
     mut commands: Commands,
     mut events: ResMut<EventStore>,
     mut data_manager: ResMut<DataManager>,
+    worker_limits: Option<Res<WorkerLimits>>,
     requests: Query<
         (Entity, &DataRequester),
         (
-            Added<DataRequester>,
+            Or<(Added<DataRequester>, Added<Resumed>)>,
             Without<Priority>,
             Without<Deleted>,
             Without<Requested>,
+            Without<Waiting>,
         ),
     >,
     removed: Query<Entity, (With<DataRequester>, With<Deleted>, Without<Ignored>)>,
 ) {
-    // Only send events for Pending DataRequesters.
-    // Success DataRequesters already have their data and don't need fetching.
     for (e, data_req) in requests.iter() {
-        if data_req.status == DataRequesterStatus::Pending {
-            commands.entity(e).insert(Requested);
-
-            // Only push event if this is the first fetch for this URL.
-            // try_mark_fetch_enqueued returns true if we're the first, false if another
-            // consumer already enqueued a fetch for the same URL in this frame.
-            if data_manager.try_mark_fetch_enqueued(e) {
-                events.data_requested.push(e);
-            }
-        }
+        send_data_request(
+            &mut commands,
+            &mut events,
+            &mut data_manager,
+            worker_limits.as_deref(),
+            e,
+            data_req,
+        );
     }
 
     for e in removed.iter() {
@@ -397,24 +447,26 @@ pub fn send_data_request_events_with_priority(
     mut commands: Commands,
     mut events: ResMut<EventStore>,
     mut data_manager: ResMut<DataManager>,
+    worker_limits: Option<Res<WorkerLimits>>,
     requests: Query<
         (Entity, &Priority, &DataRequester),
-        (Added<DataRequester>, Without<Deleted>, Without<Requested>),
+        (
+            Or<(Added<DataRequester>, Added<Resumed>)>,
+            Without<Deleted>,
+            Without<Requested>,
+            Without<Waiting>,
+        ),
     >,
 ) {
-    // Only send events for Pending DataRequesters.
-    // Success DataRequesters already have their data and don't need fetching.
     for (e, _, data_req) in requests.iter().sort::<&Priority>() {
-        if data_req.status == DataRequesterStatus::Pending {
-            commands.entity(e).insert(Requested);
-
-            // Only push event if this is the first fetch for this URL.
-            // try_mark_fetch_enqueued returns true if we're the first, false if another
-            // consumer already enqueued a fetch for the same URL in this frame.
-            if data_manager.try_mark_fetch_enqueued(e) {
-                events.data_requested.push(e);
-            }
-        }
+        send_data_request(
+            &mut commands,
+            &mut events,
+            &mut data_manager,
+            worker_limits.as_deref(),
+            e,
+            data_req,
+        );
     }
 }
 
@@ -441,24 +493,26 @@ pub fn send_data_request_events_with_priority_and_sort<K: RequestOrderKey>(
     mut commands: Commands,
     mut events: ResMut<EventStore>,
     mut data_manager: ResMut<DataManager>,
+    worker_limits: Option<Res<WorkerLimits>>,
     requests: Query<
         (Entity, &Priority, &RequestOrder<K>, &DataRequester),
-        (Added<DataRequester>, Without<Deleted>, Without<Requested>),
+        (
+            Or<(Added<DataRequester>, Added<Resumed>)>,
+            Without<Deleted>,
+            Without<Requested>,
+            Without<Waiting>,
+        ),
     >,
 ) {
-    // Only send events for Pending DataRequesters.
-    // Success DataRequesters already have their data and don't need fetching.
     for (e, _, _, data_req) in requests.iter().sort::<(&Priority, &RequestOrder<K>)>() {
-        if data_req.status == DataRequesterStatus::Pending {
-            commands.entity(e).insert(Requested);
-
-            // Only push event if this is the first fetch for this URL.
-            // try_mark_fetch_enqueued returns true if we're the first, false if another
-            // consumer already enqueued a fetch for the same URL in this frame.
-            if data_manager.try_mark_fetch_enqueued(e) {
-                events.data_requested.push(e);
-            }
-        }
+        send_data_request(
+            &mut commands,
+            &mut events,
+            &mut data_manager,
+            worker_limits.as_deref(),
+            e,
+            data_req,
+        );
     }
 }
 
@@ -474,7 +528,13 @@ pub fn remove_removed_data_requesters(
             // Note: unregister_consumer may return None if this entity was already
             // unregistered (e.g., by filter systems), which is fine - the handle
             // cleanup was already handled or is still shared by other consumers.
-            if let Some((_url, handle, true)) = resource_manager.unregister_consumer(e) {
+            // A removed leader's key is re-led by `promote_fetch_leaders`.
+            if let Some(Unregistered {
+                handle,
+                last_consumer: true,
+                ..
+            }) = resource_manager.unregister_consumer(e)
+            {
                 buf.remove(&handle);
             }
         } else {
@@ -484,6 +544,319 @@ pub fn remove_removed_data_requesters(
 
         commands.entity(e).remove::<Requested>();
         commands.entity(e).despawn();
+    }
+}
+
+/// Dispatch the fetch again for keys whose leader was removed while other
+/// consumers still wait on it (the frontend aborts the removed leader's
+/// fetch). A waiting follower already carries `Requested`, so the senders
+/// never revisit it; this is the only path that re-emits it.
+///
+/// Runs after the load/fail systems so a follower whose result landed this
+/// frame is no longer Pending and is not re-dispatched.
+#[allow(clippy::type_complexity)]
+pub fn promote_fetch_leaders(
+    mut commands: Commands,
+    mut events: ResMut<EventStore>,
+    mut data_manager: ResMut<DataManager>,
+    worker_limits: Option<Res<WorkerLimits>>,
+    waiting: Query<(&DataRequester, Option<&Priority>), (With<Requested>, Without<Deleted>)>,
+) {
+    // Requests without `Priority` rank as `Extreme`, as on the frontend.
+    let urgency = |e: Entity| {
+        let (data_req, priority) = waiting.get(e).ok()?;
+        (data_req.status == DataRequesterStatus::Pending).then(|| priority.map_or(0, |p| p.rank()))
+    };
+    let mut promoted = data_manager.promote_orphaned_leaders(urgency);
+    promoted.sort_by_key(|&e| urgency(e));
+    for e in promoted {
+        if let Ok((data_req, _)) = waiting.get(e) {
+            dispatch_fetch(
+                &mut commands,
+                &mut events,
+                worker_limits.as_deref(),
+                e,
+                &data_req.extension,
+            );
+        }
+    }
+}
+
+/// Emit the fetches held back by [`dispatch_fetch`] once worker intake
+/// resumes, most urgent first (requests without `Priority` rank as
+/// `Extreme`, as on the frontend).
+#[allow(clippy::type_complexity)]
+pub fn release_deferred_data_requests(
+    mut commands: Commands,
+    mut events: ResMut<EventStore>,
+    worker_limits: Option<Res<WorkerLimits>>,
+    deferred: Query<(Entity, Option<&Priority>), (With<DeferredDataRequest>, Without<Deleted>)>,
+) {
+    if worker_limits.is_some_and(|l| l.is_paused()) {
+        return;
+    }
+    for (e, _) in deferred.iter().sort::<Option<&Priority>>() {
+        commands.entity(e).remove::<DeferredDataRequest>();
+        events.data_requested.push(e);
+    }
+}
+
+#[cfg(test)]
+mod leader_promotion_tests {
+    use bevy_app::{App, PostUpdate, PreUpdate};
+
+    use super::*;
+
+    fn make_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<EventStore>();
+        app.init_resource::<DataManager>();
+        app.init_resource::<BufferStore>();
+        app.add_systems(PreUpdate, remove_removed_data_requesters);
+        app.add_message::<BufferStoreLoadedEvent>();
+        app.add_message::<BufferStoreFailedEvent>();
+        app.add_systems(
+            PostUpdate,
+            (
+                send_data_request_events,
+                release_deferred_data_requests,
+                set_data_requester_loaded,
+                set_data_requester_failed,
+                promote_fetch_leaders,
+            )
+                .chain(),
+        );
+        app
+    }
+
+    /// Spawn a managed consumer of `url`; the first one dispatches, later ones
+    /// wait on the same handle with `Requested` already set.
+    fn spawn_consumer(app: &mut App, url: &str) -> Entity {
+        spawn_consumer_of(app, url, DataRequesterExtension::Png)
+    }
+
+    fn spawn_consumer_of(app: &mut App, url: &str, extension: DataRequesterExtension) -> Entity {
+        let world = app.world_mut();
+        let entity = world.spawn_empty().id();
+        let (handle, _, already_enqueued) =
+            world.resource_scope(|world, mut dm: bevy_ecs::world::Mut<DataManager>| {
+                let mut buf = world.resource_mut::<BufferStore>();
+                dm.register_consumer(url.to_string(), None, entity, &mut buf)
+            });
+        let requester = DataRequester::new_with_status(
+            handle,
+            url.to_string(),
+            extension,
+            DataRequesterStatus::Pending,
+        );
+        if already_enqueued {
+            world.entity_mut(entity).insert((requester, Requested));
+        } else {
+            world.entity_mut(entity).insert(requester);
+        }
+        entity
+    }
+
+    fn take_requested(app: &mut App) -> Vec<Entity> {
+        let mut store = app.world_mut().resource_mut::<EventStore>();
+        std::mem::take(&mut store.data_requested)
+    }
+
+    #[test]
+    fn a_follower_redispatches_when_its_leader_is_removed() {
+        let mut app = make_app();
+        let leader = spawn_consumer(&mut app, "https://example.com/a.png");
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![leader]);
+
+        let follower = spawn_consumer(&mut app, "https://example.com/a.png");
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+
+        app.world_mut().entity_mut(leader).insert(Deleted);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![follower]);
+        assert!(app.world().get_entity(leader).is_err());
+
+        // Removing the promoted follower (now the last consumer) orphans nobody.
+        app.world_mut().entity_mut(follower).insert(Deleted);
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_settled_follower_is_not_redispatched() {
+        let mut app = make_app();
+        let leader = spawn_consumer(&mut app, "https://example.com/b.png");
+        let follower = spawn_consumer(&mut app, "https://example.com/b.png");
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![leader]);
+
+        app.world_mut()
+            .get_mut::<DataRequester>(follower)
+            .unwrap()
+            .status = DataRequesterStatus::Success;
+        app.world_mut().entity_mut(leader).insert(Deleted);
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+    }
+
+    #[test]
+    fn a_deleted_follower_is_never_promoted() {
+        let mut app = make_app();
+        let url = "https://example.com/c.png";
+        let leader = spawn_consumer(&mut app, url);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![leader]);
+        let a = spawn_consumer(&mut app, url);
+        let b = spawn_consumer(&mut app, url);
+        app.update();
+
+        // The leader and one follower go in the same frame; the survivor
+        // leads, whichever of the two the registry would have listed first.
+        app.world_mut().entity_mut(leader).insert(Deleted);
+        app.world_mut().entity_mut(a).insert(Deleted);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![b]);
+    }
+
+    #[test]
+    fn a_follower_loaded_in_the_promotion_frame_is_not_redispatched() {
+        let mut app = make_app();
+        let url = "https://example.com/d.png";
+        let leader = spawn_consumer(&mut app, url);
+        let follower = spawn_consumer(&mut app, url);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![leader]);
+
+        // The leader's fetch reported before its removal reached the frontend.
+        let handle = app.world().get::<DataRequester>(follower).unwrap().handle;
+        app.world_mut().entity_mut(leader).insert(Deleted);
+        app.world_mut().write_message(BufferStoreLoadedEvent {
+            id: leader,
+            ty: navara_buffer_store::BufferType::U8,
+            handle,
+        });
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+        assert!(
+            app.world()
+                .get::<DataRequester>(follower)
+                .unwrap()
+                .is_succeeded()
+        );
+    }
+
+    #[test]
+    fn a_follower_failed_in_the_promotion_frame_is_not_redispatched() {
+        let mut app = make_app();
+        let url = "https://example.com/f.png";
+        let leader = spawn_consumer(&mut app, url);
+        let follower = spawn_consumer(&mut app, url);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![leader]);
+
+        // The leader's fetch failed before its removal reached the frontend;
+        // the leader is unregistered before the report lands.
+        let handle = app.world().get::<DataRequester>(follower).unwrap().handle;
+        app.world_mut().entity_mut(leader).insert(Deleted);
+        app.world_mut()
+            .write_message(BufferStoreFailedEvent { id: leader, handle });
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+        assert!(
+            app.world()
+                .get::<DataRequester>(follower)
+                .unwrap()
+                .is_failed()
+        );
+    }
+
+    #[test]
+    fn a_loaded_fetch_releases_the_leader() {
+        let mut app = make_app();
+        let url = "https://example.com/e.png";
+        let leader = spawn_consumer(&mut app, url);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![leader]);
+
+        let handle = app.world().get::<DataRequester>(leader).unwrap().handle;
+        app.world_mut().write_message(BufferStoreLoadedEvent {
+            id: leader,
+            ty: navara_buffer_store::BufferType::U8,
+            handle,
+        });
+        app.update();
+
+        // The buffer is absent (never stored as u8), so a new consumer must
+        // dispatch instead of waiting on the settled fetch.
+        let next = spawn_consumer(&mut app, url);
+        assert!(!app.world().entity(next).contains::<Requested>());
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![next]);
+    }
+
+    fn set_worker_intake_paused(app: &mut App, paused: bool) {
+        app.world_mut().insert_resource(WorkerLimits {
+            intake_paused: paused,
+            ..Default::default()
+        });
+    }
+
+    /// While worker intake is paused an image fetch is held back (a
+    /// non-image one is not), keeps `Requested`, and is emitted on resume.
+    #[test]
+    fn an_image_fetch_waits_for_worker_intake() {
+        let mut app = make_app();
+        set_worker_intake_paused(&mut app, true);
+        let image = spawn_consumer(&mut app, "https://example.com/dem.png");
+        let json = spawn_consumer_of(
+            &mut app,
+            "https://example.com/tileset.json",
+            DataRequesterExtension::Json,
+        );
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![json]);
+        assert!(app.world().entity(image).contains::<DeferredDataRequest>());
+        assert!(app.world().entity(image).contains::<Requested>());
+
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+
+        set_worker_intake_paused(&mut app, false);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![image]);
+        assert!(!app.world().entity(image).contains::<DeferredDataRequest>());
+
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+    }
+
+    /// A follower promoted while intake is paused is held back like a new
+    /// fetch; a deferred leader removed before resuming is never emitted.
+    #[test]
+    fn a_promoted_image_fetch_waits_for_worker_intake() {
+        let mut app = make_app();
+        let url = "https://example.com/g.png";
+        let leader = spawn_consumer(&mut app, url);
+        let follower = spawn_consumer(&mut app, url);
+        app.update();
+        assert_eq!(take_requested(&mut app), vec![leader]);
+
+        set_worker_intake_paused(&mut app, true);
+        app.world_mut().entity_mut(leader).insert(Deleted);
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
+        assert!(
+            app.world()
+                .entity(follower)
+                .contains::<DeferredDataRequest>()
+        );
+
+        app.world_mut().entity_mut(follower).insert(Deleted);
+        set_worker_intake_paused(&mut app, false);
+        app.update();
+        assert!(take_requested(&mut app).is_empty());
     }
 }
 
@@ -521,6 +894,41 @@ mod tests {
                 RequestOrder(TestKey(key)),
             ))
             .id()
+    }
+
+    /// A requester its pipeline holds back is not sent, whichever sender
+    /// runs, until the pipeline releases it.
+    #[test]
+    fn senders_send_a_waiting_requester_once_released() {
+        let mut app = App::new();
+        app.init_resource::<EventStore>();
+        app.init_resource::<DataManager>();
+        app.add_systems(
+            bevy_app::Update,
+            (
+                send_data_request_events_with_priority_and_sort::<TestKey>,
+                send_data_request_events_with_priority,
+            )
+                .chain(),
+        );
+
+        let sent = spawn_requester(&mut app, Priority::High, 1);
+        let held = spawn_requester(&mut app, Priority::High, 2);
+        app.world_mut().entity_mut(held).insert(Waiting);
+        app.update();
+
+        let order = app.world().resource::<EventStore>().data_requested.clone();
+        assert_eq!(order, vec![sent]);
+        assert!(app.world().get::<Requested>(held).is_none());
+
+        app.world_mut()
+            .entity_mut(held)
+            .remove::<Waiting>()
+            .insert(Resumed);
+        app.update();
+        let order = app.world().resource::<EventStore>().data_requested.clone();
+        assert_eq!(order, vec![sent, held]);
+        assert!(app.world().get::<Requested>(held).is_some());
     }
 
     #[test]

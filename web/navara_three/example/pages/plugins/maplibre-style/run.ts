@@ -1,6 +1,6 @@
 import {
   MapLibreStylePlugin,
-  RustStyleEngine,
+  fetchFontStyleOverrides,
 } from "@navaramap/maplibre-style";
 import ThreeView from "@navaramap/three";
 import {
@@ -9,7 +9,6 @@ import {
 } from "@navaramap/three-default-plugin";
 import { Pane } from "tweakpane";
 
-import { withBase } from "../../../helpers/base";
 import {
   MVT_DATASETS,
   TERRAIN_DATASETS,
@@ -25,15 +24,19 @@ export type CustomDescriptions = DefaultDescriptions;
  */
 export async function run() {
   const view = new ThreeView<CustomDescriptions>({});
+  view.addPlugin(new DefaultPlugin());
 
-  // Add default plugin for camera controls, etc.
-  const plugin = new DefaultPlugin();
-  view.addPlugin(plugin);
-
-  // Add the MapLibre Style plugin
+  // Add the MapLibre Style plugin with font overrides
+  const fontOverrides = await fetchFontStyleOverrides(
+    "Open Sans",
+    "https://fonts.googleapis.com/css2?family=Open+Sans:wght@600&display=swap",
+  );
   const maplibrePlugin = new MapLibreStylePlugin(
-    withBase("maplibre-style.json"),
-    new RustStyleEngine(),
+    "https://demotiles.maplibre.org/globe.json",
+    {
+      overrides: fontOverrides,
+      forceMapLibreFov: true,
+    },
   );
   view.addPlugin(maplibrePlugin);
 
@@ -42,18 +45,10 @@ export async function run() {
   // Initialize the view
   await view.init();
 
-  // Set up default scene
-  plugin.addDefaultPhotorealScene();
+  view.addLight({ ambient: {} });
 
-  // Position camera to view Tokyo area
-  view.setCamera({
-    lng: 138.753,
-    lat: 35.2,
-    height: 15000,
-    heading: 0,
-    pitch: -45,
-    roll: 0,
-  });
+  // Add ellipsoid terrain as the base surface for vector features
+  view.addLayer({ type: "terrain", ellipsoid: {} });
 
   // Add controls
   const pane = new Pane();

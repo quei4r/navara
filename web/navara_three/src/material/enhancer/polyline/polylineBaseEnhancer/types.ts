@@ -16,9 +16,29 @@ export type PolylineBaseProps = {
 
   // Height/width
   minMaxHeight?: [number, number];
+  /**
+   * Height range of the terrain under a `groundCulling` line. A dash pattern
+   * lifts the points it reads from the segment table, which lie on the
+   * ellipsoid, to its middle. `minMaxHeight` encloses it, plus the volume's
+   * allowance for the curvature.
+   */
+  groundHeightRange?: [number, number];
   addHeight?: number;
   width?: number;
   maxWidth?: number;
+
+  /**
+   * Row of the line's dash pattern in `lineDashAtlas` (`LineDashAtlas.register`);
+   * `SOLID_DASH_ROW` draws a solid line.
+   */
+  dashRow?: number;
+  /** The view's dash pattern atlas (`LineDashAtlas.uniform`). */
+  lineDashAtlas?: { value: Texture | null | undefined };
+  /**
+   * A volume line's segment table (`createLineSegmentTextureReleasedOnUpload`), needed while
+   * the line has a dash pattern.
+   */
+  lineDashSegments?: { value: Texture | null | undefined };
 
   isTexturized?: boolean;
 
@@ -28,6 +48,23 @@ export type PolylineBaseProps = {
 
   // Picking
   pickable?: boolean;
+
+  /**
+   * Draw the line on the terrain: keep fragments whose ground point, read from
+   * the globe depth, lies within half a line width of the segment. Needs
+   * `globeDepth`, `inverseProjectionMatrix`, and a `minMaxHeight` enclosing
+   * the terrain.
+   */
+  groundCulling?: boolean;
+
+  /**
+   * Light a `groundCulling` line with the terrain normal. Needs
+   * `globeNormal`.
+   */
+  useGroundNormals?: boolean;
+  globeDepth?: { value: Texture | null | undefined };
+  globeNormal?: { value: Texture | null | undefined };
+  inverseProjectionMatrix?: { value: Matrix4 | null | undefined };
 
   // SelectiveEffect
   effectIdsMask?: number;
@@ -43,6 +80,8 @@ export type PolylineBaseProps = {
   frustumRatio?: {
     value: [x: number, y: number, z: number, w: number] | undefined | null;
   };
+  /** Height the ellipsoid is shrunk by for horizon culling, bound as `nvrHorizonMinHeight`. */
+  horizonMinHeight?: { value: number };
 
   // Batch texture
   batchDataTexture?: UniformValue<Texture | null>;
@@ -64,14 +103,19 @@ export type PolylineBaseState = Readonly<{
   isTexturized: boolean;
   drapeRtSize: number;
   pickable: boolean;
+  groundCulling: boolean;
+  useGroundNormals: boolean;
   effectIdsMask: number;
   emissiveColor: number;
   emissiveIntensity: number;
   minMaxHeight: [number, number];
+  groundHeightRange: [number, number];
   addHeight: number;
   width: number;
   maxWidth: number;
+  dashRow: number;
   color: number;
+  opacity: number;
   // Batch texture state - when true, material.color is white and colors come from batch texture
   batchColorEnabled: boolean;
 }>;
@@ -86,6 +130,7 @@ export type PolylineBaseState = Readonly<{
 export type PolylineBaseRefs = {
   // Core uniforms
   minMaxHeightAndWidth: UniformValue<[number, number, number]>;
+  nvr_uGroundHeightRange: UniformValue<[number, number]>;
   maxWidth: UniformValue<number>;
   uAddHeight: UniformValue<number>;
   color: UniformValue<Color>;
@@ -93,11 +138,18 @@ export type PolylineBaseRefs = {
   uEffectIdsMask: UniformValue<number>;
   uEmissiveColor: UniformValue<Vector3>;
   uEmissiveIntensity: UniformValue<number>;
+  uOpacity: UniformValue<number>;
   nvr_uPickingCoord: UniformValue<Vector2>;
   uDrapeRtSize: UniformValue<number>;
+  uLineDashRow: UniformValue<number>;
 
   // Optional uniforms
   batchDataTexture?: UniformValue<Texture | null>;
+  tLineDashAtlas?: { value: Texture | null | undefined };
+  tLineDashSegments?: { value: Texture | null | undefined };
+  tGlobeDepth?: { value: Texture | null | undefined };
+  tGlobeNormal?: { value: Texture | null | undefined };
+  inverseProjectionMatrix?: { value: Matrix4 | null | undefined };
 
   // External shared uniforms (references passed from CommonUniforms)
   // Note: These use tuple types matching CommonUniforms, not Three.js Vector types
@@ -108,6 +160,7 @@ export type PolylineBaseRefs = {
   frustumRatio?: {
     value: [x: number, y: number, z: number, w: number] | undefined | null;
   };
+  nvrHorizonMinHeight?: { value: number };
 
   // RTE uniforms (only present if useRTE is true)
   modelViewMatrixRTE?: UniformValue<Matrix4>;
@@ -166,6 +219,12 @@ export type PolylineBaseMutates = Mutates<
       frustumRatio?: {
         value: [x: number, y: number, z: number, w: number] | undefined | null;
       };
+      horizonMinHeight?: { value: number };
+      globeDepth?: { value: Texture | null | undefined };
+      globeNormal?: { value: Texture | null | undefined };
+      inverseProjectionMatrix?: { value: Matrix4 | null | undefined };
+      lineDashAtlas?: { value: Texture | null | undefined };
+      lineDashSegments?: { value: Texture | null | undefined };
     }) => void;
   }
 >;

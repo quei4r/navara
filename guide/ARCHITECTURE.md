@@ -81,6 +81,20 @@ GIS Processing Modules
 - Application layer can choose appropriate interface based on complexity needs
 - GPU receives final rendering commands via WebGL from Three.js
 
+#### **4. Frontend Job Protocol (events in, reports out)**
+
+The Rust core (the backend) owns every scheduling decision — which fetches
+and worker tasks are admitted, in what order, and when an entity lives or
+dies — and never runs async work itself. Each frame it emits a
+`*_requested` / `*_changed` / `*_removed` event per entity that needs
+frontend work; the frontend's `JobDispatcher`
+(`web/navara_core/src/event/`) starts, updates or tears down a job for each
+right away, with no queue of its own, and reports completion through the
+`trigger_*` / `set*` / `mark*` bindings, applied on the next `update()`.
+See [FRONTEND_JOB_PROTOCOL.md](FRONTEND_JOB_PROTOCOL.md) for the event
+contract, the dispatcher, the handler rules, the shared worker budget and
+the shared-fetch leader.
+
 ### **Independent Processing Model - Module Specialization**
 
 #### **Full Engine Processing (`navara_wasm` with 40+ modules)**
@@ -164,7 +178,7 @@ The project implements a sophisticated multi-language architecture:
 
 - **`@navaramap/core`** (`web/navara_core/`) - Core utilities, event management, type definitions
 - **`@navaramap/three`** (`web/navara_three/`) - Main Three.js integration with comprehensive 3D engine
-- **`@navaramap/worker`** (`web/navara_worker/`) - Web Worker abstraction with task queuing
+- **`@navaramap/worker`** (`web/navara_worker/`) - Web Worker abstraction with task queuing. Delegated engine tasks are admitted and ordered on the Rust side (`Priority`, `OrderByDistance`) and queued on the pool in the order they are emitted; the frontend keeps no queue of its own (see [FRONTEND_JOB_PROTOCOL.md](FRONTEND_JOB_PROTOCOL.md))
 - **`@navaramap/three-api`** (`web/navara_three_api/`) - Bridge between Three.js and WASM API
 
 ### **WASM Integration** (`web/wasm/`)
@@ -236,14 +250,15 @@ The engine supports comprehensive geospatial data formats:
 
 The rendering engine includes a GPU-based mesh picking system that identifies which mesh the user clicked or hovered. Rather than using CPU-side raycasting, picking renders all pickable meshes into a dedicated 1×1 render target with each mesh's batch ID encoded as an RGB color, then reads back the single pixel to determine the hit.
 
-Two gestures trigger a pick: a click (emitting `"featureClick"`) and hovering (emitting `"featureHover"` plus the diff-synthesized `"featureEnter"` / `"featureLeave"` pair). Hover picks are throttled to one per animation frame and suppressed while a mouse button is down. Both gestures are lazy, and the pick runs only while a matching listener is registered on the view.
+Two gestures trigger a pick: a click (emitting `"featureClick"`) and hovering (emitting `"featureHover"` plus the diff-synthesized `"featureEnter"` / `"featureLeave"` pair). Hover picks are throttled to one per animation frame and suppressed while a mouse button is down. The view runs the frame's hover pick (`PickHelper.pickHover`) at the start of the frame, before its render: the readback is synchronous, and by then the GPU has usually finished the previous frame, so it waits for the pick render alone. Both gestures are lazy, and the pick runs only while a matching listener is registered on the view.
 
 ### Pick Flow
 
 1. The user clicks on the canvas.
 2. `PickHelper` converts the click coordinates to WebGL pixel space (Y-flipped) and sets a scissor rect to limit the GPU work to a single pixel.
-3. All registered pickable meshes are temporarily re-parented into a dedicated pick scene. Each mesh's `onBeforePicking()` callback activates the picking shader branch.
-4. The pick scene is rendered with a black clear color (batch ID 0 = miss).
+3. All registered pickable meshes are temporarily re-parented into a dedicated pick scene. Each mesh's `onBeforePicking()` callback activates the picking shader branch. Pickables that cannot reach the search window are left out: those whose drawn objects (the meshes inside a container such as a 3D Tiles model) all have bounding spheres outside the camera frustum narrowed to the window, plus a margin for screen-space geometry such as pixel-width lines. The test is the one three's culling uses, so objects three never culls always stay.
+4. The target is cleared to black (batch ID 0 = miss) and rendered in the main pass's order: the terrain tiles (the globe scene's pickables, which carry texture-draped vector features), then the enabled `DrapedMesh` pickables, then the pick scene.
+   A draped mesh stays out of the pick scene: the packed globe depth is written into the pick target's depth buffer and the mesh runs its stencil passes (`DrapedMesh.process`) against it, so it is hit only where its volume meets the terrain. Its final pass has no depth test, so it must come after the terrain and before the pickables standing in front of the ground. The depth buffer then goes back to the pickable terrain alone (redrawn depth-only), so the remaining pickables are occluded only by pickable terrain, whether or not a draped pickable exists.
 5. The single pixel is read back and decoded: `batchId = (R << 16) + (G << 8) + B`.
 6. `onAfterPicking()` restores each mesh's normal rendering state, and all meshes are re-parented to their original scenes.
 7. A `"featureClick"` event is emitted with the decoded `PickedFeature` (batch ID, layer ID, properties).

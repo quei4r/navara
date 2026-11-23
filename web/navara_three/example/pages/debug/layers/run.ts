@@ -115,7 +115,6 @@ const createGeoLayersDef = (
       transparent: false,
       depthTest: true,
       offsetDepth: true,
-      center: { x: 0.0, y: 0.0 },
     },
   },
 
@@ -155,7 +154,7 @@ const createGeoLayersDef = (
       transparent: true,
       url: withBase("example.png"),
       offsetDepth: true,
-      center: { x: 0.0, y: -0.5 },
+      anchor: "bottom",
     },
   },
 
@@ -190,10 +189,7 @@ const createGeoLayersDef = (
       borderWidth: 0.08, // 0 ~ 0.5, the ratio of the border to the height
       // cornerRadius: 0.1, // 0 ~ 0.5, the ratio of the corner radius to the height
       size: 50,
-      center: {
-        x: 0.5,
-        y: 0,
-      },
+      anchor: "bottom",
       // padding: {
       //   x: 10,
       //   y: 0,
@@ -234,10 +230,7 @@ const createGeoLayersDef = (
       highQuality: true,
       // cornerRadius: 0.1, // 0 ~ 0.5, the ratio of the corner radius to the height
       size: 50,
-      center: {
-        x: 0.5,
-        y: 0,
-      },
+      anchor: "bottom",
       // padding: {
       //   x: 10,
       //   y: 0,
@@ -451,6 +444,52 @@ const createGeoLayersDef = (
     },
   },
   {
+    // A sloped polygon with a hole whose vertices carry their own heights.
+    type: "vector",
+    source: view.addSource({
+      type: "geojson",
+      data: {
+        type: "Feature",
+        properties: {},
+        geometry: {
+          type: "Polygon",
+          coordinates: [
+            [
+              [139.7555, 35.6795, 40],
+              [139.7595, 35.6795, 80],
+              [139.7595, 35.6825, 140],
+              [139.7555, 35.6825, 100],
+              [139.7555, 35.6795, 40],
+            ],
+            [
+              [139.7568, 35.6805, 73],
+              [139.7568, 35.6815, 93],
+              [139.7582, 35.6815, 107],
+              [139.7582, 35.6805, 87],
+              [139.7568, 35.6805, 73],
+            ],
+          ],
+        },
+      },
+    }),
+    polygon: {
+      color: new Color().setStyle("#2f8fff"),
+      height: 0,
+      extrudedHeight: 0,
+      clampToGround: false,
+      wireframe: false,
+      outlineColor: new Color().setStyle("#ffffff"),
+      outlineWidth: 2,
+      outline: true,
+      outlineShow: true,
+      surfaceShow: true,
+      castShadow: true,
+      receiveShadow: true,
+      perPositionHeight: true,
+      extrusionBase: "ellipsoid",
+    },
+  },
+  {
     type: "3d-tiles",
     source: view.addSource({
       type: "b3dm",
@@ -504,11 +543,7 @@ const createGeoLayersDef = (
       color: new Color().setStyle("#ff0000"),
       size: 70.0,
       height: 1,
-      // TODO: This should be abstracted like top-left/center/right, bottom-left/center/right
-      center: {
-        x: 0.0,
-        y: 0.0,
-      },
+      anchor: "bottom-left",
       sizeInMeters: false,
       clampToGround: true,
       depthTest: true,
@@ -633,7 +668,7 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
         ? MAPBOX_ELEVATION_DECODER()
         : JAPAN_GSI_ELEVATION_DECODER(),
   });
-  view.addLayer({
+  const terrainLayer = view.addLayer({
     type: "terrain",
     source: terrainDem,
     terrain: {
@@ -687,6 +722,25 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
 
   addCameraControl(view, pane);
   addDateControl(view, pane);
+
+  const terrainCtrl = pane.addFolder({ title: "terrain" });
+  const terrainParams = { exaggeration: 1, relativeHeight: 0 };
+  terrainCtrl
+    .addBinding(terrainParams, "exaggeration", { min: 0, max: 5, step: 0.1 })
+    .on("change", (ev) => {
+      terrainLayer.update({ terrain: { exaggeration: ev.value } });
+    });
+  terrainCtrl
+    .addBinding(terrainParams, "relativeHeight", {
+      min: 0,
+      max: 4000,
+      step: 100,
+    })
+    .on("change", (ev) => {
+      terrainLayer.update({
+        terrain: { exaggerationRelativeHeight: ev.value },
+      });
+    });
 
   const materialCtrl = pane.addFolder({ title: "material" });
 

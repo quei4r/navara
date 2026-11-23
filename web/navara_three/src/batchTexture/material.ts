@@ -14,15 +14,25 @@ export const SCALAR_DEFINE_SUFFIX: Record<BatchScalarSlotKey, string> = {
   height: "HEIGHT",
   extrudedHeight: "EXTRUDED_HEIGHT",
   lineWidth: "LINE_WIDTH",
+  lineDash: "LINE_DASH",
   size: "SIZE",
+  rotation: "ROTATION",
+  orientation: "ORIENTATION",
+  anchor: "ANCHOR",
+  offsetX: "OFFSET_X",
+  offsetY: "OFFSET_Y",
   showOpacity: "SHOW_OPACITY",
   emissiveIntensity: "EMISSIVE_INTENSITY",
+  outlineOpacity: "OUTLINE_OPACITY",
+  outlineWidth: "OUTLINE_WIDTH",
+  outlineBlur: "OUTLINE_BLUR",
 };
 
 /** GLSL define suffix per vec3 key (e.g. USE_BATCH_COLOR / BATCHED_TEXTURE_ROW_COLOR). */
 export const VEC3_DEFINE_SUFFIX: Record<BatchVec3Key, string> = {
   color: "COLOR",
   emissive: "EMISSIVE",
+  outlineColor: "OUTLINE_COLOR",
 };
 
 /**

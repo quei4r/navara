@@ -15,7 +15,7 @@ description: >
 > "Don't hide our API inside abstractions in the example"
 
 - Call `view.addLayer()`, `layer.on("featureUpdated", ...)`, `layer.update()` directly — no wrapper functions that obscure API calls.
-- One example = one feature. Don't combine unrelated features.
+- One example = one feature. Don't combine unrelated features. The exception is the gallery's `showcase` section, which composes several features into one scene; its reusable machinery goes into a package (a plugin or a Descriptor) so main.ts still reads as the API story.
 
 ## Two example tracks — and who decides what goes where
 
@@ -24,7 +24,7 @@ description: >
 
    **The gallery is curated, not exhaustive.** Pages under `pages/examples/` require **design approval** and are planned against the gallery's overall design. Never add a page there for development/debug purposes, and never add one proactively "for coverage" the way docs pages are added — only add a gallery example when explicitly asked to, with the placement already decided.
 
-   Sections and the `ExampleMeta` type are declared in `pages/examples/sections.ts` (`getting-started`, `2d`, `2.5d`, `3d`, `basemap`, `terrain`, `source`, `styling`, `interaction`, `lighting-effect`). `meta.ts` shape:
+   Sections and the `ExampleMeta` type are declared in `pages/examples/sections.ts` (`getting-started`, `2d`, `2.5d`, `3d`, `basemap`, `terrain`, `tiles-3d`, `styling`, `interaction`, `lighting-effect`, `showcase`). `meta.ts` shape:
 
 ```typescript
 import type { ExampleMeta } from "../../sections";
@@ -35,10 +35,13 @@ export default {
   title: { en: "Hello World", ja: "Hello World" },
   description: { en: "One-line summary.", ja: "一行の説明。" },
   docs: "three/tutorial/basic-visualization",   // docs-site path or absolute URL
+  since: "0.3.2",   // only when it shows an API not in the latest npm release
 } satisfies ExampleMeta;
 ```
 
 Provide both `en` and `ja` for title/description (a bare string is a fallback for all languages).
+
+When the example uses an API that the latest release (`site/released-version.json`) does not have yet, set `since` to that version + 0.0.1 (`X.Y.Z`, no `v`; `0.3.2` while `0.3.1` is the latest). The gallery card and detail page show a **Nightly** badge until a release reaches it, then the badge disappears by itself, so leave `since` in place. For an API no release is planned to ship yet (a package under `web/experimental/`), set `since: "nightly"`, and change it to the version when the package joins a release.
 
 ## File structure convention
 
@@ -89,11 +92,12 @@ The detail page (`pages/detail/DetailApp.tsx`) renders **only the example's `mai
   const source = view.addSource({ type: "geojson", data });
   ```
 - **UI chrome → `example/helpers/button.ts`** — gallery demos use a few plain DOM buttons via `addButton(label)` (fixed top-left bar styled for the neutral basemap; returns a plain `HTMLButtonElement` — drive it with `.textContent` / `.disabled` / `.onclick` from main.ts). **Tweakpane is for dev/debug pages only, not the gallery.** Never move Navara API calls into helpers — helpers hold presentation only.
-- **`initializeExample(view, loadingMeshes?)` (required)** — every gallery example calls `initializeExample(view)` (`example/helpers/initialize.ts`) as the **last line** of main.ts, with no explanatory comment. Pages that add async-loading meshes (GLTF models, 3D Gaussian Splats) pass their handles: `initializeExample(view, [splat])`. It bundles the example-harness plumbing that is *not* part of the API story — the opaque name signals readers to skip it; no monkey-patching, it only listens to public events. Currently that plumbing is scene-loaded signalling: the **detail page** (`pages/detail/DetailApp.tsx`) renders the loading overlay (progress bar + percentage; scene loading has no measurable progress, so a pseudo-progress eases toward 90% and snaps to 100% on the demo's signal) over the demo iframe, and the demo posts `SCENE_LOADED_MESSAGE` once the page settles — no engine `postUpdate` for a quiet window (a single `idle` event is not reliable: the first can fire mid-setup) and every passed mesh has emitted its `load` event (`GLTFModelDesc`, `InstancedGltfModelMeshDesc`, `SplatMeshDesc`). Spark loads splats through its own pipeline that emits no engine events, which is why splat handles must be passed; give any new async-loading desc the same `load` event and pass its handle the same way. Add any future per-page boilerplate inside `initializeExample`, not as new lines in main.ts.
+- **`initializeExample(view, loadingMeshes?)` (required)** — every gallery example calls `initializeExample(view)` (`example/helpers/initialize.ts`) as the **last line** of main.ts, with no explanatory comment. Pages that add async-loading meshes (GLTF models, 3D Gaussian Splats, 3D text) pass their handles: `initializeExample(view, [splat])`. It bundles the example-harness plumbing that is *not* part of the API story — the opaque name signals readers to skip it; no monkey-patching, it only listens to public events. Currently that plumbing is scene-loaded signalling: the **detail page** (`pages/detail/DetailApp.tsx`) renders the loading overlay (progress bar + percentage; scene loading has no measurable progress, so a pseudo-progress eases toward 90% and snaps to 100% on the demo's signal) over the demo iframe, and the demo posts `SCENE_LOADED_MESSAGE` once the page settles — no engine `postUpdate` for a quiet window (a single `idle` event is not reliable: the first can fire mid-setup) and every passed mesh has emitted its `load` event (`GLTFModelDesc`, `InstancedGltfModelMeshDesc`, `SplatMeshDesc`, `Text3DMeshDesc`). Spark loads splats through its own pipeline that emits no engine events, which is why splat handles must be passed; give any new async-loading desc the same `load` event and pass its handle the same way. Add any future per-page boilerplate inside `initializeExample`, not as new lines in main.ts.
 
 Gallery visual conventions (from the AD_EXAMPLE.md direction):
 
 - Neutral stage: the grayscale basemap `https://papers.reearth.land/styles/grayscale/tilejson.json` added via `TileJsonPlugin` (`tilejson.addSource({ type: "raster-tile", url }) ` + `view.addLayer({ type: "raster", source })`), so the data colors are the hero.
+- **A dark basemap needs a dark globe.** Raster tiles seam on terrain, and the gap shows the globe's own color (near-white by default), so a dark stage gets bright hairlines drawn across it. Set `view.globe.color` to the basemap's background (e.g. `new Color().setStyle("#15181c")` for `papers-dark`) whenever the basemap is dark. Light basemaps hide the seam, which is why only dark pages hit this.
 - Data colors: one vivid accent per state rather than one hue per geometry (e.g. blue `#0091ff`, switching to orange `#ff6b2c` to visualize a style update).
 - Lighting for meshes/extrusions (Lambert materials render black unlit): `view.addLight({ ambient: { intensity: 0.6 } })` + `view.addLight({ sun: { intensity: 1.8 } })` with a **fixed UTC** `view.atmosphere.date`, instead of the full photoreal scene. **Unlit content needs no lights at all**: clamp-to-ground (draped) vectors, `point`/`billboard` sprites, and raster basemaps render identically with zero lights — pure-2D pages should add none.
 - **Fill the frame with the subject.** Frame the camera so the feature being demonstrated dominates the shot — no small subject floating in empty basemap. Full-globe shots: the globe nearly fills or slightly overflows the frame (e.g. draped world polygons at `height: ~6_500_000`, straight down near the equator — at higher latitudes the geodetic normal misses the globe center and the sphere drifts off-center). Screen-space symbols (billboard/point/text with `sizeInMeters: false`) are sized for the 1200×750 capture viewport, so pick sizes that read in a 400px-wide thumbnail (pin ~240px, labels ~72px).
@@ -107,9 +111,10 @@ Under `example/helpers/`:
 - `constants.ts` — `TERRAIN_DATASETS`, `TILE_DATASETS`, `TILES_3D_DATASETS`, `VECTOR_DATASETS`, `LOCAL_DATASETS` (GSI tiles/terrain, PLATEAU 3D Tiles, etc. with attribution metadata)
 - `control.ts` — `addCameraControl(view, pane)`, `addDateControl(view, pane)`, `addHidePaneKeyShortcut`
 - `panel.ts` — `addFieldsToFolder` for Tweakpane folders with many fields
-- `button.ts` — `addButton(label, onClick?)` plain DOM buttons for gallery examples (see the gallery code layout section)
+- `button.ts` — plain DOM controls for gallery examples (see the gallery code layout section): `addButton(label, onClick?)`, `addSwitch`, `addCheckbox`, `addSlider`, `addReadout`. They share one bar that wraps onto more rows on a narrow screen
 - `initialize.ts` — `initializeExample(view)` example-harness bootstrap + `SCENE_LOADED_MESSAGE`, required in every gallery example; the detail page owns the loading overlay (see the gallery code layout section)
 - `keys.ts` — API keys (e.g. `GOOGLE_MAPS_API_KEY`)
+- `overture.ts` — `resolveOvertureDatasets()` resolves the current Overture release from its STAC catalog and returns the per-theme PMTiles `Dataset`s; never hardcode a dated `tiles.overturemaps.org` URL (releases expire after ~60 days)
 
 Dev/debug page UI is **Tweakpane** (`new Pane({ title })` + `.addBinding(...).on("change", ...)`); gallery example UI is plain DOM buttons from `button.ts`. The gallery/detail pages additionally use React + local shadcn/ui components (`example/components/ui`, imported via `@/components/ui/*`) — those are example-only, not part of the library.
 

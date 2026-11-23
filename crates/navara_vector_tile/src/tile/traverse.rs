@@ -1,6 +1,8 @@
 use bevy_ecs::prelude::*;
-use navara_component::{OrderByDistance, Priority};
-use navara_core::Ellipsoid;
+use navara_component::Priority;
+use std::ops::Range;
+
+use navara_core::{Aabb, Ellipsoid};
 
 use navara_buffer_store::BufferStore;
 use navara_feature_component::{id::FeatureId, render::RenderableFeature};
@@ -13,8 +15,8 @@ use navara_memory::SseDegrade;
 use navara_layer::TerrainLayer;
 use navara_occluder::ellipsoidal_occluder::EllipsoidalOccluder;
 use navara_tile_component::{
-    TerrainTileQuadtree, Tile, TileHandle, VectorTile, VectorTileQuadtree,
-    terrain_height_for_extent,
+    TerrainExaggeration, TerrainTileQuadtree, Tile, TileHandle, VectorTile, VectorTileQuadtree,
+    terrain_height_for_tile,
 };
 use navara_window::Window;
 
@@ -26,15 +28,26 @@ use crate::{
 use super::render::RenderedTile;
 
 // This process works in the following steps.
-// 1. Check if the AABB of the tile is within the camera's frustum.(Frustum culling)
-// 2. Check horizon culling because the frustum culling isn't enough.
+// 1. Check horizon culling.
+// 2. Check if the AABB of the tile, raised by how high its features are drawn, is within the camera's
+//    frustum. A tile outside it is neither requested nor drawn, except for texturized layers.
 // 3. Check SSE is within max SSE.
 // 4. If SSE works and the tile is ready, the tile should be rendered.
 // 5. On the other hand, if SSE works but the tile isn't loaded, the tile should be requested, not rendered.
 // 6. If above steps aren't matched, traverse children.
-// 7. If children couldn't be rendered completely, use this tile instead.
+// 7. If children couldn't be rendered completely and this tile is on screen, keep this tile until they are.
+//    If it isn't on screen, it is neither requested nor drawn while a child is loading: each ready child is
+//    drawn on its own and the missing children's area stays empty until they load.
 // 8. If all children is rendered, use children.
-// 9. If the tile is overscaled, it's leaf is marked just in quadtree, but it isn't actually rendered. It reuses a parent tile.
+// 9. If no child in view has data (each is past `max_zoom`, failed or culled), this tile is the finest data
+//    there, so it is requested and drawn like a leaf.
+// 10. If the tile is overscaled, it's leaf is marked just in quadtree, but it isn't actually rendered. It reuses a parent tile.
+
+/// How far above its terrain the features of a non-texturized tile are at least assumed to reach
+/// when it is tested against the frustum: data-driven heights, such as building extrusions, stand
+/// above the ground the tile's AABB covers and are not known before the tile loads. A source whose
+/// layer materials draw higher raises it (`TileCacheManager::feature_height_margin`).
+pub const FEATURE_HEIGHT_MARGIN: FloatType = 500.;
 
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_tile(
@@ -53,6 +66,7 @@ pub fn traverse_tile(
     rendered_tiles: &Query<&RenderedTile>,
     features: &Query<&FeatureId, With<VectorTileFeatureMarker>>,
     renderable_features: &mut Query<&mut RenderableFeature>,
+    activations: &mut PendingActivations,
     fog: &Fog,
     dynamic_sse: DynamicSseTerm,
     degrade: SseDegrade,
@@ -61,6 +75,7 @@ pub fn traverse_tile(
     meets_sse_ancestors: bool,
     terrain_layer: &Option<&TerrainLayer>,
     terrain_tile_qt: &TerrainTileQuadtree,
+    terrain_exaggeration: &TerrainExaggeration,
     ready_parent_tile_handle: Option<TileHandle>,
     globe: &Globe,
     source: &mut dyn crate::source::VectorTileSource,
@@ -83,31 +98,43 @@ pub fn traverse_tile(
     // tiles still relax a little). Strengths come from `TraversalConfig`
     // (content-based defaults, per-layer overridable). The `min_zoom` gate
     // below still bounds how far any of it can coarsen. (#697)
-    let dynamic_sse = dynamic_sse.scaled(traversal_config.dynamic_sse_scale() as f64);
+    //
+    // If it is texturized, max SSE need to be same with Globe.
+    let max_sse = if is_texturized {
+        globe.max_sse
+    } else {
+        traversal_config.max_sse()
+    } as f64;
+    let dynamic_sse = dynamic_sse
+        .scaled(traversal_config.dynamic_sse_scale() as f64)
+        .for_max_sse(max_sse);
 
     if tile.coords.z > traversal_config.max_zoom && !is_texturized {
-        return TraversalResult::NotFound;
+        return TraversalResult::NoData;
     }
 
-    // Borrow the terrain elevation by EXTENT (scheme-agnostic point-in-tile walk),
-    // exactly like the raster traverse, so the SSE matches the terrain's subdivision
-    // depth instead of treating the tile as flat at sea level. A by-handle lookup
-    // would miss when the vector tile is WebMercator and the terrain is Geographic
-    // (quantized-mesh), which is what kept the drape coarse.
-    let extent = tile.extent;
+    // Borrow the terrain elevation so the SSE matches the terrain's subdivision
+    // depth instead of treating the tile as flat at sea level.
     let (max_height, min_height) =
-        terrain_height_for_extent(terrain_tile_qt, &extent).unwrap_or((0., 0.));
+        terrain_height_for_tile(terrain_tile_qt, terrain_exaggeration, tile.coords);
     begin_traverse_tile(ellipsoid, occluder, camera, tile, max_height, min_height);
 
-    let is_culled_by_occlusion = !tile
-        .occludee_point_in_scaled_space
-        .map(|p| occluder.is_scaled_space_point_visible(p))
-        .unwrap_or(true);
+    let is_culled_by_occlusion = tile.is_occluded_by_horizon(occluder);
     if is_culled_by_occlusion {
         return TraversalResult::Culled;
     }
 
-    let is_culled_by_frustum = !tile.intersect_with_camera_frustum(frustum);
+    // A texturized tile backs the drape of the terrain tiles in its area, and
+    // terrain tiles outside the frustum are drawn too, so it is still selected.
+    let is_culled_by_frustum = if is_texturized {
+        !tile.intersect_with_camera_frustum(frustum)
+    } else {
+        let aabb = raise_aabb(tile.aabb(), tc.feature_height_margin);
+        if !tile.is_root() && !frustum.intersection_with_aabb(&aabb) {
+            return TraversalResult::Culled;
+        }
+        false
+    };
 
     let is_overscaled = ready_parent_tile_handle.is_some()
         && tile.coords.z > traversal_config.max_zoom
@@ -118,11 +145,12 @@ pub fn traverse_tile(
         // draping resolve reads the field, and a node that never records one (e.g.
         // past `overscaled_max_zoom` on deeply subdivided/upsampled terrain) would
         // otherwise sit in the quadtree with a stale value forever.
-        tile.ready_parent_tile_handle = if source.should_upscale(tile) {
+        let drape_source = if source.should_upscale(tile) {
             ready_parent_tile_handle
         } else {
             None
         };
+        record_drape_source(tile, tc, drape_source);
         return TraversalResult::NotFound;
     }
 
@@ -130,16 +158,16 @@ pub fn traverse_tile(
     let is_tile_ready = matches!(ready_state, ReadyState::Success);
     let is_tile_failed = matches!(ready_state, ReadyState::Failed);
 
-    let is_activated = matches!(
-        are_all_renderable_features_active(
-            tc,
-            &handle,
-            rendered_tiles,
-            features,
-            renderable_features
-        ),
-        Some(true)
+    let activation = get_renderable_feature_activation_state(
+        tc,
+        &handle,
+        rendered_tiles,
+        features,
+        renderable_features,
     );
+    let is_activated = activation.is_some_and(|state| state.all_active);
+    // On screen. An empty tile reads as all active, but draws nothing.
+    let is_drawn = activation.is_some_and(|state| state.any_active);
 
     let is_rendered_last_frame = is_activated;
 
@@ -194,26 +222,34 @@ pub fn traverse_tile(
     } else {
         inherited_drape_source
     };
-    tile.ready_parent_tile_handle = drape_source;
+    record_drape_source(tile, tc, drape_source);
 
     let were_children_rendered = tile.were_children_rendered;
     tile.were_children_rendered = false;
 
-    // If it is texturized, max SSE need to be same with Globe.
-    let max_sse = if is_texturized {
-        globe.max_sse
-    } else {
-        traversal_config.max_sse()
-    } as f64;
     // Clamp LOD selection to the source's data-available floor: a tile below
     // `min_zoom` never counts as a leaf, so dynamic-SSE relaxation can coarsen
     // down to — but not past — where the source has data. Without this, a
     // horizon-tilted view relaxes far tiles below `min_zoom` and their
     // features vanish.
-    let meets_sse = coords_z >= traversal_config.min_zoom
-        && sse <= degrade.effective_max_sse(max_sse, distance_from_camera);
+    let meets_error = sse <= degrade.effective_max_sse(max_sse, distance_from_camera);
+    let meets_sse = coords_z >= traversal_config.min_zoom && meets_error;
+
+    // The descent toward `min_zoom` ends once the traversal's budget is
+    // spent. The tile has no data to show, so it is left out like a culled
+    // one. A frustum-culled tile does not descend and takes no budget.
+    if meets_error && !meets_sse && !is_culled_by_frustum && !tc.min_zoom_descent.try_spend() {
+        return TraversalResult::Culled;
+    }
 
     let is_renderable = is_rendered_last_frame || is_tile_ready;
+    // Frustum-culled (texturized) tiles still request but demoted, so in-view
+    // tiles win the pending-request slots.
+    let request_priority = if is_culled_by_frustum {
+        Priority::Medium.demote()
+    } else {
+        Priority::Medium
+    };
 
     if meets_sse || meets_sse_ancestors {
         // The overscaled tile means that the tiles reached the max zoom level,
@@ -230,31 +266,35 @@ pub fn traverse_tile(
             return TraversalResult::TileRendered;
         }
 
-        if !meets_sse_ancestors {
-            let tile = qt.qt.get_mut(handle).unwrap();
-            // Frustum-culled tiles still request (parent backfill) but
-            // demoted, so in-view tiles win the pending-request slots.
-            source.prepare_tile(
+        // A tile that isn't loaded and keeps its children drawn is requested
+        // once, below, after its children.
+        let is_requested_below = were_children_rendered && !is_renderable;
+        if !meets_sse_ancestors && !is_requested_below {
+            request_tile_data(
                 command,
-                tile,
-                handle,
+                source,
+                qt,
                 tc,
+                handle,
                 buf,
                 data_requesters,
-                if is_culled_by_frustum {
-                    Priority::Low.demote()
-                } else {
-                    Priority::Low
-                },
+                request_priority,
             );
         }
 
         if !were_children_rendered {
-            return TraversalResult::NotFound;
+            // A failed request is never retried: report it as such, or the
+            // parent waits on this tile forever and never hands over to its
+            // other children.
+            return if is_tile_failed {
+                TraversalResult::NoData
+            } else {
+                TraversalResult::NotFound
+            };
         }
     }
 
-    // Culled tiles do not traverse children, but they are rendered to prevent parent tiles from flickering.
+    // A frustum-culled (texturized) tile is drawn without descending.
     if !is_culled_by_frustum && let Some(children) = VectorTile::traversable_children(qt, handle) {
         let mut any_children_rendered = false;
 
@@ -270,11 +310,22 @@ pub fn traverse_tile(
         let mut rendered_children_indices = vec![];
         let mut hidden_children_indices = vec![];
         let mut prepared_children_indices = vec![];
+        // Each child's run in `activations`: the tiles its subtree queued active.
+        let mut queued_descendants: Vec<Range<usize>> = Vec::with_capacity(children.len());
+        // Children that can be drawn as they are: selected, with every mesh built.
+        let mut ready_children = vec![false; children.len()];
+        // Children on screen.
+        let mut drawn_children = vec![false; children.len()];
+        // Whether a child is past `max_zoom` or failed, and whether one is
+        // neither that nor culled: drawn, ready or loading.
+        let mut any_child_without_data = false;
+        let mut any_child_with_data = false;
 
         // Overscaled tile is actually not rendered, since parent tile is reused in the rendering engine side.
         let mut overscaled_children_indices = vec![];
 
         for (i, child) in children.iter().enumerate() {
+            let queued_start = activations.mark();
             let traversal_result = traverse_tile(
                 command,
                 source_id,
@@ -291,6 +342,7 @@ pub fn traverse_tile(
                 rendered_tiles,
                 features,
                 renderable_features,
+                activations,
                 fog,
                 dynamic_sse,
                 degrade,
@@ -302,13 +354,24 @@ pub fn traverse_tile(
                 meets_sse,
                 terrain_layer,
                 terrain_tile_qt,
+                terrain_exaggeration,
                 drape_source,
                 globe,
                 source,
                 buf,
             );
+            queued_descendants.push(queued_start..activations.mark());
 
-            if matches!(traversal_result, TraversalResult::NotFound) {
+            match traversal_result {
+                TraversalResult::NoData => any_child_without_data = true,
+                TraversalResult::Culled => {}
+                _ => any_child_with_data = true,
+            }
+
+            if matches!(
+                traversal_result,
+                TraversalResult::NotFound | TraversalResult::DescendantsKept
+            ) {
                 are_all_children_rendered = false;
                 are_all_children_mesh_prepared = false;
                 are_all_children_activated = false;
@@ -316,7 +379,7 @@ pub fn traverse_tile(
 
             if matches!(
                 traversal_result,
-                TraversalResult::NotFound | TraversalResult::Culled | TraversalResult::Failed
+                TraversalResult::NotFound | TraversalResult::Culled | TraversalResult::NoData
             ) {
                 hidden_children_indices.push(i);
             }
@@ -331,45 +394,46 @@ pub fn traverse_tile(
                 TraversalResult::TileRendered
                     | TraversalResult::ChildrenRendered
                     | TraversalResult::ChildrenMeshPrepared
+                    | TraversalResult::DescendantsKept
                     | TraversalResult::Culled
             ) {
                 any_children_rendered = true;
             }
 
-            if matches!(traversal_result, TraversalResult::TileRendered)
-                && !are_all_features_rendered(get_renderable_feature(
+            if matches!(traversal_result, TraversalResult::TileRendered) {
+                ready_children[i] = are_all_features_rendered(get_renderable_feature(
                     tc,
                     child,
                     rendered_tiles,
                     features,
                     renderable_features,
-                ))
-            {
-                are_all_children_mesh_prepared = false;
-                are_all_children_rendered = false;
-                are_all_children_activated = false;
-            }
+                ));
+                if !ready_children[i] {
+                    are_all_children_mesh_prepared = false;
+                    are_all_children_rendered = false;
+                    are_all_children_activated = false;
+                }
 
-            // If tile's mesh isn't ready, render the parent tile.
-            if (matches!(traversal_result, TraversalResult::TileRendered)
-                && !matches!(
-                    are_all_renderable_features_active(
-                        tc,
-                        child,
-                        rendered_tiles,
-                        features,
-                        renderable_features
-                    ),
-                    Some(true)
-                ))
-            {
-                are_all_children_activated = false;
+                let activation = get_renderable_feature_activation_state(
+                    tc,
+                    child,
+                    rendered_tiles,
+                    features,
+                    renderable_features,
+                );
+                // If tile's mesh isn't ready, render the parent tile.
+                if !activation.is_some_and(|state| state.all_active) {
+                    are_all_children_activated = false;
+                }
+                drawn_children[i] = activation.is_some_and(|state| state.any_active);
             }
 
             // Skip rendering children in this tile.
             if matches!(
                 traversal_result,
-                TraversalResult::ChildrenRendered | TraversalResult::ChildrenMeshPrepared
+                TraversalResult::ChildrenRendered
+                    | TraversalResult::ChildrenMeshPrepared
+                    | TraversalResult::DescendantsKept
             ) {
                 rendered_children_indices.push(i);
             }
@@ -378,20 +442,49 @@ pub fn traverse_tile(
                 are_all_children_mesh_prepared = false;
             }
 
-            if matches!(traversal_result, TraversalResult::ChildrenMeshPrepared) {
+            if matches!(
+                traversal_result,
+                TraversalResult::ChildrenMeshPrepared | TraversalResult::DescendantsKept
+            ) {
                 prepared_children_indices.push(i);
             }
         }
 
+        // No child in view has data, so this tile is the finest data there.
+        let is_finest_data = any_child_without_data && !any_child_with_data;
+        // While a child is missing and this tile isn't on screen, each ready
+        // child is drawn on its own instead of this tile, and the missing
+        // children's area stays empty until they load. Falling back to this
+        // tile would trade them for a coarser tile: low zoom tiles often drop
+        // most features or have none, and while the memory load gate is
+        // closed nothing new loads to replace it, so the working set stays
+        // frozen rather than coarsened. A texturized tile still falls back
+        // unless tiles under it are on screen: the drape takes the nearest
+        // built ancestor where a finer tile is missing.
+        let leaves_missing_children_empty = !is_drawn && !is_texturized;
+
         // This condition should be avoided when overscaled children are selected.
         // We assume vector tiles is continuous data, so a tile that is over `max_zoom` is assumed an overscaled tile.
-        if any_children_rendered && overscaled_children_indices.is_empty() {
+        if any_children_rendered && !is_finest_data && overscaled_children_indices.is_empty() {
             // If the children are rendered to fill the parent, the parent tile replaces them when it is ready.
             let hide_children = (meets_sse_ancestors && is_ancestor_rendered)
                 || (meets_sse && is_rendered_last_frame);
 
+            let is_child_missing = !hide_children && !are_all_children_mesh_prepared;
+            let has_drawn_descendants = is_child_missing
+                && !is_drawn
+                && queued_descendants
+                    .iter()
+                    .enumerate()
+                    .any(|(i, range)| drawn_children[i] || activations.any_drawn(range.clone()));
+            let draws_children_alone =
+                is_child_missing && (leaves_missing_children_empty || has_drawn_descendants);
+
             let tile = qt.qt.get_mut(handle).unwrap();
-            tile.were_children_rendered = are_all_children_activated && !hide_children;
+            // The kept tiles are visited on a zoom-out like a complete group,
+            // or the cache would drop them before this tile is ready.
+            tile.were_children_rendered =
+                (are_all_children_activated && !hide_children) || has_drawn_descendants;
 
             if !meets_sse && !meets_sse_ancestors {
                 for (i, child) in children.iter().enumerate() {
@@ -414,49 +507,56 @@ pub fn traverse_tile(
                 }
             }
 
-            for (i, child) in children.iter().enumerate() {
-                let activation_state = get_renderable_feature_activation_state(
-                    tc,
-                    child,
-                    rendered_tiles,
-                    features,
-                    renderable_features,
-                );
-
+            // Reversed, so taking a child's queued descendants leaves the
+            // earlier children's runs in place.
+            for (i, child) in children.iter().enumerate().rev() {
                 let tile = qt.qt.get_mut(*child).unwrap();
                 tile.is_rendered = are_all_children_mesh_prepared;
 
                 // If this child is not renderable, skip rendering this child.
                 if prepared_children_indices.contains(&i) || hidden_children_indices.contains(&i) {
-                    if activation_state.is_some_and(|state| state.any_active) {
+                    let state = write_activation(
+                        tc,
+                        child,
+                        rendered_tiles,
+                        features,
+                        renderable_features,
+                        false,
+                    );
+                    if state.is_some_and(|state| state.any_active) {
                         tile.is_rendered = false;
-                        activate_all_renderable_features(
+                    }
+                    continue;
+                }
+
+                let draws_child = if draws_children_alone {
+                    ready_children[i]
+                } else {
+                    are_all_children_mesh_prepared && !hide_children
+                };
+                if draws_child {
+                    for descendant in activations.activate(
+                        *child,
+                        drawn_children[i],
+                        queued_descendants[i].clone(),
+                    ) {
+                        write_activation(
                             tc,
-                            child,
+                            &descendant,
                             rendered_tiles,
                             features,
                             renderable_features,
                             false,
                         );
                     }
-                    continue;
-                }
-
-                let target_active = are_all_children_mesh_prepared && !hide_children;
-                let needs_activation_update =
-                    activation_state.is_some_and(|state| state.all_active != target_active);
-
-                if needs_activation_update {
-                    // Re-run this traverse if `active` is updated, because the child tiles are updated depending on the parent state.
-                    tc.needs_update = true;
-
-                    activate_all_renderable_features(
+                } else {
+                    write_activation(
                         tc,
                         child,
                         rendered_tiles,
                         features,
                         renderable_features,
-                        target_active,
+                        false,
                     );
                 }
             }
@@ -466,11 +566,21 @@ pub fn traverse_tile(
                     return TraversalResult::ChildrenMeshPrepared;
                 }
 
+                if draws_children_alone {
+                    return TraversalResult::DescendantsKept;
+                }
+
                 if are_all_children_rendered {
                     // This tile's children are rendered completely, so parent tile isn't rendered.
                     return TraversalResult::ChildrenRendered;
                 }
             }
+        }
+
+        // The children are loading and none is ready yet: as above, this
+        // tile stays out.
+        if leaves_missing_children_empty && !meets_sse && !meets_sse_ancestors && !is_finest_data {
+            return TraversalResult::NotFound;
         }
     }
 
@@ -479,7 +589,7 @@ pub fn traverse_tile(
     }
 
     if is_tile_failed {
-        return TraversalResult::Failed;
+        return TraversalResult::NoData;
     }
 
     if !is_renderable {
@@ -492,19 +602,15 @@ pub fn traverse_tile(
         // raster traverse, only request at or above `min_zoom` (traversal still
         // descends toward it above).
         if coords_z >= traversal_config.min_zoom {
-            let tile = qt.qt.get_mut(handle).unwrap();
-            source.prepare_tile(
+            request_tile_data(
                 command,
-                tile,
-                handle,
+                source,
+                qt,
                 tc,
+                handle,
                 buf,
                 data_requesters,
-                if is_culled_by_frustum {
-                    Priority::Medium.demote()
-                } else {
-                    Priority::Medium
-                },
+                request_priority,
             );
         }
 
@@ -564,11 +670,155 @@ pub fn activate_all_renderable_features(
         .and_then(|fs| fs.iter().map(|f| f.0).collect::<Option<Vec<_>>>())
         .map(|ids| {
             for id in ids {
-                if let Ok(mut r) = renderable_features.get_mut(id) {
-                    r.activate(active);
+                if let Ok(r) = renderable_features.get_mut(id) {
+                    activate_if_changed(r, active);
                 };
             }
         });
+}
+
+/// Flip `active` only when it differs: a write through `Mut` marks the
+/// feature changed and the frontend re-applies the whole feature per change.
+/// A flip the frontend does not draw (see
+/// [`RenderableFeature::is_drawn_regardless_of_activation`]) is not marked,
+/// since a draped feature's change re-bakes every terrain tile it backs.
+pub fn activate_if_changed(mut feature: Mut<RenderableFeature>, active: bool) {
+    if feature.is_active() == active {
+        return;
+    }
+    if feature.is_drawn_regardless_of_activation() {
+        feature.bypass_change_detection().activate(active);
+    } else {
+        feature.activate(active);
+    }
+}
+
+/// The tiles a traversal targets active, written by [`Self::apply`] once no
+/// ancestor can take over from them any more. Inactive targets are final, so
+/// they are written right away.
+///
+/// A tile's child loop targets its children active before its own parent
+/// decides whether to hand over to it. A parent that falls back to drawing
+/// itself (a sibling is not ready) must not leave those descendants active
+/// beside it. The traversal is post-order, so everything a child's subtree
+/// queues sits in one contiguous run, which [`Self::activate`] drops.
+#[derive(Default)]
+pub struct PendingActivations(Vec<QueuedTile>);
+
+/// A tile queued active, and whether it was on screen when it was queued. A
+/// queued tile is not written until [`PendingActivations::apply`], so that
+/// stays true while it is queued.
+struct QueuedTile {
+    handle: TileHandle,
+    drawn: bool,
+}
+
+impl PendingActivations {
+    /// Where the tiles queued from now on start.
+    pub fn mark(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Queues `handle` active (`drawn`: whether it is on screen now) and takes
+    /// back the tiles queued under it (`descendants`, a run between two
+    /// [`Self::mark`]s), to deactivate.
+    pub fn activate(
+        &mut self,
+        handle: TileHandle,
+        drawn: bool,
+        descendants: Range<usize>,
+    ) -> impl Iterator<Item = TileHandle> + '_ {
+        self.0.push(QueuedTile { handle, drawn });
+        self.0.drain(descendants).map(|tile| tile.handle)
+    }
+
+    /// Whether a tile queued in `range` (between two [`Self::mark`]s) is on
+    /// screen.
+    pub fn any_drawn(&self, range: Range<usize>) -> bool {
+        self.0[range].iter().any(|tile| tile.drawn)
+    }
+
+    /// Writes the tiles still queued: no ancestor took over from them.
+    pub fn apply(
+        self,
+        tc: &mut TileCacheManager,
+        rendered_tiles: &Query<&RenderedTile>,
+        features: &Query<&FeatureId, With<VectorTileFeatureMarker>>,
+        renderable_features: &mut Query<&mut RenderableFeature>,
+    ) {
+        for tile in self.0 {
+            write_activation(
+                tc,
+                &tile.handle,
+                rendered_tiles,
+                features,
+                renderable_features,
+                true,
+            );
+        }
+    }
+}
+
+/// Writes `active` to the tile's features when it changes their state,
+/// flagging `tc` for another pass, because the parents' decisions read it.
+/// Returns the state before the write.
+pub(crate) fn write_activation(
+    tc: &mut TileCacheManager,
+    handle: &TileHandle,
+    rendered_tiles: &Query<&RenderedTile>,
+    features: &Query<&FeatureId, With<VectorTileFeatureMarker>>,
+    renderable_features: &mut Query<&mut RenderableFeature>,
+    active: bool,
+) -> Option<RenderableFeatureActivationState> {
+    let state = get_renderable_feature_activation_state(
+        tc,
+        handle,
+        rendered_tiles,
+        features,
+        renderable_features,
+    )?;
+    // An empty tile reads as all active whatever it is set to, so it must not
+    // ask for another pass, or the traversal would re-run every frame.
+    let changed = !state.is_empty
+        && if active {
+            !state.all_active
+        } else {
+            state.any_active
+        };
+    if changed {
+        tc.needs_update = true;
+        activate_all_renderable_features(
+            tc,
+            handle,
+            rendered_tiles,
+            features,
+            renderable_features,
+            active,
+        );
+    }
+    Some(state)
+}
+
+/// Asks the source for the tile's data, and records that this pass wants it
+/// (see [`TileCacheManager::wanted_data`]).
+#[allow(clippy::too_many_arguments)]
+fn request_tile_data(
+    command: &mut Commands,
+    source: &mut dyn crate::source::VectorTileSource,
+    qt: &mut VectorTileQuadtree,
+    tc: &mut TileCacheManager,
+    handle: TileHandle,
+    buf: &mut BufferStore,
+    data_requesters: &VectorTileDataRequesterQuery,
+    priority: Priority,
+) {
+    // Another camera's pass may have asked first: keep the more urgent.
+    tc.wanted_data
+        .entry(handle)
+        .and_modify(|wanted| *wanted = (*wanted).min(priority))
+        .or_insert(priority);
+    let tile = qt.qt.get_mut(handle).unwrap();
+    source.prepare_tile(command, tile, handle, tc, buf, data_requesters, priority);
 }
 
 pub fn are_all_renderable_features_active(
@@ -589,9 +839,12 @@ pub fn are_all_renderable_features_active(
 }
 
 #[derive(Clone, Copy)]
-struct RenderableFeatureActivationState {
+pub(crate) struct RenderableFeatureActivationState {
     all_active: bool,
     any_active: bool,
+    /// The tile parsed to no features: vacuously all active and none active,
+    /// and activating it changes nothing.
+    is_empty: bool,
 }
 
 fn get_renderable_feature_activation_state(
@@ -599,7 +852,7 @@ fn get_renderable_feature_activation_state(
     handle: &TileHandle,
     rendered_tiles: &Query<&RenderedTile>,
     features: &Query<&FeatureId, With<VectorTileFeatureMarker>>,
-    renderable_features: &mut Query<&mut RenderableFeature>,
+    renderable_features: &Query<&mut RenderableFeature>,
 ) -> Option<RenderableFeatureActivationState> {
     let rendered_tile_entity = tc.rendered_tile_caches.get(handle)?;
     let rendered_tile = rendered_tiles.get(*rendered_tile_entity).ok()?;
@@ -622,6 +875,7 @@ fn get_renderable_feature_activation_state(
     Some(RenderableFeatureActivationState {
         all_active,
         any_active,
+        is_empty: tile_feature_ids.is_empty(),
     })
 }
 
@@ -674,12 +928,22 @@ pub fn spawn_tile_entity(
             tile_handle,
             ..Default::default()
         },
-        OrderByDistance {
-            sse: tile.sse,
-            distance: tile.distance_from_camera,
-        },
+        tile.load_order(),
     ));
     tc.rendered_tile_caches.insert(tile_handle, e.id());
+}
+
+/// Record `tile`'s drape source, flagging `tc` when it changed: the drape
+/// source hand-over re-resolves the shown terrain tiles only then.
+fn record_drape_source(
+    tile: &mut VectorTile,
+    tc: &mut TileCacheManager,
+    drape_source: Option<TileHandle>,
+) {
+    if tile.ready_parent_tile_handle != drape_source {
+        tile.ready_parent_tile_handle = drape_source;
+        tc.drape_sources_changed = true;
+    }
 }
 
 fn begin_traverse_tile(
@@ -694,12 +958,230 @@ fn begin_traverse_tile(
     tile.update_tile_occludee_point(ellipsoid, occluder);
 }
 
+/// `aabb` extended by `height` along the up direction at its center.
+fn raise_aabb(aabb: &Aabb, height: FloatType) -> Aabb {
+    let up = aabb.center.normalize() * height;
+    let min = aabb.min().min(aabb.min() + up);
+    let max = aabb.max().max(aabb.max() + up);
+    Aabb {
+        center: (min + max) * 0.5,
+        extents: (max - min) * 0.5,
+    }
+}
+
 pub enum TraversalResult {
     TileRendered,
     ChildrenRendered,
     ChildrenMeshPrepared,
+    /// A child is missing and this tile is not drawn: the ready tiles under
+    /// it are drawn around the missing child's empty area.
+    DescendantsKept,
     Culled,
     NotFound,
-    Failed,
+    /// Nothing is drawn for this tile and nothing waits for it: it is past
+    /// `max_zoom`, or its request failed (a failed request is not retried).
+    NoData,
     Overscaled,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use navara_feature_component::render::PolygonRenderInformation;
+
+    fn point(active: bool) -> RenderableFeature {
+        RenderableFeature::Point {
+            coordinates: Default::default(),
+            crs: Default::default(),
+            active,
+            material: Default::default(),
+            transform: Default::default(),
+            feature_id: Entity::PLACEHOLDER,
+            render_info: Default::default(),
+            geometry: Default::default(),
+            feature_batch_id: 0,
+            batch_length: 0,
+        }
+    }
+
+    /// Setting the flag it already has leaves the feature unchanged for
+    /// change detection; a real flip marks it.
+    #[test]
+    fn it_should_mark_a_feature_changed_only_when_active_flips() {
+        let mut world = World::new();
+        let same = world.spawn(point(true)).id();
+        let flipped = world.spawn(point(true)).id();
+        world.clear_trackers();
+
+        let mut query = world.query::<&mut RenderableFeature>();
+        activate_if_changed(query.get_mut(&mut world, same).unwrap(), true);
+        activate_if_changed(query.get_mut(&mut world, flipped).unwrap(), false);
+
+        let mut changed = world.query_filtered::<Entity, Changed<RenderableFeature>>();
+        let changed: Vec<Entity> = changed.iter(&world).collect();
+        assert_eq!(changed, vec![flipped]);
+        assert!(!world.get::<RenderableFeature>(flipped).unwrap().is_active());
+    }
+
+    fn polygon(texturized: bool, outlined: bool) -> RenderableFeature {
+        RenderableFeature::Polygon {
+            coordinates: Default::default(),
+            crs: Default::default(),
+            active: true,
+            material: Default::default(),
+            geometry: Default::default(),
+            outline_geometry: outlined.then(Default::default),
+            transform: Default::default(),
+            feature_id: Entity::PLACEHOLDER,
+            render_info: PolygonRenderInformation {
+                should_be_texturized: texturized,
+                ..Default::default()
+            },
+            extent: None,
+            bounding_sphere: None,
+            feature_batch_id: 0,
+            batch_length: 0,
+        }
+    }
+
+    /// A draped polygon's flip is applied without marking it changed; a
+    /// direct one, or a draped one with a directly drawn outline, is marked.
+    #[test]
+    fn it_should_not_mark_a_draped_feature_changed_on_an_activation_flip() {
+        let mut world = World::new();
+        let draped = world.spawn(polygon(true, false)).id();
+        let outlined = world.spawn(polygon(true, true)).id();
+        let direct = world.spawn(polygon(false, false)).id();
+        world.clear_trackers();
+
+        let mut query = world.query::<&mut RenderableFeature>();
+        for e in [draped, outlined, direct] {
+            activate_if_changed(query.get_mut(&mut world, e).unwrap(), false);
+        }
+
+        let mut changed = world.query_filtered::<Entity, Changed<RenderableFeature>>();
+        let mut changed: Vec<Entity> = changed.iter(&world).collect();
+        changed.sort();
+        let mut expected = vec![outlined, direct];
+        expected.sort();
+        assert_eq!(changed, expected);
+        assert!(!world.get::<RenderableFeature>(draped).unwrap().is_active());
+    }
+
+    /// A parent that falls back to drawing itself while a child's own loop
+    /// queued the grandchildren under it: activating the parent drops them,
+    /// and a sibling queued before keeps its target.
+    fn queued(handles: &[TileHandle]) -> PendingActivations {
+        PendingActivations(
+            handles
+                .iter()
+                .map(|&handle| QueuedTile {
+                    handle,
+                    drawn: false,
+                })
+                .collect(),
+        )
+    }
+
+    fn handles(pending: &PendingActivations) -> Vec<TileHandle> {
+        pending.0.iter().map(|tile| tile.handle).collect()
+    }
+
+    #[test]
+    fn it_should_drop_the_descendants_of_an_activated_tile() {
+        let mut pending = PendingActivations::default();
+        assert_eq!(pending.activate(1, false, 0..0).count(), 0);
+
+        let start = pending.mark();
+        for grandchild in 10..14 {
+            let at = pending.mark();
+            assert_eq!(pending.activate(grandchild, false, at..at).count(), 0);
+        }
+        let end = pending.mark();
+
+        let dropped: Vec<TileHandle> = pending.activate(2, false, start..end).collect();
+        assert_eq!(dropped, vec![10, 11, 12, 13]);
+        assert_eq!(handles(&pending), vec![1, 2]);
+    }
+
+    /// A run is drawn while a tile still queued in it is: one taken back by
+    /// an ancestor no longer counts.
+    #[test]
+    fn it_should_tell_whether_a_tile_queued_in_a_run_is_drawn() {
+        let mut pending = PendingActivations::default();
+        let start = pending.mark();
+        let at = pending.mark();
+        assert_eq!(pending.activate(10, true, at..at).count(), 0);
+        let at = pending.mark();
+        assert_eq!(pending.activate(11, false, at..at).count(), 0);
+        assert!(pending.any_drawn(start..pending.mark()));
+        assert!(!pending.any_drawn(1..2));
+
+        let end = pending.mark();
+        assert_eq!(pending.activate(1, false, start..end).count(), 2);
+        assert!(!pending.any_drawn(0..pending.mark()));
+    }
+
+    /// Siblings are activated last to first, so taking a later child's
+    /// descendants leaves an earlier child's run in place, and a child that
+    /// hands over keeps its descendants queued.
+    #[test]
+    fn it_should_keep_earlier_sibling_runs_when_activating_in_reverse() {
+        let mut pending = queued(&[10, 11, 12]);
+        let (first, second) = (0..2, 2..3);
+
+        let dropped: Vec<TileHandle> = pending.activate(2, false, second).collect();
+        assert_eq!(dropped, vec![12]);
+        assert_eq!(handles(&pending), vec![10, 11, 2]);
+
+        let dropped: Vec<TileHandle> = pending.activate(1, false, first).collect();
+        assert_eq!(dropped, vec![10, 11]);
+        assert_eq!(handles(&pending), vec![2, 1]);
+    }
+
+    #[test]
+    fn it_should_flag_only_a_changed_drape_source() {
+        let mut tile = VectorTile::new(navara_core::TileXYZ { x: 0, y: 0, z: 0 }, 0., 0.);
+        let mut tc = TileCacheManager::default();
+
+        record_drape_source(&mut tile, &mut tc, None);
+        assert!(!tc.drape_sources_changed);
+
+        record_drape_source(&mut tile, &mut tc, Some(1));
+        assert!(tc.drape_sources_changed);
+        assert_eq!(tile.ready_parent_tile_handle, Some(1));
+    }
+
+    /// The camera stands 10 m above the equator at lng 0° and looks north,
+    /// 10° up, through a 10° wide view. The z16 tile about 5 km north lies
+    /// below the view, but its features up to `FEATURE_HEIGHT_MARGIN` reach
+    /// into it.
+    #[test]
+    fn it_should_raise_the_tile_aabb_by_the_feature_height() {
+        use navara_core::{Angle, LLE, Meters, TileXYZ, WGS84_64, xyz_to_vec3};
+
+        let at = |lat: FloatType, height: FloatType| {
+            xyz_to_vec3(WGS84_64.lle_to_xyz(LLE {
+                lng: Angle::new(0.),
+                lat: Angle::new(lat.to_radians()),
+                height: Meters::new(height),
+            }))
+        };
+        let position = at(0., 10.);
+        let target = at(0.045, 10. + 5000. * 10f64.to_radians().tan());
+        let camera = Transform::from_translation(position).looking_at(target, position.normalize());
+        let frustum = navara_camera::CameraFrustum::new(&camera, 0.1, 1e6, 10f64.to_radians(), 1.);
+        let tile = VectorTile::new(
+            TileXYZ {
+                x: 32768,
+                y: 32759,
+                z: 16,
+            },
+            0.,
+            0.,
+        );
+
+        assert!(!frustum.intersection_with_aabb(tile.aabb()));
+        assert!(frustum.intersection_with_aabb(&raise_aabb(tile.aabb(), FEATURE_HEIGHT_MARGIN)));
+    }
 }

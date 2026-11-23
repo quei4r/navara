@@ -39,7 +39,7 @@ view.camera.on("moveend", () => {
 
 **Read-only** (getter)
 
-地形、画像レイヤー、グローブ固有の設定を管理する Globe インスタンス。透明度、ワイヤーフレーム表示、標高ヒートマップのカラーマップなど、地球表示に関するさまざまなプロパティを制御できます。
+地形、画像レイヤー、グローブ固有の設定を管理する Globe インスタンス。透明度やワイヤーフレーム表示など、地球表示に関するさまざまなプロパティを制御できます。
 
 **Example:**
 
@@ -50,9 +50,6 @@ view.globe.opacity = 0.8;
 
 // ワイヤーフレームモードを有効化
 view.globe.wireframe = true;
-
-// 標高ヒートマップ用カラーマップを設定
-view.globe.elevationColormap = customColorMap;
 ```
 
 :::tip[関連ドキュメント]
@@ -151,19 +148,19 @@ view.addMesh<SphereMeshDesc>({
 
 **読み取り専用**（getter）
 
-現在確保されているバッファを `{ selectiveEffect, emissive, shadow, globeNormal }` の真偽値として返します。これは設定値ではなく**導出値**です。view はアクティブなエフェクト Descriptor が宣言する `static requiredBuffers` の和集合を確保し、そのバッファを必要とする最後のエフェクトが削除された時点で解放します。
+現在確保されているバッファを `{ normal, selectiveEffect, emissive, shadow, globeNormal }` の真偽値として返します。これは設定値ではなく**導出値**です。view はアクティブなエフェクト Descriptor が `static requiredBuffers` または `getRequiredBuffers()` のオーバーライドで宣言するものの和集合を確保し、そのバッファを必要とする最後のエフェクトが削除されるか宣言をやめた時点で解放します。
 
-前 3 つは G-buffer のアタッチメントですが、`globeNormal` だけは地形法線の画面座標コピーであり、アタッチメント枠を消費しません（[カスタム Descriptor: G-Buffer の読み取り](../../../three/core/custom-desc/#g-buffer-の読み取り)を参照）。
+前 4 つは G-buffer のアタッチメントですが、`globeNormal` だけは地形法線の画面座標コピーであり、アタッチメント枠を消費しません（[カスタム Descriptor: G-Buffer の読み取り](../../../three/core/custom-desc/#g-buffer-の読み取り)を参照）。
 
 **Example:**
 
 ```tsx
 console.log(view.buffers);
-// { selectiveEffect: false, emissive: false, shadow: false, globeNormal: false }
+// { normal: false, selectiveEffect: false, emissive: false, shadow: false, globeNormal: false }
 ```
 
 :::tip[関連ドキュメント]
-`requiredBuffers` の宣言方法とカスタムエフェクトからの読み取りについては、[カスタム Descriptor: G-Buffer の読み取り](../../../three/core/custom-desc/#g-buffer-の読み取り) を参照してください。
+`requiredBuffers` や `getRequiredBuffers()` の宣言方法とカスタムエフェクトからの読み取りについては、[カスタム Descriptor: G-Buffer の読み取り](../../../three/core/custom-desc/#g-buffer-の読み取り) を参照してください。
 :::
 
 ### animation

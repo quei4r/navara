@@ -86,7 +86,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `boolean | undefined`
 
-**Description:** 色を直接適用するか、大気散乱計算を使用するかを指定します。`false`の場合、大気テクスチャから動的に色を計算します。
+**Description:** 色を直接適用するか、大気散乱計算を使用するかを指定します。`false`の場合、色は大気の透過テクスチャから動的に計算され、そのテクスチャが利用できない間は太陽が黒くレンダリングされます。`true`にすると、設定した`color`を大気テクスチャなしで直接使用します。
 
 **Default:** `false`
 
@@ -104,7 +104,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** 太陽光の強度を指定します。数値が大きいほど明るくなります。
+**Description:** 太陽光の強度を指定します。数値が大きいほど明るくなります。拡散シェーディングでは結果がπで除算される（Lambert BRDF）ため、大気システムとトーンマッピングを使わない場合、強度1では完全に照らされた面がアルベドの約32%の明るさでレンダリングされます。その構成では`Math.PI`を使うと、面を本来のアルベドでレンダリングできます。
 
 **Default:** `1`
 
@@ -144,7 +144,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** シャドウカスケードの数を指定します。カスケード数が多いほど影の品質分布が向上しますが、GPU リソースを多く消費します。
 
-**Default:** `4`
+**Default:** `4`（`mobileOptimization` が有効なときは `2`）
 
 **Example:**
 
@@ -162,7 +162,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** シャドウマップの解像度（カスケードごと）を指定します。値が大きいほど影の品質が向上しますが、GPU メモリを多く消費します。
 
-**Default:** `2048`
+**Default:** `2048`（`mobileOptimization` が有効なときは `1024`）
 
 **Example:**
 
@@ -180,7 +180,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** カメラからの最大距離で、この距離を超えると影は描画されません。単位はメートルです。
 
-**Default:** `50000`
+**Default:** `50000`（`mobileOptimization` が有効なときは `10000`）
 
 **Example:**
 
@@ -256,7 +256,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** シャドウカスケード間のスムーズな遷移を有効にして、目に見える継ぎ目を減らします。
 
-**Default:** `true`
+**Default:** `true`（`mobileOptimization` が有効なときは `false`）
 
 **Example:**
 
@@ -318,6 +318,24 @@ import { Color } from "@navaramap/three";
 {
   sun: {
     shadowNormalBias: 0,
+  }
+}
+```
+
+### shadowRadius
+
+**Type:** `number | undefined`
+
+**Description:** シャドウマップのフィルタカーネルの幅を、シャドウマップのテクセル単位で指定します。カーネルのサンプル数は 9 で固定されているため、`4` を超えるとエッジが滑らかにならず個々のサンプルが点として見えます。[AerialPerspectiveEffectDesc](../../../three_default_descs/effect-desc/aerial-perspective-effect-desc/) がこの影を再適用する場面では、代わりにその `shadowSoftness` オプションがスクリーンスペースでエッジを広げます。
+
+**Default:** `1`
+
+**Example:**
+
+```typescript
+{
+  sun: {
+    shadowRadius: 2,
   }
 }
 ```
@@ -384,7 +402,8 @@ const sun = view.addLight<SunLightDesc>({
     shadowFade: true,
     shadowIntensity: 1.0,
     shadowBias: 0.0001,
-    shadowNormalBias: 0
+    shadowNormalBias: 0,
+    shadowRadius: 1
   }
 });
 ```

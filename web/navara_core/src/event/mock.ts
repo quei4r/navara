@@ -6,7 +6,7 @@ import type {
 } from "@navaramap/engine";
 import { noop } from "lodash-es";
 
-import type { JsEvents, JsEventsKey } from "./EventManager";
+import type { JsEvents, JsEventsKey } from "./JobDispatcher";
 
 export const makeRenderableFeatures = <
   Ev extends
@@ -19,7 +19,7 @@ export const makeRenderableFeatures = <
 };
 
 // The real `Events` exposes each stack only via a `take_<key>()` method
-// (see EventManager.pushEvents); mimic that shape for any key.
+// (see JobDispatcher.tick); mimic that shape for any key.
 export const makeEvent = (events: { [K in JsEventsKey]?: JsEvents[K] }) =>
   new Proxy(
     {},

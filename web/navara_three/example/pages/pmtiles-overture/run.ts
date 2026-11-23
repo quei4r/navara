@@ -12,7 +12,8 @@ import { SphericalHarmonics3 } from "three";
 import { Pane } from "tweakpane";
 
 import { withBase } from "../../helpers/base";
-import { PMTILES_DATASETS } from "../../helpers/constants";
+import { googleFontsCssUrl, notoSansStack } from "../../helpers/fonts";
+import { resolveOvertureDatasets } from "../../helpers/overture";
 import { SH_COEFFICIENTS } from "../../helpers/sh";
 
 export type CustomDescriptions = DefaultDescriptions;
@@ -39,84 +40,11 @@ const ADMIN_WEIGHT = 700;
 const POI_WEIGHT = 400;
 
 /**
- * Latin face. Overture's glyph server exposes "Noto Sans SemiCondensed" as a
- * named face; on the Google Fonts CSS API the same design is the `wdth` axis of
- * variable Noto Sans at 87.5 (100 = normal, 75 = Condensed).
+ * Overture's glyph server exposes "Noto Sans SemiCondensed" as a named face; on
+ * the Google Fonts CSS API the same design is the `wdth` axis of variable Noto
+ * Sans at 87.5 (100 = normal, 75 = Condensed).
  */
-const latinFace = (weight: number) => `Noto Sans:wdth,wght@87.5,${weight}`;
-
-/**
- * Non-Latin faces covering the scripts Overture place names use, in priority
- * order. `variable: false` marks families Google publishes at a single weight —
- * appending a `wght` axis they don't have makes the whole CSS request fail with
- * HTTP 400, taking every other family down with it.
- *
- * Order matters: for each codepoint the first face whose declared ranges contain
- * it wins, and Google's declared ranges are per-subset boilerplate that can
- * claim codepoints a font doesn't actually contain (which would shape as tofu).
- * This order was verified against the fonts' real coverage:
- * - Bengali/Devanagari/Armenian/Gurmukhi/Syriac precede Noto Sans, which
- *   declares (but lacks) some of their signs, e.g. Vedic marks.
- * - Noto Sans and JP/KR precede the remaining script fonts so shared
- *   symbols/punctuation resolve to fonts that really contain them.
- * - SC and Mongolian go last: Google slices them like CJK fonts whose declared
- *   ranges also claim Hiragana, Hangul, Armenian, Arabic, Thai, Cherokee, and
- *   more that these fonts don't cover.
- */
-const SCRIPT_FACES: { family: string; variable?: boolean }[] = [
-  { family: "Noto Sans Bengali" },
-  { family: "Noto Sans Devanagari" },
-  { family: "Noto Sans Armenian" },
-  { family: "Noto Sans Gurmukhi" },
-  { family: "Noto Sans Arabic" },
-  { family: "Noto Sans Syriac" },
-  // No plain "Noto Sans" entry: `latinFace` already requests that family with
-  // the `wdth` axis pinned to 87.5. Asking for both merges into one family in
-  // the CSS response, emitting the same unicode-ranges at 87.5% *and* 100%
-  // width, after which face selection per codepoint is a coin flip between
-  // SemiCondensed and normal.
-  { family: "Noto Sans JP" },
-  { family: "Noto Sans KR" },
-  { family: "Noto Sans Hebrew" },
-  { family: "Noto Sans Thaana" },
-  { family: "Noto Sans NKo", variable: false },
-  { family: "Noto Sans Thai" },
-  { family: "Noto Sans Lao" },
-  { family: "Noto Sans Khmer" },
-  { family: "Noto Sans Myanmar" },
-  { family: "Noto Sans Gujarati" },
-  { family: "Noto Sans Tamil" },
-  { family: "Noto Sans Telugu" },
-  { family: "Noto Sans Kannada" },
-  { family: "Noto Sans Malayalam" },
-  { family: "Noto Sans Oriya" },
-  { family: "Noto Sans Sinhala" },
-  { family: "Noto Sans Georgian" },
-  { family: "Noto Sans Ethiopic" },
-  { family: "Noto Serif Tibetan" },
-  { family: "Noto Sans Tifinagh", variable: false },
-  { family: "Noto Sans Adlam" },
-  { family: "Noto Sans Cherokee" },
-  { family: "Noto Sans Canadian Aboriginal" },
-  { family: "Noto Sans Vai", variable: false },
-  { family: "Noto Sans Yi", variable: false },
-  { family: "Noto Sans Osmanya", variable: false },
-  { family: "Noto Sans SC" },
-  { family: "Noto Sans Mongolian", variable: false },
-];
-
-/** Google Fonts CSS API specs for one weight, Latin face first. */
-const fontStack = (weight: number): string[] => [
-  latinFace(weight),
-  ...SCRIPT_FACES.map(({ family, variable }) =>
-    variable === false ? family : `${family}:wght@${weight}`,
-  ),
-];
-
-const cssUrl = (stack: string[]) =>
-  `https://fonts.googleapis.com/css2?${stack
-    .map((family) => `family=${family.replace(/ /g, "+")}`)
-    .join("&")}`;
+const LABEL_WIDTH = 87.5;
 
 /**
  * Label colors, resolved from the Overture explorer's style variables through
@@ -317,6 +245,9 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
 
   const attribution = view.attribution;
 
+  // Kick off the release lookup so it overlaps engine init and font loading.
+  const overtureReady = resolveOvertureDatasets();
+
   await view.init();
 
   // The Google Fonts CSS API orders @font-face blocks alphabetically, so pass
@@ -334,9 +265,9 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
         [POI_FONT, POI_WEIGHT],
       ] as const
     ).map(async ([name, weight]) => {
-      const stack = fontStack(weight);
+      const stack = notoSansStack(weight, LABEL_WIDTH);
       view.addFontFamily(
-        await fetchFontFamilyFromCss(name, cssUrl(stack), {
+        await fetchFontFamilyFromCss(name, googleFontsCssUrl(stack), {
           fontFamily: stack.map((family) => family.split(":")[0]),
         }),
       );
@@ -355,29 +286,31 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
 
   view.addLayer({ type: "terrain", ellipsoid: {} });
 
+  const overture = await overtureReady;
+
   // One vector-tile source per `.pmtiles` archive (PMTiles is detected from the
   // URL extension); every layer references its archive's source and selects
   // which MVT sublayer to style via `sourceLayers`.
   const baseSource = view.addSource({
     type: "vector-tile",
-    url: PMTILES_DATASETS.overtureBase.url,
+    url: overture.base.url,
     maxZoom: 13,
   });
   const divisionsSource = view.addSource({
     type: "vector-tile",
-    url: PMTILES_DATASETS.overtureDivisions.url,
+    url: overture.divisions.url,
     // Finer admin features (governorate/district) exist only in higher-zoom
     // tiles, so fetch to z12 and let the altitude tiers keep the view uncluttered.
     maxZoom: 12,
   });
   const buildingsSource = view.addSource({
     type: "vector-tile",
-    url: PMTILES_DATASETS.overtureBuildings.url,
+    url: overture.buildings.url,
     maxZoom: 14,
   });
   const placesSource = view.addSource({
     type: "vector-tile",
-    url: PMTILES_DATASETS.overturePlaces.url,
+    url: overture.places.url,
     maxZoom: 14,
   });
 
@@ -572,7 +505,6 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
       size: LABEL_TIERS[0].size,
       sizeInMeters: false,
       clampToGround: false,
-      center: { x: 0.5, y: 0.5 },
       outlineColor: new Color().setStyle(OVERTURE_COLORS.adminHalo),
       outlineWidth: ADMIN_OUTLINE_WIDTH,
       outlineOpacity: OVERTURE_COLORS.adminHaloOpacity,
@@ -661,11 +593,9 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
   // evaluator selects each billboard's atlas image, so every supported category
   // can render at once.
   //
-  // Positioning is anchor-only (`center`, a normalized Vec2), there is no pixel
-  // offset. To read as `icon │ name` we anchor the icon's RIGHT edge and the
-  // text's LEFT edge to the same geographic point. The text keeps its baseline
-  // origin so the icon aligns with the first line; the leading en space supplies
-  // a small, consistent gap between them.
+  // To read as `icon │ name` we anchor the icon's RIGHT edge and the text's
+  // LEFT edge to the same geographic point, both vertically centred; the
+  // leading en space supplies a small, consistent gap between them.
   const poiLayer = view.addLayer({
     type: "vector",
     source: placesSource,
@@ -675,7 +605,7 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
       size: 30,
       sizeInMeters: false,
       clampToGround: false,
-      center: { x: 0.5, y: 0.0 },
+      anchor: "right",
       depthTest: true,
       offsetDepth: true,
       transparent: true,
@@ -691,7 +621,7 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
       size: 12,
       sizeInMeters: false,
       clampToGround: false,
-      center: { x: 0.0, y: 0.0 },
+      anchor: "left",
       outlineColor: new Color().setStyle(OVERTURE_COLORS.placeHalo),
       outlineWidth: POI_OUTLINE_WIDTH,
       outlineOpacity: OVERTURE_COLORS.placeHaloOpacity,
@@ -842,9 +772,9 @@ export const run = async (view: ThreeView<CustomDescriptions>) => {
   // All four Overture sources are declared; base/divisions/buildings share one
   // credit, so the AttributionPlugin collapses them to a single rendered line.
   attribution?.add([
-    PMTILES_DATASETS.overtureBase,
-    PMTILES_DATASETS.overtureDivisions,
-    PMTILES_DATASETS.overtureBuildings,
-    PMTILES_DATASETS.overturePlaces,
+    overture.base,
+    overture.divisions,
+    overture.buildings,
+    overture.places,
   ]);
 };

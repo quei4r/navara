@@ -7,6 +7,8 @@
       "@navaramap/three-default-descs": ["../navara_three_default_descs/src"],
       "@navaramap/three-default-plugin": ["../navara_three_default_plugin/src"],
       "@navaramap/three-plugins": ["../navara_three_plugins/src"],
+      "@navaramap/material-schema": ["../navara_material_schema/src"],
+
       "@navaramap/maplibre-style": ["../navara_maplibre_style/src"],
       "@navaramap/three-api": ["../navara_three_api/src"],
       "@navaramap/core": ["../navara_core/src"],
@@ -21,5 +23,10 @@
     }
   },
   "include": ["src", "example", "vite-plugin-mpa.ts"],
-  "exclude": ["./dist", "./node_modules"]
+  "exclude": [
+    "./dist",
+    "./node_modules",
+    "./example/pages/webgpu-model-fx",
+    "./example/pages/webgpu-text-sprite"
+  ]
 }

@@ -10,8 +10,8 @@ use navara_memory::{MemoryLedger, RetainedEntry, SseDegrade, SsePressure, TileCo
 use navara_occluder::ellipsoidal_occluder::EllipsoidalOccluder;
 use navara_texture_fragment::TextureFragment;
 use navara_tile_component::{
-    ChangedTileTextureFragmentQuery, RasterTile, RasterTileQuadtree, TerrainTileQuadtree,
-    TileHandle, TileTextureFragmentMarker, TileTextureFragmentQuery,
+    ChangedTileTextureFragmentQuery, RasterTile, RasterTileQuadtree, TerrainExaggeration,
+    TerrainTileQuadtree, TileHandle, TileTextureFragmentMarker, TileTextureFragmentQuery,
 };
 use navara_window::Window;
 
@@ -133,7 +133,8 @@ pub fn update_raster_tiles(
     mut commands: Commands,
     mut qt: ResMut<RasterTileQuadtree>,
     mut tc: ResMut<RasterTileCacheManager>,
-    terrain_qt: Res<TerrainTileQuadtree>,
+    // Bundled to stay within Bevy's per-system parameter limit.
+    (terrain_qt, terrain_exaggeration): (Res<TerrainTileQuadtree>, Res<TerrainExaggeration>),
     frame: Res<FrameManager>,
     window: Res<Window>,
     globe: Res<navara_globe::Globe>,
@@ -216,6 +217,7 @@ pub fn update_raster_tiles(
         // Terrain heights feed the raster SSE, so a terrain change must
         // re-traverse even when the camera is static (matches the vector pipeline).
         || terrain_qt.is_changed()
+        || terrain_exaggeration.is_changed()
         || camera.is_added()
         || camera.is_changed()
         || frustum.is_changed()
@@ -270,13 +272,16 @@ pub fn update_raster_tiles(
         pressure.min,
         pressure.max,
     );
-    let dynamic_sse = dynamic_sse.term(camera_pos, camera.forward(), camera_height);
+    let dynamic_sse = dynamic_sse
+        .term(camera_pos, camera.forward(), camera_height)
+        .for_max_sse(globe.max_sse as f64);
 
     let terrain_present = terrain_layer.iter().next().is_some();
 
     // Sort the layer list once per run; the traversal touches every visited tile.
     let sorted_layers: Vec<_> = tiles.iter().sort::<&Order>().collect();
 
+    tc.min_zoom_descent.refill();
     let root_coords = (TilingScheme::WebMercator { tms: false }).root_tiles();
     for root in &root_coords {
         let coords = (root.x, root.y, root.z);
@@ -292,6 +297,7 @@ pub fn update_raster_tiles(
             &mut qt,
             &mut tc,
             &terrain_qt,
+            &terrain_exaggeration,
             &frame,
             &camera,
             &frustum,

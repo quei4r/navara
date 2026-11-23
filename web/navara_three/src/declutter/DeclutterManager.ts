@@ -1,6 +1,11 @@
 import { Matrix4, type PerspectiveCamera } from "three";
 
-import { CANDIDATE_STRIDE, type DeclutterKernel } from "./kernel";
+import {
+  CANDIDATE_STRIDE,
+  OVERLAP_CODES,
+  PAIR_ROLE_CODES,
+  type DeclutterKernel,
+} from "./kernel";
 import type { DeclutterCandidate, DeclutterParticipant } from "./types";
 
 export type DeclutterUpdateResult =
@@ -38,9 +43,6 @@ export type DeclutterUpdateResult =
 export class DeclutterManager {
   /** Minimum time between placement passes (ms). */
   static readonly MIN_INTERVAL_MS = 150;
-  /** Padding added around every collision box (px); two labels never sit
-   *  closer than twice this. */
-  static readonly PADDING_PX = 2;
   /** Largest single fade step (ms), so a frame after an idle gap doesn't
    *  swallow most of a fade in one jump. */
   static readonly MAX_FADE_STEP_MS = 50;
@@ -60,14 +62,14 @@ export class DeclutterManager {
    *  update re-places even with a static camera. */
   private _dirty = true;
 
-  // Snapshot of the camera/viewport the last pass ran with.
-  private _prevCamera = new Float64Array(34).fill(Number.NaN);
+  // Snapshot of the camera/viewport/horizon minimum the last pass ran with.
+  private _prevCamera = new Float64Array(35).fill(Number.NaN);
   private _lastRunAt = Number.NEGATIVE_INFINITY;
   private _lastStepAt = Number.NaN;
 
-  /** Shown candidates of the most recent pass, keyed by content, as flat xyz
-   *  anchor triplets. Read by {@link wasRecentlyShown} when a tile swap
-   *  activates a replacement batch. */
+  /** Shown candidates of the most recent pass, keyed by content, as flat
+   *  `[x, y, z, variant]` quads. Read by {@link recentlyShownVariant} when a
+   *  tile swap activates a replacement batch. */
   private _shownByContent = new Map<string, number[]>();
 
   // Reused per-pass scratch to keep steady-state allocations low.
@@ -78,9 +80,21 @@ export class DeclutterManager {
   private _view16 = new Float64Array(16);
   private _proj16 = new Float64Array(16);
 
-  /** @param _kernel the placement kernel — the Rust-backed
-   *  `wasmDeclutterKernel` in production, a stub in unit tests. */
-  constructor(private readonly _kernel: DeclutterKernel) {}
+  /** True while `update()` runs, which consumes the dirty flag itself. */
+  private _updating = false;
+
+  /**
+   * @param _kernel the placement kernel — the Rust-backed
+   *  `wasmDeclutterKernel` in production, a stub in unit tests.
+   * @param _requestFrame asks the view for a frame. Meshes mark the pass dirty
+   *  from async work (a material update lands after the frame that delivered
+   *  it), and the view renders only on request, so without a frame the pass
+   *  would wait for the next camera move.
+   */
+  constructor(
+    private readonly _kernel: DeclutterKernel,
+    private readonly _requestFrame: () => void = () => {},
+  ) {}
 
   /** Milliseconds until the throttle window since the last placement pass
    *  elapses, clamped to `[0, MIN_INTERVAL_MS]`. Callers use this to schedule
@@ -105,58 +119,83 @@ export class DeclutterManager {
   }
 
   /** Signal that candidates changed (text, positions, visibility, style) so
-   *  the next update re-runs placement even if the camera is still. */
-  markDirty(): void {
+   *  the next update re-runs placement even if the camera is still.
+   *  `immediate` also lifts the throttle, for labels that stay undrawn until a
+   *  pass judges them — along-line labels in a batch a tile swap activated. */
+  markDirty(immediate = false): void {
     this._dirty = true;
+    if (immediate) this._lastRunAt = Number.NEGATIVE_INFINITY;
+    if (!this._updating) this._requestFrame();
   }
 
   /**
-   * Whether the most recent pass showed `contentKey` anchored within
-   * {@link DeclutterManager.HANDOFF_TOLERANCE_M} of (x, y, z) — i.e. an
-   * equivalent label (typically the swapped-out tile's copy) already holds
-   * this screen space. A batch activating in a tile swap uses this to seed
-   * such labels as granted instead of fading them in from hidden, which
-   * would blink the whole tile's labels out for a pass-plus-fade.
+   * The variant the most recent pass showed `contentKey` with, anchored
+   * within {@link DeclutterManager.HANDOFF_TOLERANCE_M} of (x, y, z), or
+   * `undefined` if it showed none — i.e. whether an equivalent label
+   * (typically the swapped-out tile's copy) already holds this screen space.
+   * A batch activating in a tile swap uses this to seed such labels as
+   * granted, at the same variable anchor, instead of fading them in from
+   * hidden, which would blink the whole tile's labels out for a
+   * pass-plus-fade.
    */
-  wasRecentlyShown(
+  recentlyShownVariant(
     contentKey: string,
     x: number,
     y: number,
     z: number,
-  ): boolean {
+  ): number | undefined {
     const anchors = this._shownByContent.get(contentKey);
-    if (!anchors) return false;
+    if (!anchors) return undefined;
     const tol = DeclutterManager.HANDOFF_TOLERANCE_M;
     const tolSq = tol * tol;
-    for (let i = 0; i < anchors.length; i += 3) {
+    for (let i = 0; i < anchors.length; i += 4) {
       const dx = anchors[i] - x;
       const dy = anchors[i + 1] - y;
       const dz = anchors[i + 2] - z;
-      if (dx * dx + dy * dy + dz * dz <= tolSq) return true;
+      if (dx * dx + dy * dy + dz * dz <= tolSq) return anchors[i + 3];
     }
-    return false;
+    return undefined;
   }
 
   /**
    * Run a placement pass if one is due, then advance any active show/hide
    * fades. `widthPx`/`heightPx` are the viewport in CSS pixels (matching the
    * `uScreenHeightPx` uniform); `nowMs` is the frame timestamp used for
-   * throttling and fade stepping.
+   * throttling and fade stepping; `horizonMinHeight` is the
+   * `nvrHorizonMinHeight` uniform the label shaders horizon-cull with.
    */
   update(
     camera: PerspectiveCamera,
     widthPx: number,
     heightPx: number,
     nowMs: number,
+    horizonMinHeight: number,
   ): DeclutterUpdateResult {
     if (this._participants.size === 0) return "idle";
+    this._updating = true;
+    try {
+      return this._update(camera, widthPx, heightPx, nowMs, horizonMinHeight);
+    } finally {
+      this._updating = false;
+    }
+  }
 
+  private _update(
+    camera: PerspectiveCamera,
+    widthPx: number,
+    heightPx: number,
+    nowMs: number,
+    horizonMinHeight: number,
+  ): DeclutterUpdateResult {
     let ran = false;
     let throttled = false;
-    if (this._dirty || this._snapshotChanged(camera, widthPx, heightPx)) {
+    if (
+      this._dirty ||
+      this._snapshotChanged(camera, widthPx, heightPx, horizonMinHeight)
+    ) {
       if (nowMs - this._lastRunAt >= DeclutterManager.MIN_INTERVAL_MS) {
-        this._run(camera, widthPx, heightPx);
-        this._takeSnapshot(camera, widthPx, heightPx);
+        this._run(camera, widthPx, heightPx, horizonMinHeight);
+        this._takeSnapshot(camera, widthPx, heightPx, horizonMinHeight);
         this._dirty = false;
         this._lastRunAt = nowMs;
         ran = true;
@@ -189,6 +228,7 @@ export class DeclutterManager {
     camera: PerspectiveCamera,
     widthPx: number,
     heightPx: number,
+    horizonMinHeight: number,
   ): void {
     // Let participants start font/shape preparation for labels whose anchors
     // became potentially visible (text batches park preparation while an
@@ -198,6 +238,7 @@ export class DeclutterManager {
     // labels.
     for (const p of this._participants) {
       p.prepareDeferredLabels?.(camera);
+      p.placeLineLabels?.(camera, heightPx);
     }
 
     const candidates = this._candidates;
@@ -229,6 +270,24 @@ export class DeclutterManager {
       input[o + 8] = c.sizeInMeters ? 1 : 0;
       input[o + 9] = c.priority;
       input[o + 10] = c.isShown ? 1 : 0;
+      input[o + 11] = OVERLAP_CODES[c.overlap];
+      input[o + 12] = c.ignorePlacement ? 1 : 0;
+      input[o + 13] = c.rank;
+      input[o + 14] = c.padding[0];
+      input[o + 15] = c.padding[1];
+      input[o + 16] = c.padding[2];
+      input[o + 17] = c.padding[3];
+      input[o + 18] = c.pairGroup;
+      input[o + 19] = c.featureIndex;
+      input[o + 20] = c.pairGroup === 0 ? 0 : PAIR_ROLE_CODES[c.pairRole];
+      input[o + 21] = c.standalone ? 1 : 0;
+      input[o + 22] = c.flatFacing ? 1 : 0;
+      input[o + 23] = c.rotateWithCamera ? 1 : 0;
+      input[o + 24] = c.rotation;
+      input[o + 25] = c.translate[0];
+      input[o + 26] = c.translate[1];
+      input[o + 27] = c.translateViewport ? 0 : 1;
+      input[o + 28] = c.variants ?? 1;
     }
 
     // The pass may run before the renderer refreshed matrixWorldInverse, so
@@ -253,26 +312,33 @@ export class DeclutterManager {
       // Plain math instead of @navaramap/three-api's degreeToRadian — that one
       // is a WASM call whose result we'd only marshal straight back in.
       (camera.fov * Math.PI) / 180.0,
-      DeclutterManager.PADDING_PX,
+      horizonMinHeight,
       DeclutterManager.HYSTERESIS_PX,
     );
 
-    // Apply results as fade targets. Order is irrelevant — applyDeclutter is
-    // idempotent per handle — so iterate in candidate order, not sorted order.
-    // Rebuild the shown-content registry from the same results.
+    // Apply results as fade targets, one per label: the row of its group the
+    // pass showed, or the one in use if none. Order is irrelevant —
+    // applyDeclutter is idempotent per handle — so iterate in candidate
+    // order, not sorted order. Rebuild the shown-content registry from the
+    // same results.
     this._shownByContent.clear();
-    for (let i = 0; i < n; i++) {
-      const c = candidates[i];
-      const isHidden = hidden[i] !== 0;
-      c.owner.applyDeclutter(c.handle, isHidden);
+    for (let i = 0; i < n;) {
+      const rows = Math.max(1, candidates[i].variants ?? 1);
+      let shown = i;
+      while (shown < i + rows && hidden[shown] !== 0) shown++;
+      const isHidden = shown === i + rows;
+      const c = candidates[isHidden ? i : shown];
+      const variant = c.variant ?? 0;
+      c.owner.applyDeclutter(c.handle, isHidden, variant);
       if (!isHidden && c.contentKey) {
         let anchors = this._shownByContent.get(c.contentKey);
         if (!anchors) {
           anchors = [];
           this._shownByContent.set(c.contentKey, anchors);
         }
-        anchors.push(c.anchorX, c.anchorY, c.anchorZ);
+        anchors.push(c.anchorX, c.anchorY, c.anchorZ, variant);
       }
+      i += rows;
     }
 
     candidates.length = 0;
@@ -291,6 +357,7 @@ export class DeclutterManager {
     camera: PerspectiveCamera,
     widthPx: number,
     heightPx: number,
+    horizonMinHeight: number,
   ): boolean {
     const s = this._prevCamera;
     const world = camera.matrixWorld.elements;
@@ -298,18 +365,22 @@ export class DeclutterManager {
     for (let i = 0; i < 16; i++) {
       if (s[i] !== world[i] || s[16 + i] !== proj[i]) return true;
     }
-    return s[32] !== widthPx || s[33] !== heightPx;
+    return (
+      s[32] !== widthPx || s[33] !== heightPx || s[34] !== horizonMinHeight
+    );
   }
 
   private _takeSnapshot(
     camera: PerspectiveCamera,
     widthPx: number,
     heightPx: number,
+    horizonMinHeight: number,
   ): void {
     const s = this._prevCamera;
     s.set(camera.matrixWorld.elements, 0);
     s.set(camera.projectionMatrix.elements, 16);
     s[32] = widthPx;
     s[33] = heightPx;
+    s[34] = horizonMinHeight;
   }
 }

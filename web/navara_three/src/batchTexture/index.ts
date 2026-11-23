@@ -1,10 +1,12 @@
 export {
   flushBatchTextureUpdates,
   getBatchDataTexture,
+  hasBatchScalarSlot,
   packShowOpacity,
   readBatchScalar,
   readBatchShowOpacity,
   readBatchVec3,
+  unpackOrientation,
   unpackShowOpacity,
   updateBatchAttribute,
 } from "./core";
@@ -34,6 +36,7 @@ export {
   BATCHED_ATTRIBUTE_NAMES,
   BATCH_SCALAR_KEYS,
   BATCH_VEC3_KEYS,
+  type BatchAttributeDefaults,
   type BatchScalarKey,
   type BatchSlot,
   type BatchTextureConfig,

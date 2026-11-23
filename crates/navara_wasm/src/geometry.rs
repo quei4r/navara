@@ -15,6 +15,7 @@ pub struct TransferableGeometry {
     pub skirt_uvs: Option<Handle>,
     pub skirt_indices: Option<Handle>,
     pub skirt_normals: Option<Handle>,
+    pub skirt_heights: Option<Handle>,
 }
 
 #[wasm_bindgen]
@@ -30,6 +31,7 @@ impl TransferableGeometry {
             skirt_uvs: None,
             skirt_indices: None,
             skirt_normals: None,
+            skirt_heights: None,
         }
     }
 }
@@ -45,6 +47,7 @@ impl From<TransferableGeometry> for navara_geometry::TransferableGeometry {
             skirt_uvs: val.skirt_uvs,
             skirt_indices: val.skirt_indices,
             skirt_normals: val.skirt_normals,
+            skirt_heights: val.skirt_heights,
         }
     }
 }
@@ -59,6 +62,7 @@ impl<'a> From<&'a navara_geometry::TransferableGeometry> for TransferableGeometr
             skirt_uvs: val.skirt_uvs,
             skirt_indices: val.skirt_indices,
             skirt_normals: val.skirt_normals,
+            skirt_heights: val.skirt_heights,
         }
     }
 }
@@ -85,17 +89,20 @@ pub struct TransferablePolylineGeometry {
     #[wasm_bindgen(getter_with_clone)]
     pub end_low: Option<TransferableFloatAttribute>,
     #[wasm_bindgen(getter_with_clone)]
-    pub start_normals: Option<TransferableFloatAttribute>,
+    pub start_normal_and_length_high: Option<TransferableFloatAttribute>,
     #[wasm_bindgen(getter_with_clone)]
-    pub end_normal_and_texture_coordinate_normalization_x: Option<TransferableFloatAttribute>,
+    pub end_normal_and_segment_length: Option<TransferableFloatAttribute>,
     #[wasm_bindgen(getter_with_clone)]
-    pub right_normal_and_texture_coordinate_normalization_y: TransferableFloatAttribute,
+    pub right_normal_and_line_length: TransferableFloatAttribute,
     #[wasm_bindgen(getter_with_clone)]
     pub batch_ids: Option<TransferableFloatAttribute>,
     #[wasm_bindgen(getter_with_clone)]
     pub batch_index: Option<TransferableUintAttribute>,
-    #[wasm_bindgen(getter_with_clone)]
     pub indices: Handle,
+    #[wasm_bindgen(getter_with_clone)]
+    pub line_segments: Option<TransferableFloatAttribute>,
+    #[wasm_bindgen(getter_with_clone)]
+    pub line_distance_and_ends: Option<TransferableFloatAttribute>,
 }
 
 #[wasm_bindgen]
@@ -112,12 +119,14 @@ impl TransferablePolylineGeometry {
         forward_offset: Option<TransferableFloatAttribute>,
         end_high: Option<TransferableFloatAttribute>,
         end_low: Option<TransferableFloatAttribute>,
-        start_normals: Option<TransferableFloatAttribute>,
-        end_normal_and_texture_coordinate_normalization_x: Option<TransferableFloatAttribute>,
-        right_normal_and_texture_coordinate_normalization_y: TransferableFloatAttribute,
+        start_normal_and_length_high: Option<TransferableFloatAttribute>,
+        end_normal_and_segment_length: Option<TransferableFloatAttribute>,
+        right_normal_and_line_length: TransferableFloatAttribute,
         batch_ids: Option<TransferableFloatAttribute>,
         batch_index: Option<TransferableUintAttribute>,
         indices: Handle,
+        line_segments: Option<TransferableFloatAttribute>,
+        line_distance_and_ends: Option<TransferableFloatAttribute>,
     ) -> Self {
         Self {
             position,
@@ -129,12 +138,14 @@ impl TransferablePolylineGeometry {
             forward_offset,
             end_high,
             end_low,
-            start_normals,
-            end_normal_and_texture_coordinate_normalization_x,
-            right_normal_and_texture_coordinate_normalization_y,
+            start_normal_and_length_high,
+            end_normal_and_segment_length,
+            right_normal_and_line_length,
             batch_ids,
             batch_index,
             indices,
+            line_segments,
+            line_distance_and_ends,
         }
     }
 }
@@ -153,16 +164,14 @@ impl From<TransferablePolylineGeometry>
             forward_offset: val.forward_offset.map(|p| p.into()),
             end_high: val.end_high.map(|p| p.into()),
             end_low: val.end_low.map(|p| p.into()),
-            start_normals: val.start_normals.map(|p| p.into()),
-            end_normal_and_texture_coordinate_normalization_x: val
-                .end_normal_and_texture_coordinate_normalization_x
-                .map(|p| p.into()),
-            right_normal_and_texture_coordinate_normalization_y: val
-                .right_normal_and_texture_coordinate_normalization_y
-                .into(),
+            start_normal_and_length_high: val.start_normal_and_length_high.map(|p| p.into()),
+            end_normal_and_segment_length: val.end_normal_and_segment_length.map(|p| p.into()),
+            right_normal_and_line_length: val.right_normal_and_line_length.into(),
             batch_ids: val.batch_ids.map(|b| b.into()),
             batch_index: val.batch_index.map(|b| b.into()),
             indices: val.indices,
+            line_segments: val.line_segments.map(|p| p.into()),
+            line_distance_and_ends: val.line_distance_and_ends.map(|p| p.into()),
         }
     }
 }
@@ -182,17 +191,20 @@ impl<'a> From<&'a navara_feature_component::render::TransferablePolylineGeometry
             forward_offset: val.forward_offset.as_ref().map(|p| p.into()),
             end_high: val.end_high.as_ref().map(|p| p.into()),
             end_low: val.end_low.as_ref().map(|p| p.into()),
-            start_normals: val.start_normals.as_ref().map(|p| p.into()),
-            end_normal_and_texture_coordinate_normalization_x: val
-                .end_normal_and_texture_coordinate_normalization_x
+            start_normal_and_length_high: val
+                .start_normal_and_length_high
                 .as_ref()
                 .map(|p| p.into()),
-            right_normal_and_texture_coordinate_normalization_y: (&val
-                .right_normal_and_texture_coordinate_normalization_y)
-                .into(),
+            end_normal_and_segment_length: val
+                .end_normal_and_segment_length
+                .as_ref()
+                .map(|p| p.into()),
+            right_normal_and_line_length: (&val.right_normal_and_line_length).into(),
             batch_ids: val.batch_ids.as_ref().map(|b| b.into()),
             batch_index: val.batch_index.as_ref().map(|b| b.into()),
             indices: val.indices,
+            line_segments: val.line_segments.as_ref().map(|p| p.into()),
+            line_distance_and_ends: val.line_distance_and_ends.as_ref().map(|p| p.into()),
         }
     }
 }
@@ -214,7 +226,6 @@ pub struct TransferablePolygonGeometry {
     pub batch_ids: Option<TransferableFloatAttribute>,
     #[wasm_bindgen(getter_with_clone)]
     pub batch_index: Option<TransferableUintAttribute>,
-    #[wasm_bindgen(getter_with_clone)]
     pub indices: Handle,
 }
 
@@ -291,7 +302,6 @@ pub struct TransferablePolygonOutlineGeometry {
     pub position_3d_low: Option<TransferableFloatAttribute>,
     #[wasm_bindgen(getter_with_clone)]
     pub scale_normal_and_cap: Option<TransferableFloatAttribute>,
-    #[wasm_bindgen(getter_with_clone)]
     pub skip_indices: Option<Handle>,
     #[wasm_bindgen(getter_with_clone)]
     pub batch_index: Option<TransferableFloatAttribute>,
@@ -363,6 +373,22 @@ pub struct TransferablePointGeometry {
     pub batch_ids: TransferableFloatAttribute,
     #[wasm_bindgen(getter_with_clone)]
     pub batch_index: TransferableUintAttribute,
+    /// Per-anchor tangent bearing in degrees clockwise from north, present only
+    /// when the anchors were placed along a line.
+    #[wasm_bindgen(getter_with_clone)]
+    pub bearings: Option<TransferableFloatAttribute>,
+    /// Per-anchor `(min, max]` ground metres per screen pixel over which it is
+    /// shown; `size` is the stride. Present exactly when `bearings` is.
+    #[wasm_bindgen(getter_with_clone)]
+    pub scale_bands: Option<TransferableFloatAttribute>,
+    /// Per-anchor east/north samples of the line, for bending glyphs along it.
+    /// `size` is the stride: two floats per sample.
+    #[wasm_bindgen(getter_with_clone)]
+    pub path_samples: Option<TransferableFloatAttribute>,
+    /// Per-anchor metres between adjacent path samples, then metres of real
+    /// line either side of the anchor.
+    #[wasm_bindgen(getter_with_clone)]
+    pub path_meta: Option<TransferableFloatAttribute>,
 }
 
 impl From<TransferablePointGeometry>
@@ -375,6 +401,10 @@ impl From<TransferablePointGeometry>
             position_3d_low: val.position_3d_low.map(|p| p.into()),
             batch_ids: val.batch_ids.into(),
             batch_index: val.batch_index.into(),
+            bearings: val.bearings.map(|b| b.into()),
+            scale_bands: val.scale_bands.map(|b| b.into()),
+            path_samples: val.path_samples.map(|b| b.into()),
+            path_meta: val.path_meta.map(|b| b.into()),
         }
     }
 }
@@ -389,6 +419,10 @@ impl<'a> From<&'a navara_feature_component::render::TransferablePointGeometry>
             position_3d_low: val.position_3d_low.as_ref().map(|p| p.into()),
             batch_ids: (&val.batch_ids).into(),
             batch_index: (&val.batch_index).into(),
+            bearings: val.bearings.as_ref().map(|b| b.into()),
+            scale_bands: val.scale_bands.as_ref().map(|b| b.into()),
+            path_samples: val.path_samples.as_ref().map(|b| b.into()),
+            path_meta: val.path_meta.as_ref().map(|b| b.into()),
         }
     }
 }

@@ -8,7 +8,7 @@ use bevy_ecs::{
 };
 
 use navara_component::Deleted;
-use navara_core::{is_pmtiles_url, is_tile_url};
+use navara_core::is_pmtiles_url;
 use navara_feature_component::{
     batch::BatchedFeature, id::FeatureId, polygon::UpdatePolygon, render::RenderableFeature,
 };
@@ -48,11 +48,6 @@ pub fn prepare_layer_resource(
         let Some(url) = source.url() else {
             continue;
         };
-        // Accept both `{z}/{x}/{y}` tile templates (MvtSource) and `.pmtiles`
-        // archive URLs (PmtilesSource); skip anything else.
-        if !is_tile_url(url) && !is_pmtiles_url(url) {
-            continue;
-        }
         let Some(source_id) =
             navara_vector_tile::SourceId::from_mvt_layer(layer, url.to_owned(), source)
         else {
@@ -206,8 +201,8 @@ fn create_new_source(
     let url = source_id.key.clone();
 
     // The URL form chooses the source implementation: a `.pmtiles` archive is
-    // resolved through PmtilesSource, everything else is a `{z}/{x}/{y}` MVT
-    // template. Both share the identical decode path downstream.
+    // resolved through PmtilesSource, everything else is an MVT URL template.
+    // Both share the identical decode path downstream.
     let source: Box<dyn VectorTileSource> = if is_pmtiles_url(&url) {
         Box::new(PmtilesSource::new(
             url,

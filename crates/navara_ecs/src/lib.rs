@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use bevy_ecs::{
+    change_detection::DetectChangesMut,
     entity::Entity,
     query::{With, Without},
     system::SystemState,
@@ -10,11 +11,12 @@ use navara_buffer_store::{BufferStore, Handle};
 use navara_camera::{
     CamDirType, CameraControlUpdateEvent, CameraController, CameraDirection, CameraEvent,
     CameraFrustum, CameraMarker, CameraOrientation, CameraStatus, FlightIdAllocator, FlyToEasing,
-    FrustumEvent, get_heading, get_pitch, get_roll,
+    FrustumEvent, calc_camera_target_and_distance, get_heading, get_pitch, get_roll,
 };
 use navara_component::{Deleted, Rendered};
 use navara_core::{
-    CRS, ElevationDecoder, LLE, LngLat, Radians, WGS84_64, WGS84_A_64, camera_zoom_level,
+    CRS, ElevationDecoder, Extent, LLE, LngLat, Radians, WGS84_64, WGS84_A_64, camera_zoom_level,
+    zoom_level_to_camera_distance,
 };
 use navara_data_requester::DataRequester;
 use navara_event::Events;
@@ -28,16 +30,17 @@ use navara_feature_component::{
 };
 use navara_frame::FrameManager;
 use navara_globe::Globe;
-use navara_layer::{LayerDescStore, LayerDescription, LayerId};
+use navara_layer::{LayerDescStore, LayerDescription, LayerId, TerrainLayer};
 use navara_material::{PolygonMaterial, PolylineMaterial};
 use navara_math::{FloatType, Transform, Vec3};
 use navara_source::{Source, SourceStore};
 use navara_texture_fragment::{TextureFragmentLoadedEvent, TextureFragmentStatus};
 use navara_tile_component::{
-    MartiniComponent, RasterTileQuadtree, TerrainHeightObserver, TerrainTile, TerrainTileQuadtree,
-    TileHandle, TileTerrainDataRequesterQuery, VectorTileQuadtree, compute_terrain_height_at_point,
+    MartiniComponent, RasterTileQuadtree, TerrainExaggeration, TerrainHeightObserver,
+    TerrainHeightRangeObserver, TerrainTile, TerrainTileQuadtree, TileHandle,
+    TileTerrainDataRequesterQuery, compute_terrain_height_at_point, terrain_height_range,
 };
-use navara_vector_tile::{LayerResources, VectorResolveRevision, resolve_vector_tile_states};
+use navara_vector_tile::VectorDrapeSources;
 use navara_window::{Window, WindowResizeEvent};
 use navara_worker::{
     DelegatedWorkerTasksResult, WorkerTaskCompleted, WorkerTaskCompletedEvent,
@@ -227,7 +230,10 @@ impl App {
         let Ok(mut feature) = query.get_mut(world, entity) else {
             return;
         };
-        let render_info = match feature.as_mut() {
+        // The frontend never reads `is_rendered` back, so the write is not a
+        // change: a change re-applies the whole feature there (and re-bakes a
+        // draped one). The traversals re-run on `Rendered` instead.
+        let render_info = match feature.bypass_change_detection() {
             RenderableFeature::Point { render_info, .. } => render_info,
             RenderableFeature::Billboard { render_info, .. } => render_info,
             RenderableFeature::Text { render_info, .. } => render_info,
@@ -245,7 +251,9 @@ impl App {
         let Ok(mut feature) = query.get_mut(world, entity) else {
             return;
         };
-        let RenderableFeature::Polyline { render_info, .. } = feature.as_mut() else {
+        // Not a change for the frontend; see `mark_point_is_rendered`.
+        let RenderableFeature::Polyline { render_info, .. } = feature.bypass_change_detection()
+        else {
             unreachable!("Unexpected RenderableFeature type");
         };
         render_info.is_rendered = true;
@@ -260,7 +268,9 @@ impl App {
         let Ok(mut feature) = query.get_mut(world, entity) else {
             return;
         };
-        let RenderableFeature::Polygon { render_info, .. } = feature.as_mut() else {
+        // Not a change for the frontend; see `mark_point_is_rendered`.
+        let RenderableFeature::Polygon { render_info, .. } = feature.bypass_change_detection()
+        else {
             unreachable!("Unexpected RenderableFeature type");
         };
         render_info.is_rendered = true;
@@ -292,11 +302,12 @@ impl App {
             });
     }
 
-    pub fn trigger_data_requester_failed(&mut self, bits: u64) {
+    pub fn trigger_data_requester_failed(&mut self, bits: u64, handle: i32) {
         self.app
             .world_mut()
             .write_message(navara_buffer_store::BufferStoreFailedEvent {
                 id: Entity::from_bits(bits),
+                handle,
             });
     }
 
@@ -657,6 +668,21 @@ impl App {
         store.get(source_id).cloned()
     }
 
+    /// Exaggeration of the surface rendered from `source_id`: that of the
+    /// terrain layer `sync_terrain_exaggeration` mirrors when it renders
+    /// `source_id`, identity otherwise. An `update_layer` is reflected from
+    /// the next frame.
+    pub fn terrain_exaggeration_for_source(&mut self, source_id: &str) -> TerrainExaggeration {
+        let world = self.app.world_mut();
+        let mut layers = world.query::<&TerrainLayer>();
+        layers
+            .iter(world)
+            .next()
+            .filter(|layer| layer.source_id.as_deref() == Some(source_id))
+            .map(TerrainExaggeration::of_layer)
+            .unwrap_or_default()
+    }
+
     pub fn has_data_requester(&mut self, bits: u64) -> bool {
         let entity = Entity::from_bits(bits);
         let world = self.app.world_mut();
@@ -710,76 +736,29 @@ impl App {
         ))
     }
 
-    pub fn get_parent_tile(&mut self, handle: TileHandle) -> Option<&TerrainTile> {
+    /// Buffer handle of the tile's loaded raw DEM bytes, the height data a
+    /// descendant's upsample resamples from. `None` unless the DEM has landed.
+    pub fn get_terrain_dem_bytes(
+        &mut self,
+        handle: TileHandle,
+    ) -> Option<navara_buffer_store::Handle> {
         let world = self.app.world_mut();
         let qt = world.get_resource::<TerrainTileQuadtree>()?;
-
-        let tile = qt.qt.get(handle).unwrap();
-        tile.get_parent_tile(qt)
+        let terrain_data = qt.qt.get(handle)?.terrain_data.as_ref()?;
+        let requester = world.get::<DataRequester>(terrain_data.data_requester_entity_id()?)?;
+        requester.is_succeeded().then_some(requester.handle)
     }
 
-    /// Resolve the WebMercator texturized-vector tiles to drape on a terrain tile,
-    /// flattened across clamp-to-ground vector layers for the wasm boundary. Gathers the
-    /// terrain extent/scheme and the per-layer vector quadtrees from the ECS world, then
-    /// delegates the N:M overlap + budget logic to
-    /// [`resolve_vector_tile_states`](navara_vector_tile::resolve_vector_tile_states).
-    pub fn get_vector_tiles(&mut self, handle: TileHandle) -> Vec<ResolvedVectorTileState> {
-        let world = self.app.world_mut();
-
-        // Terrain tile extent + scheme, copied out so the resource borrow ends before the
-        // component queries below.
-        let Some((terrain_extent, terrain_is_geographic)) = world
-            .get_resource::<TerrainTileQuadtree>()
-            .and_then(|qt| qt.qt.get(handle))
-            .map(|tile| (tile.extent, tile.tiling_scheme.is_geographic()))
-        else {
-            return vec![];
-        };
-
-        // Snapshot (layer_id, quadtree entity), owned so the query borrow is released before
-        // the resource/quadtree borrows below.
-        let mut layer_refs: Vec<(String, Entity)> = {
-            let mut layers = world.query::<&LayerResources>();
-            layers
-                .iter(world)
-                .map(|r| (r.layer_id.clone(), r.quadtree))
-                .collect()
-        };
-
-        // Sort by the layer's declaration order (`LayerDescStore`, same source as
-        // `get_layer_index`) so the composite stacks vector layers like the raster path
-        // (lower order = bottom, later = on top), instead of the arbitrary ECS query
-        // iteration order the resolve would otherwise preserve.
-        {
-            let store = world.get_resource::<LayerDescStore>();
-            layer_refs.sort_by_key(|(layer_id, _)| {
-                store
-                    .and_then(|s| s.get_order(layer_id).copied())
-                    .unwrap_or(usize::MAX)
-            });
-        }
-
-        let mut qts = world.query::<&VectorTileQuadtree>();
-        let pairs: Vec<(String, &VectorTileQuadtree)> = layer_refs
-            .into_iter()
-            .filter_map(|(layer_id, quadtree)| {
-                qts.get(world, quadtree).ok().map(|qt| (layer_id, qt))
-            })
-            .collect();
-
-        resolve_vector_tile_states(terrain_extent, terrain_is_geographic, &pairs)
-    }
-
-    /// Monotonic counter that changes only when the vector-tile resolution could have
-    /// changed (a traverse ran — readiness lives in the traverse now). The web side reads
-    /// this once per frame and skips the per-terrain-tile `get_vector_tiles` calls while it
-    /// is unchanged.
-    pub fn vector_revision(&self) -> u32 {
+    /// The WebMercator texturized-vector tiles handed over to drape on a terrain tile,
+    /// flattened across clamp-to-ground vector layers for the wasm boundary (see
+    /// [`VectorDrapeSources`](navara_vector_tile::VectorDrapeSources)). The frontend re-reads
+    /// a tile when its handle is listed in the `vector_drape_changed` event.
+    pub fn get_vector_tiles(&self, handle: TileHandle) -> Vec<ResolvedVectorTileState> {
         self.app
             .world()
-            .get_resource::<VectorResolveRevision>()
-            .map(|r| r.0)
-            .unwrap_or(0)
+            .get_resource::<VectorDrapeSources>()
+            .map(|sources| sources.handed(handle).to_vec())
+            .unwrap_or_default()
     }
 
     /// Resolve the WebMercator raster tiles to bake into per-layer drape render targets
@@ -1099,6 +1078,28 @@ impl App {
         None
     }
 
+    /// The whole camera in one query: `[lng, lat, height, heading, pitch,
+    /// roll, fov]`; angles in degrees (fov is the vertical field of view),
+    /// height in meters above the ellipsoid.
+    pub fn get_camera_state(&mut self) -> Option<[FloatType; 7]> {
+        let world = self.app.world_mut();
+        let mut query = world.query_filtered::<(&Transform, &CameraFrustum), With<CameraMarker>>();
+
+        let (transform, frustum) = query.iter(world).next()?;
+        let lle = CRS::Geocentric
+            .to_lle(WGS84_64, transform.translation, 0.0)
+            .deg();
+        Some([
+            lle.lng.val(),
+            lle.lat.val(),
+            lle.height.val(),
+            get_heading(transform),
+            get_pitch(transform),
+            get_roll(transform),
+            frustum.fov.to_degrees(),
+        ])
+    }
+
     /// Vertical field of view in radians as set via `set_frustum`.
     pub fn get_camera_fov(&mut self) -> Option<FloatType> {
         let world = self.app.world_mut();
@@ -1111,42 +1112,109 @@ impl App {
         None
     }
 
-    /// Effective Web Mercator zoom level the camera is viewing the surface at,
-    /// derived from the camera's ellipsoid height (not terrain), FOV and
-    /// viewport (see [`navara_core::camera_zoom_level`]).
-    pub fn get_zoom_level(&mut self) -> Option<FloatType> {
-        // Camera altitude (m) and latitude (rad).
-        let lle = {
+    /// Effective Web Mercator zoom level the camera is viewing the surface at.
+    ///
+    /// Calculated from the camera-to-target distance (along the forward direction),
+    /// target point latitude, FOV, and viewport. This ensures the zoom level is
+    /// consistent with the `distance` parameter used in `setCamera`, matching
+    /// MapLibre's zoom semantics where zoom is independent of pitch.
+    ///
+    /// # Arguments
+    /// * `tile_size_px` - Optional tile size for zoom calculation. Defaults to 256.
+    ///   Use 512 for MapLibre-compatible zoom values.
+    pub fn get_zoom_level(&mut self, tile_size_px: Option<FloatType>) -> Option<FloatType> {
+        // Get camera transform and frustum
+        let (transform, fov_y) = {
             let world = self.app.world_mut();
-            let mut query = world.query_filtered::<&Transform, With<CameraMarker>>();
-            let transform = query.iter(world).next()?;
-            CRS::Geocentric.to_lle(WGS84_64, transform.translation, 0.0)
+            let mut query =
+                world.query_filtered::<(&Transform, &CameraFrustum), With<CameraMarker>>();
+            let (transform, frustum) = query.iter(world).next()?;
+            (*transform, frustum.fov)
         };
-        // Vertical field of view (rad).
-        let fov_y = {
-            let world = self.app.world_mut();
-            let mut query = world.query_filtered::<&CameraFrustum, With<CameraMarker>>();
-            query.iter(world).next()?.fov
-        };
-        // Viewport height in CSS px (matches the 256px tile model).
+
+        // Get viewport height in CSS px
         let viewport_height = self.app.world_mut().get_resource::<Window>()?.raw_height();
 
-        let height = lle.height.val();
-        let lat = lle.lat.val();
-        // Guard the inputs: a default/unset frustum has `fov_y == 0` (→ tan(0)=0
-        // → division by zero → ±inf), and a non-finite latitude would poison the
-        // math. The `is_finite` checks also reject NaN/inf. Bail so a non-finite
-        // zoom never crosses the WASM boundary to JS.
-        if height <= 0.0
+        // Calculate camera-to-target distance and target latitude
+        // This matches MapLibre's behavior where zoom is based on the ground point being viewed
+        let (target_point, distance) = calc_camera_target_and_distance(&transform, WGS84_64)?;
+        let target_lle = CRS::Geocentric.to_lle(WGS84_64, target_point, 0.0);
+        let target_lat = target_lle.lat.val();
+
+        // Guard the inputs
+        if distance <= 0.0
             || viewport_height <= 0.0
             || !fov_y.is_finite()
             || fov_y <= 0.0
-            || !lat.is_finite()
+            || !target_lat.is_finite()
         {
             return None;
         }
-        let zoom = camera_zoom_level(height, fov_y, viewport_height, lat, WGS84_A_64);
+
+        let tile_size = match tile_size_px {
+            Some(t) if t <= 0.0 => return None, // Invalid tile size provided
+            Some(t) => Some(t),                 // Valid tile size provided
+            None => None,                       // Use default (256)
+        };
+
+        // Use camera-to-target distance instead of camera altitude
+        // This ensures zoom level is consistent with the distance parameter used in setCamera
+        let zoom = camera_zoom_level(
+            distance,
+            fov_y,
+            viewport_height,
+            target_lat,
+            WGS84_A_64,
+            tile_size,
+        );
         zoom.is_finite().then_some(zoom)
+    }
+
+    /// Inverse of [`Self::get_zoom_level`]: computes the camera viewing distance required to
+    /// achieve a given Web Mercator zoom level at the specified latitude.
+    ///
+    /// # Arguments
+    /// * `zoom_level` - Target Web Mercator zoom level
+    /// * `lat_deg` - Latitude in degrees (affects scale due to Web Mercator projection)
+    /// * `tile_size_px` - Tile size used in zoom calculation (e.g., 256 for standard, 512 for MapLibre)
+    /// * `fov_rad` - Optional FOV override in radians. If None, uses camera's current FOV.
+    ///
+    /// # Returns
+    /// Camera viewing distance to target in meters, or `None` if inputs are invalid
+    /// or required resources (camera FOV, window) are not available.
+    pub fn zoom_level_to_camera_distance(
+        &mut self,
+        zoom_level: FloatType,
+        lat_deg: FloatType,
+        tile_size_px: FloatType,
+        fov_rad: Option<FloatType>,
+    ) -> Option<FloatType> {
+        // Validate inputs
+        if !zoom_level.is_finite() || !lat_deg.is_finite() || tile_size_px <= 0.0 {
+            return None;
+        }
+
+        // Get FOV: use override if provided, otherwise get from camera
+        let fov_y_rad = match fov_rad {
+            Some(fov) if fov.is_finite() && fov > 0.0 => fov,
+            Some(_) => return None, // Invalid FOV override
+            None => self.get_camera_fov()?,
+        };
+
+        // Get viewport height from window
+        let viewport_height_px =
+            self.app.world_mut().get_resource::<Window>()?.raw_height() as FloatType;
+
+        let lat_rad = lat_deg.to_radians();
+
+        zoom_level_to_camera_distance(
+            zoom_level,
+            fov_y_rad,
+            viewport_height_px,
+            lat_rad,
+            WGS84_A_64,
+            tile_size_px,
+        )
     }
 
     pub fn rotate_around_axis(&mut self, axis: Option<Vec<FloatType>>, angle: FloatType) {
@@ -1156,11 +1224,24 @@ impl App {
             .write_message(CameraEvent::RotateAroundAxis { axis, angle });
     }
 
+    /// See [`terrain_height_range`]. `None` before the terrain quadtree
+    /// exists.
+    pub fn sample_terrain_height_range(
+        &self,
+        extent: Extent<FloatType, Radians>,
+    ) -> Option<(FloatType, FloatType)> {
+        let world = self.app.world();
+        let qt = world.get_resource::<TerrainTileQuadtree>()?;
+        let exaggeration = world.get_resource::<TerrainExaggeration>()?;
+        Some(terrain_height_range(qt, exaggeration, extent))
+    }
+
     pub fn sample_terrain_height(&mut self, lle: LLE<FloatType, Radians>) -> Option<FloatType> {
         let world = self.app.world_mut();
 
         let _ = world.get_resource::<TerrainTileQuadtree>()?;
         let _ = world.get_resource::<BufferStore>()?;
+        let exaggeration = *world.get_resource::<TerrainExaggeration>()?;
 
         world.resource_scope(|world, mut qt: Mut<TerrainTileQuadtree>| {
             world.resource_scope(|world, mut buf: Mut<BufferStore>| {
@@ -1171,6 +1252,7 @@ impl App {
                     &mut qt,
                     &mut buf,
                     &query,
+                    &exaggeration,
                     &LngLat::new(lle.lat.val(), lle.lng.val()),
                 )
             })
@@ -1186,6 +1268,28 @@ impl App {
             .id();
 
         e_id.to_bits()
+    }
+
+    pub fn add_terrain_height_range_observer(&mut self, extent: Extent<FloatType, Radians>) -> u64 {
+        let world = self.app.world_mut();
+
+        let e_id = world
+            .commands()
+            .spawn(TerrainHeightRangeObserver {
+                extent,
+                range: None,
+            })
+            .id();
+
+        e_id.to_bits()
+    }
+
+    pub fn remove_terrain_height_range_observer(&mut self, bits: u64) {
+        let world = self.app.world_mut();
+        let entity = Entity::from_bits(bits);
+        if world.get_entity(entity).is_ok() {
+            world.commands().entity(entity).despawn();
+        }
     }
 
     pub fn remove_terrain_height_observer(&mut self, bits: u64) {
@@ -1274,12 +1378,6 @@ impl App {
     pub fn set_globe_wireframe(&mut self, value: bool) {
         if let Some(mut globe) = self.get_globe_mut() {
             globe.wireframe = value;
-        }
-    }
-
-    pub fn set_globe_elevation_colormap(&mut self, value: Vec<f32>) {
-        if let Some(mut globe) = self.get_globe_mut() {
-            globe.elevation_colormap = value;
         }
     }
 

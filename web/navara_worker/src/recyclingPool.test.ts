@@ -17,6 +17,10 @@ type MockExecution = {
 
 type MockPool = {
   executions: MockExecution[];
+  /** Busy / queued counts the worker reports, independent of the slot's
+   * own `inflight` (e.g. a cancelled task still running). */
+  activeTasks: number;
+  pendingTasks: number;
   exec: ReturnType<typeof vi.fn>;
   terminate: ReturnType<typeof vi.fn>;
   stats: () => ReturnType<Pool["stats"]>;
@@ -29,6 +33,8 @@ let pools: MockPool[] = [];
 vi.spyOn(workerpool, "pool").mockImplementation(() => {
   const mock: MockPool = {
     executions: [],
+    activeTasks: 0,
+    pendingTasks: 0,
     exec: vi.fn(
       (method: string) =>
         new workerpool.Promise(
@@ -57,8 +63,8 @@ vi.spyOn(workerpool, "pool").mockImplementation(() => {
       totalWorkers: 1,
       busyWorkers: 0,
       idleWorkers: 1,
-      pendingTasks: 0,
-      activeTasks: 0,
+      pendingTasks: mock.pendingTasks,
+      activeTasks: mock.activeTasks,
     }),
   };
   pools.push(mock);
@@ -113,6 +119,91 @@ it("dispatches tasks to the least-loaded slot", () => {
 
   expect(pools[0].exec).toHaveBeenCalledTimes(1);
   expect(pools[1].exec).toHaveBeenCalledTimes(1);
+});
+
+it("does not dispatch to a worker still running a cancelled task", async () => {
+  const pool = new RecyclingWorkerPool("https://example.com", 2);
+
+  const cancelled = pool.exec("test");
+  cancelled.cancel();
+  await cancelled.catch(() => undefined);
+  respondToProbe(pools[0], 0);
+  // The slot's own count is back to 0, but its worker is still busy.
+  pools[0].activeTasks = 1;
+
+  pool.exec("test");
+  const tests = (p: MockPool) =>
+    p.executions.filter((e) => e.method === "test").length;
+  expect(tests(pools[0])).toBe(1);
+  expect(tests(pools[1])).toBe(1);
+});
+
+it("sums the slots' load, counting a cancelled task still running", async () => {
+  const pool = new RecyclingWorkerPool("https://example.com", 2);
+  expect(pool.load()).toBe(0);
+
+  const cancelled = pool.exec("test");
+  pool.exec("test");
+  expect(pool.load()).toBe(2);
+
+  cancelled.cancel();
+  await cancelled.catch(() => undefined);
+  respondToProbe(pools[0], 0);
+  expect(pool.load()).toBe(1);
+  // Its worker is still running it.
+  pools[0].activeTasks = 1;
+  expect(pool.load()).toBe(2);
+});
+
+it("leaves the pool's own probes out of its load", async () => {
+  const pool = new RecyclingWorkerPool("https://example.com", 1);
+
+  pool.exec("test");
+  settleTask(pools[0]);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(nextPending(pools[0], PROBE)).toBeDefined();
+  expect(pool.load()).toBe(0);
+});
+
+it("keeps reserved slots free of new tasks, leaving one slot open", () => {
+  const pool = new RecyclingWorkerPool("https://example.com", 3);
+  const tests = (p: MockPool) =>
+    p.executions.filter((e) => e.method === "test").length;
+
+  // Slot 0 is busy, so the idle slots are the ones reserved.
+  pool.exec("test");
+  pool.setReservedSlots(2);
+  expect(pool.reservedSlots()).toBe(2);
+  pool.exec("test");
+  pool.exec("test");
+  expect(tests(pools[0])).toBe(3);
+  expect(tests(pools[1])).toBe(0);
+  expect(tests(pools[2])).toBe(0);
+
+  pool.setReservedSlots(5);
+  expect(pool.reservedSlots()).toBe(2);
+
+  pool.setReservedSlots(0);
+  expect(pool.reservedSlots()).toBe(0);
+  pool.exec("test");
+  expect(tests(pools[1]) + tests(pools[2])).toBe(1);
+});
+
+it("reports no capacity while every unreserved slot is draining", async () => {
+  const pool = new RecyclingWorkerPool("https://example.com", 2, {
+    maxWorkerHeapBytes: 100,
+  });
+  pool.exec("test");
+  pool.setReservedSlots(1);
+  expect(pool.canAcceptTasks()).toBe(true);
+
+  // The open slot goes over budget while its next task still runs.
+  pool.exec("test");
+  settleTask(pools[0]);
+  await vi.advanceTimersByTimeAsync(0);
+  respondToProbe(pools[0], 200);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(pool.canAcceptTasks()).toBe(false);
 });
 
 it("probes heap usage after a settled task and recycles once over budget", async () => {
@@ -260,6 +351,17 @@ it("warmUp() warms a single worker first, then the rest in the background", asyn
 
   // The remaining slot warms in the background once the first is ready.
   expect(nextPending(pools[1], "warmUp")).toBeDefined();
+});
+
+it("warmUp() starts no background warm-up once terminated", async () => {
+  const pool = new RecyclingWorkerPool("https://example.com", 2);
+
+  const warmed = pool.warmUp();
+  pool.terminate();
+  nextPending(pools[0], "warmUp")?.resolve();
+  await warmed;
+
+  expect(pools[1].executions).toHaveLength(0);
 });
 
 it("warmUp() falls back to the remaining workers when the first fails", async () => {

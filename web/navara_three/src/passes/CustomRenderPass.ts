@@ -30,6 +30,7 @@ import {
 } from "../material/gbufferLayout";
 import { DrapedMesh, setupMaterialForDrape } from "../mesh/DrapedMesh";
 import type { Scenes } from "../scene";
+import type { RefThree } from "../uniforms";
 
 import { AllDepthCopyPass, NormalCopyPass, RenderTargetCopyPass } from ".";
 
@@ -67,7 +68,8 @@ export class CustomRenderPass extends RenderPass {
   private drapedTempScene = new Scene();
 
   // Used to render only the shadow map
-  private shadowScene = new Scene();
+  private shadowLightScene = new Scene();
+  private shadowCasterScene = new Scene();
   private dummyShadowRenderTarget = new WebGLRenderTarget(1, 1, {
     depthBuffer: true,
     stencilBuffer: false,
@@ -78,13 +80,14 @@ export class CustomRenderPass extends RenderPass {
   // Rendered outside the G-buffer pass, so these must never declare G-buffer
   // outputs the render target has no attachments for.
   private readonly forwardScenes: readonly Scene[];
-  private readonly stampScenes: readonly Scene[];
   private allowTransparent: boolean;
   private buffers: ResolvedGBufferOptions;
   // Scene-level default of the `lit` material option (`view.lit`).
   private sceneLit: boolean;
-  // Template for rebuilding the G-buffer render target in setBuffers.
-  private inputBufferTemplate: WebGLRenderTarget;
+  // Template for rebuilding the G-buffer render target in setBuffers. The
+  // template is the composer's input buffer, so it is not held in a property
+  // `Pass.dispose()` would dispose.
+  private readonly cloneInputBuffer: () => WebGLRenderTarget;
   /**
    * Attachment indices of `gbufferRenderTarget.textures` for this view.
    * Recomputed by {@link setBuffers}.
@@ -94,19 +97,23 @@ export class CustomRenderPass extends RenderPass {
   // stamped onto every material rendered into the G-buffer.
   private gbufferDefines: Readonly<Record<string, number>>;
   private gbufferDefinesStamped = new WeakSet<Material>();
+  // Materials met in a G-buffer scene during the current traversal. Lets the
+  // forward traversal tell a material that left the G-buffer scenes (its
+  // defines must go) from one shared with them (they must stay).
+  private readonly gbufferVisited = new Set<Material>();
   // Separate from the G-buffer set: the two cover different scene sets, and a
   // shared one would skip the G-buffer defines for a material first seen in
   // the opaque scene that later moves to the MRT pass.
   private litStamped = new WeakSet<Material>();
-  private stampDirty = true;
-  // Drives the globe-normal copy target, which stays 1x1 until a draped mesh
-  // exists. Tracked here because setSize can arrive while it is inactive.
+  // Drives the globe-normal copy target, which stays 1x1 until a descriptor
+  // requires `globeNormal`. Tracked here because setSize can arrive while it
+  // is inactive.
   private globeNormalActive = false;
-  private readonly globeNormalUniform: { value: Texture | null };
+  // Bound by draped materials; pointed at the copy targets every frame.
+  private readonly globeDepthUniform: RefThree<Texture> = { value: null };
+  private readonly globeNormalUniform: RefThree<Texture> = { value: null };
   private width = 1;
   private height = 1;
-  private lastProgramCount = -1;
-  private readonly lastSceneChildCounts = [-1, -1, -1, -1, -1];
 
   constructor(
     scenes: Scenes,
@@ -127,13 +134,12 @@ export class CustomRenderPass extends RenderPass {
 
     this.gbufferScenes = [scenes.globe, scenes.mrt, scenes.draped];
     this.forwardScenes = [scenes.opaque, scenes.transparent];
-    this.stampScenes = [...this.gbufferScenes, ...this.forwardScenes];
 
     this.buffers = options?.buffers ?? resolveGBufferOptions();
     this.sceneLit = options?.lit ?? true;
     this.textureIndex = computeGBufferTextureIndex(this.buffers);
     this.gbufferDefines = computeGBufferDefines(this.buffers);
-    this.inputBufferTemplate = inputBuffer;
+    this.cloneInputBuffer = () => inputBuffer.clone();
 
     this.gbufferRenderTarget = inputBuffer.clone();
     // Extra G-buffer attachments (normal/effectIds/emissive) – see
@@ -165,9 +171,6 @@ export class CustomRenderPass extends RenderPass {
     this.allowTransparent = options?.allowTransparent ?? true;
 
     this.globeNormalCopyPass = new NormalCopyPass();
-    // The copy target keeps its Texture identity across setSize, so draped
-    // materials can bind this ref once.
-    this.globeNormalUniform = { value: this.globeNormalCopyPass.texture };
     if (options?.debugNormal) {
       this.debugNormalCopyPass = new NormalCopyPass();
       this.debugNormalCopyPass.unpackNormal = true;
@@ -216,7 +219,6 @@ export class CustomRenderPass extends RenderPass {
     this.textureIndex = computeGBufferTextureIndex(buffers);
     this.gbufferDefines = computeGBufferDefines(buffers);
     this.gbufferDefinesStamped = new WeakSet();
-    this.stampDirty = true;
 
     // Must be a fresh target: splicing textures in place leaves the renderer's
     // cached GL state on a stale attachment, so writes land in the framebuffer
@@ -224,13 +226,16 @@ export class CustomRenderPass extends RenderPass {
     // Texture identity; every optional attachment is reallocated, which is why
     // consumers must re-fetch each frame rather than capture at creation.
     const old = this.gbufferRenderTarget;
-    const rt = this.inputBufferTemplate.clone();
+    const rt = this.cloneInputBuffer();
     rt.setSize(old.width, old.height);
     rt.texture = old.texture;
     appendOptionalGBufferAttachments(rt, buffers);
-    rt.depthTexture = old.depthTexture;
-    // three disposes rt.depthTexture with the target; detach the reused one.
+    // Detach before re-attaching: three hands a depth texture's ownership only
+    // to a target when it is unowned, and only the owner reallocates it on
+    // setSize (an unowned one keeps its old size and breaks the framebuffer).
+    const depthTexture = old.depthTexture;
     old.depthTexture = null;
+    rt.depthTexture = depthTexture;
     this.gbufferRenderTarget = rt;
     old.dispose();
 
@@ -243,40 +248,29 @@ export class CustomRenderPass extends RenderPass {
     if (this.sceneLit === lit) return;
     this.sceneLit = lit;
     this.litStamped = new WeakSet();
-    this.stampDirty = true;
-  }
-
-  /**
-   * O(1) gate keeping the stamping traversal off the per-frame path. The
-   * program count catches deeply-nested async additions (a glTF populating a
-   * scene-resident group): a material must compile before it can render, so
-   * the traversal converges one frame later.
-   */
-  private shouldStampGBufferDefines(renderer: WebGLRenderer): boolean {
-    let dirty = this.stampDirty;
-    this.stampDirty = false;
-
-    const programCount = renderer.info.programs?.length ?? 0;
-    if (programCount !== this.lastProgramCount) {
-      this.lastProgramCount = programCount;
-      dirty = true;
-    }
-
-    for (let i = 0; i < this.stampScenes.length; i++) {
-      const count = this.stampScenes[i].children.length;
-      if (count !== this.lastSceneChildCounts[i]) {
-        this.lastSceneChildCounts[i] = count;
-        dirty = true;
-      }
-    }
-
-    return dirty;
   }
 
   // Materials reach the G-buffer from anywhere (built-ins, enhancers, user
   // ShaderMaterials), so they are stamped here rather than per-desc. `lit` is
   // a lighting define, not a G-buffer one, hence the forward scenes too.
+  //
+  // Runs every frame. A material can appear without any scene-level signal:
+  // added inside a group that is already in the scene (a glTF populating its
+  // group after load), swapped in place on a mesh (`mesh.material = ...`), or
+  // added in the same frame another mesh was removed. It may also compile to
+  // a program that is already cached, so the program count does not change
+  // either. An unstamped material declares no G-buffer outputs and renders
+  // without normal / effect-id / emissive data. The per-material work is
+  // WeakSet-gated, so the per-frame cost is the traversal alone.
+  //
+  // A mesh can also leave the G-buffer scenes (its last selective effect
+  // removed, see MeshDescWithSelectiveEffect.getPassKey); its material must
+  // then stop declaring outputs the forward target has no attachments for.
+  // G-buffer scenes are traversed first so a material shared by both sets
+  // keeps its outputs: the G-buffer needs them, the forward pass discards
+  // them.
   private stampGBufferDefines(): void {
+    this.gbufferVisited.clear();
     for (const scene of this.gbufferScenes) {
       scene.traverse((object) => {
         this.forEachMaterial(object, (m) => this.stampGBufferDefine(m));
@@ -284,14 +278,19 @@ export class CustomRenderPass extends RenderPass {
     }
     for (const scene of this.forwardScenes) {
       scene.traverse((object) => {
-        this.forEachMaterial(object, (m) => this.stampLitDefine(m));
+        this.forEachMaterial(object, (m) => this.stampForwardDefines(m));
       });
     }
+    this.gbufferVisited.clear();
     // Drape shading is opted into here rather than per-desc, so a mesh moved
     // into the draped scene picks it up wherever it came from.
     this._scenes.draped.traverse((object) => {
       this.forEachMaterial(object, (m) =>
-        setupMaterialForDrape(m, this.globeNormalUniform),
+        setupMaterialForDrape(
+          m,
+          this.globeNormalUniform,
+          this.globeDepthUniform,
+        ),
       );
     });
   }
@@ -310,6 +309,7 @@ export class CustomRenderPass extends RenderPass {
   }
 
   private stampGBufferDefine(material: Material): void {
+    this.gbufferVisited.add(material);
     material.defines ??= {};
     let changed = false;
 
@@ -341,6 +341,38 @@ export class CustomRenderPass extends RenderPass {
     this.stampLitDefine(material);
   }
 
+  private stampForwardDefines(material: Material): void {
+    if (
+      this.gbufferDefinesStamped.has(material) &&
+      !this.gbufferVisited.has(material)
+    ) {
+      this.clearGBufferDefines(material);
+    }
+    this.stampLitDefine(material);
+  }
+
+  private clearGBufferDefines(material: Material): void {
+    this.gbufferDefinesStamped.delete(material);
+    const defines = material.defines;
+    if (!defines) return;
+    let changed = false;
+    for (const name of GBUFFER_DEFINE_NAMES) {
+      if (name in defines) {
+        // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+        delete defines[name];
+        changed = true;
+      }
+    }
+    if (NVR_BLENDED_DEFINE in defines) {
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+      delete defines[NVR_BLENDED_DEFINE];
+      changed = true;
+    }
+    if (changed) {
+      material.needsUpdate = true;
+    }
+  }
+
   /** Per-material `lit` (NVR_LIT / NVR_UNLIT) wins over this in the shader. */
   private stampLitDefine(material: Material): void {
     if (this.litStamped.has(material)) return;
@@ -359,9 +391,9 @@ export class CustomRenderPass extends RenderPass {
     inputBuffer: WebGLRenderTarget | null,
     _outputBuffer: WebGLRenderTarget | null,
   ) {
-    if (this.shouldStampGBufferDefines(renderer)) {
-      this.stampGBufferDefines();
-    }
+    this.globeDepthUniform.value = this.globeDepthCopyPass.texture;
+    this.globeNormalUniform.value = this.globeNormalCopyPass.texture;
+    this.stampGBufferDefines();
 
     const shouldDrapeByStencilTest = this._scenes.draped.children.length !== 0;
 
@@ -371,15 +403,8 @@ export class CustomRenderPass extends RenderPass {
       this.clearPass.render(renderer, inputBuffer, null);
     }
 
-    // Render shadow map
     if (renderer.shadowMap.enabled && !this.disableShadow) {
-      renderer.setRenderTarget(this.dummyShadowRenderTarget);
-      this.shadowScene.add(this._scenes.globe);
-      this.shadowScene.add(this._scenes.mrt);
-      this.shadowScene.add(this._scenes.opaque);
-      renderer.shadowMap.needsUpdate = true;
-      this._renderWithLight(renderer, this.shadowScene);
-      this.shadowScene.clear();
+      this.renderShadowMaps(renderer);
     }
 
     const clearDepth =
@@ -397,11 +422,11 @@ export class CustomRenderPass extends RenderPass {
 
     this._renderWithLight(renderer, this._scenes.globe);
 
-    // Draped meshes read it and draw further down, so the copy still happens
-    // before its consumer; effects opt in through `requiredBuffers`.
+    // Draped meshes and ground polylines read it further down, so the copy
+    // happens before its consumers. Effects and meshes opt in through
+    // `getRequiredBuffers()`.
     const needsGlobeNormal =
-      (shouldDrapeByStencilTest || this.buffers.globeNormal) &&
-      this.textureIndex.normal !== undefined;
+      !!this.buffers.globeNormal && this.textureIndex.normal !== undefined;
     this.setGlobeNormalActive(needsGlobeNormal);
     if (needsGlobeNormal) {
       this.globeNormalCopyPass.render(renderer, null, null);
@@ -451,6 +476,9 @@ export class CustomRenderPass extends RenderPass {
       renderer.clearDepth();
     }
 
+    // A polygon's `depthPrePass` marks the pixels it blends in the stencil.
+    renderer.clearStencil();
+
     // If globe can be transparent, need to render all scene in same scene to blend them.
     // Currently, blending is supported only with MRT scene.
     if (shouldBlend) {
@@ -478,6 +506,29 @@ export class CustomRenderPass extends RenderPass {
     this.allDepthCopyPass.setDepthTexture(finalTarget?.depthTexture ?? null);
     this.allDepthCopyPass.copyDepth(clearDepth);
     this.allDepthCopyPass.render(renderer, null, null);
+  }
+
+  // `shadowMap.render` needs the render state only `renderer.render` sets up,
+  // and three has no shadow-only render. So only the lights are rendered, and
+  // the shadow map is pointed at the casters, which then get no regular draw.
+  private renderShadowMaps(renderer: WebGLRenderer): void {
+    const casters = this.shadowCasterScene;
+    casters.add(this._scenes.globe);
+    casters.add(this._scenes.mrt);
+    casters.add(this._scenes.opaque);
+    casters.updateMatrixWorld();
+
+    const shadowMap = renderer.shadowMap;
+    const renderShadowMap = shadowMap.render;
+    shadowMap.render = (lights, _scene, camera) => {
+      renderShadowMap.call(shadowMap, lights, casters, camera);
+    };
+    shadowMap.needsUpdate = true;
+    renderer.setRenderTarget(this.dummyShadowRenderTarget);
+    this._renderWithLight(renderer, this.shadowLightScene);
+    shadowMap.render = renderShadowMap;
+
+    casters.clear();
   }
 
   // The composer-provided depth texture is intentionally ignored: the gbuffer

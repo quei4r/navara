@@ -1,6 +1,5 @@
 import path from "path";
 
-import dts from "unplugin-dts/vite";
 import { defineConfig, normalizePath } from "vite";
 import glsl from "vite-plugin-glsl";
 import { viteStaticCopy } from "vite-plugin-static-copy";
@@ -10,6 +9,7 @@ import {
   assetFileNamesPreservingAssetsDir,
   commonConfig,
   composePlugins,
+  dts,
 } from "../vite.config.common";
 
 export default defineConfig((env) => {
@@ -57,6 +57,7 @@ export default defineConfig((env) => {
         external: [
           ...(common.build.rollupOptions.external as string[]),
           "three",
+          /^three\//,
         ],
         output: {
           assetFileNames: assetFileNamesPreservingAssetsDir,

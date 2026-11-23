@@ -1,14 +1,17 @@
 use bevy_ecs::{component::Component, entity::Entity, system::Commands};
-use bevy_log::{error, warn};
+use bevy_log::error;
 use navara_buffer_store::BufferStore;
 use navara_component::Priority;
-use navara_data_requester::{DataRequester, DataRequesterExtension, RequestOrder};
+use navara_data_requester::{DataRequester, RequestOrder};
 use url::Url;
 
 use crate::{
-    Cesium3dTileContent, TileOrderByDistance, b3dm::B3dmDataRequesterMarker,
-    cesium3dtiles::types::Cesium3dTileContentRequesterQuery, glb::GlbDataRequesterMarker,
-    gltf_features::GltfFeaturesDataRequesterMarker, pnts::PntsDataRequesterMarker,
+    Cesium3dTileContent, TileOrderByDistance,
+    b3dm::B3dmDataRequesterMarker,
+    cesium3dtiles::{ContentKind, resolve_content_url, types::Cesium3dTileContentRequesterQuery},
+    glb::GlbDataRequesterMarker,
+    gltf_features::GltfFeaturesDataRequesterMarker,
+    pnts::PntsDataRequesterMarker,
 };
 
 #[derive(Component)]
@@ -34,6 +37,8 @@ pub struct Cesium3dTileContentLayerId(pub Entity);
 #[derive(Component)]
 pub struct Cesium3dTilesNestedMetadataDataRequesterMarker;
 
+/// Spawns a data requester for every renderable content of `tile` that has
+/// none alive.
 // TODO: Request again if the request failed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn request_tile_content(
@@ -45,90 +50,43 @@ pub(crate) fn request_tile_content(
     priority: Priority,
     is_v1_1: bool,
     layer_id: Entity,
-) -> bool {
-    let data_requester_entity_id = tile.data_requester_id;
-    if let Some(id) = data_requester_entity_id
-        && requesters.contains(id)
-    {
-        return false;
-    }
-    let (content_url, extension) = match tile.make_content_url(base_url) {
-        Ok(url) => url,
-        Err(e) => {
-            error!("{}", e);
-            return false;
-        }
-    };
+) {
     let request_order = RequestOrder(TileOrderByDistance {
         distance_from_camera: tile.state.distance_from_camera,
         sse: tile.state.sse,
     });
-    match extension {
-        DataRequesterExtension::Pnts => {
-            let id = commands
-                .spawn((
-                    Cesium3dTileContentDataRequesterMarker,
-                    Cesium3dTileContentLayerId(layer_id),
-                    PntsDataRequesterMarker,
-                    priority,
-                    request_order,
-                    DataRequester::from_store(content_url, buf, extension),
-                ))
-                .id();
-            tile.data_requester_id = Some(id);
-            true
+    for slot in &mut tile.contents {
+        // A nested tileset is requested by the traversal.
+        if slot.kind == ContentKind::Json
+            || slot
+                .data_requester_id
+                .is_some_and(|id| requesters.contains(id))
+        {
+            continue;
         }
-        DataRequesterExtension::B3dm => {
-            let id = commands
-                .spawn((
-                    Cesium3dTileContentDataRequesterMarker,
-                    Cesium3dTileContentLayerId(layer_id),
-                    B3dmDataRequesterMarker,
-                    priority,
-                    request_order,
-                    DataRequester::from_store(content_url, buf, extension),
-                ))
-                .id();
-            tile.data_requester_id = Some(id);
-            true
-        }
-        DataRequesterExtension::Glb if is_v1_1 => {
-            let id = commands
-                .spawn((
-                    Cesium3dTileContentDataRequesterMarker,
-                    Cesium3dTileContentLayerId(layer_id),
-                    GltfFeaturesDataRequesterMarker,
-                    priority,
-                    request_order,
-                    DataRequester::from_store(content_url, buf, extension),
-                ))
-                .id();
-            tile.data_requester_id = Some(id);
-            true
-        }
-        DataRequesterExtension::Glb => {
-            let id = commands
-                .spawn((
-                    Cesium3dTileContentDataRequesterMarker,
-                    Cesium3dTileContentLayerId(layer_id),
-                    GlbDataRequesterMarker,
-                    priority,
-                    request_order,
-                    DataRequester::from_store(content_url, buf, extension),
-                ))
-                .id();
-            tile.data_requester_id = Some(id);
-            true
-        }
-        DataRequesterExtension::Gltf => {
-            // Plain .gltf files (JSON + external .bin buffers) are not yet supported.
-            // Only GLB (binary glTF container) is supported.
-            warn!(
-                "Plain .gltf format is not yet supported, only .glb is supported. Skipping tile: {}",
-                content_url
-            );
-            false
-        }
-        _ => false,
+        let content_url = match resolve_content_url(base_url, &slot.uri) {
+            Ok(url) => url.to_string(),
+            Err(e) => {
+                error!("{}", e);
+                continue;
+            }
+        };
+        let mut entity = commands.spawn((
+            Cesium3dTileContentDataRequesterMarker,
+            Cesium3dTileContentLayerId(layer_id),
+            priority,
+            request_order.clone(),
+            DataRequester::from_store(content_url, buf, slot.kind.data_requester_extension()),
+        ));
+        match slot.kind {
+            ContentKind::Pnts => entity.insert(PntsDataRequesterMarker),
+            ContentKind::B3dm => entity.insert(B3dmDataRequesterMarker),
+            ContentKind::Glb | ContentKind::Gltf if is_v1_1 => {
+                entity.insert(GltfFeaturesDataRequesterMarker)
+            }
+            ContentKind::Glb | ContentKind::Gltf => entity.insert(GlbDataRequesterMarker),
+            ContentKind::Json => unreachable!(),
+        };
+        slot.data_requester_id = Some(entity.id());
     }
 }

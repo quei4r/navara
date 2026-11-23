@@ -2,6 +2,7 @@ import { defaults } from "lodash-es";
 import type { WebGLProgramParametersWithUniforms } from "three";
 import invariant from "tiny-invariant";
 
+import { SOLID_DASH_ROW } from "../../../../lineDash";
 import type { MaterialEnhancer } from "../../MaterialEnhancer";
 
 import { AVAILABLE_SHADERS, type SupportedMaterial } from "./material";
@@ -27,9 +28,8 @@ import type {
  * - Batch texture attributes (color, show, height, lineWidth)
  * - RTE (Relative-To-Eye) support for high-precision coordinates
  *
- * Supports ShaderMaterial with custom polyline shaders.
- * Note: Unlike polygon materials, polylines don't support opacity/transparent/wireframe
- * as these are managed via shader uniforms and custom shader code.
+ * Supports ShaderMaterial with custom polyline shaders. `opacity` reaches the
+ * volume shader as a uniform; it blends only with `transparent`.
  *
  * @param material - The Three.js ShaderMaterial to enhance
  */
@@ -76,6 +76,12 @@ export function createPolylineBaseEnhancer(
         viewportAndPixelRatio: props.viewportAndPixelRatio,
         frustumNearFar: props.frustumNearFar,
         frustumRatio: props.frustumRatio,
+        horizonMinHeight: props.horizonMinHeight,
+        globeDepth: props.globeDepth,
+        globeNormal: props.globeNormal,
+        inverseProjectionMatrix: props.inverseProjectionMatrix,
+        lineDashAtlas: props.lineDashAtlas,
+        lineDashSegments: props.lineDashSegments,
       });
       updateMaterialProps(material, mergedProps, state.isTexturized);
     },
@@ -85,12 +91,20 @@ export function createPolylineBaseEnhancer(
 
       // Capture previous state for shader-affecting properties
       const prevIsTexturized = state.isTexturized;
+      const prevGroundCulling = state.groundCulling;
+      const prevUseGroundNormals = state.useGroundNormals;
+      const prevDashed = state.dashRow !== SOLID_DASH_ROW;
 
       state = updateState(props, state);
       mutates.update(state);
 
       // Trigger shader recompilation if shader-affecting state changed
-      if (state.isTexturized !== prevIsTexturized) {
+      if (
+        state.isTexturized !== prevIsTexturized ||
+        state.groundCulling !== prevGroundCulling ||
+        state.useGroundNormals !== prevUseGroundNormals ||
+        (state.dashRow !== SOLID_DASH_ROW) !== prevDashed
+      ) {
         material.needsUpdate = true;
       }
 
@@ -116,7 +130,10 @@ export function createPolylineBaseEnhancer(
       // Return cache key based on state that affects shader sources/defines.
       return JSON.stringify({
         isTexturized: state.isTexturized,
+        groundCulling: state.groundCulling,
+        useGroundNormals: state.useGroundNormals,
         useRTE: state.useRTE,
+        dashed: state.dashRow !== SOLID_DASH_ROW,
         // Custom defines that may influence shader variants
         userDataDefines: material.userData?.defines ?? undefined,
       });

@@ -1,9 +1,11 @@
 mod clip;
+mod dem_grid;
+
+pub use dem_grid::*;
 
 use rustc_hash::FxHashMap;
 
 use clip::{ClippedIndex, clip_2d_triangle_at_threshold};
-use itertools::Itertools;
 use radians::{Angle, Radians};
 
 use navara_core::{Ellipsoid, Extent, LLE, Meters, TileRegion, lerp};
@@ -29,6 +31,11 @@ pub struct UpsamplableTerrainGeometry<'a> {
 /// | 1 | 2 |  upsample 1  |       |
 /// ---------     =>       |   1   |
 /// | 3 | 4 |              |       |
+///
+/// A descendant deeper than one level is reached with
+/// [`UpsampledTerrainGeometry::new_from_path`], which applies this quadrant
+/// clip once per level so a tile can be upsampled straight from any ready
+/// ancestor without materializing the levels in between.
 #[derive(Debug)]
 pub struct UpsampledTerrainGeometry {
     pub uvs: Option<Vec<FloatType>>,
@@ -41,6 +48,28 @@ pub struct UpsampledTerrainGeometry {
     pub min_height: FloatType,
     is_east: bool,
     is_north: bool,
+}
+
+/// An intermediate level of a multi-level upsample: a clipped mesh already
+/// remapped into its own tile's UV space, owned so the next clip can borrow it.
+struct ChildSpaceGeometry {
+    uvs: Vec<f32>,
+    heights: Vec<f32>,
+    indices: Vec<u32>,
+    normals: Option<Vec<f32>>,
+    watermask: Option<Vec<u8>>,
+}
+
+impl ChildSpaceGeometry {
+    fn as_upsamplable(&self) -> UpsamplableTerrainGeometry<'_> {
+        UpsamplableTerrainGeometry {
+            uvs: &self.uvs,
+            heights: &self.heights,
+            indices: &self.indices,
+            normals: self.normals.as_deref(),
+            watermask: self.watermask.as_deref(),
+        }
+    }
 }
 
 impl UpsampledTerrainGeometry {
@@ -74,6 +103,72 @@ impl UpsampledTerrainGeometry {
             min_height,
             is_east,
             is_north,
+        }
+    }
+
+    /// Upsample along a quadrant path from an ancestor down to the target tile,
+    /// `regions[0]` being the ancestor's child on the way and the last entry the
+    /// target itself. Every intermediate level is clipped and remapped into its
+    /// own UV space before the next clip, so the result is what upsampling
+    /// level by level would produce. Returns `None` for an empty path.
+    pub fn new_from_path(
+        upsamplable_geometry: UpsamplableTerrainGeometry,
+        regions: &[TileRegion],
+    ) -> Option<Self> {
+        let (last, intermediates) = regions.split_last()?;
+
+        let mut current: Option<ChildSpaceGeometry> = None;
+        for region in intermediates {
+            let clipped = match &current {
+                Some(c) => Self::new(c.as_upsamplable(), region),
+                None => Self::new(
+                    UpsamplableTerrainGeometry {
+                        uvs: upsamplable_geometry.uvs,
+                        heights: upsamplable_geometry.heights,
+                        indices: upsamplable_geometry.indices,
+                        normals: upsamplable_geometry.normals,
+                        watermask: upsamplable_geometry.watermask,
+                    },
+                    region,
+                ),
+            };
+            current = Some(clipped.into_child_space());
+        }
+
+        Some(match &current {
+            Some(c) => Self::new(c.as_upsamplable(), last),
+            None => Self::new(upsamplable_geometry, last),
+        })
+    }
+
+    /// Remap the clipped geometry from the parent's UV space into this tile's
+    /// own `[0, 1]` UV space, as `construct_geometry` does, but keep it as
+    /// plain buffers so it can serve as the parent of the next clip.
+    fn into_child_space(mut self) -> ChildSpaceGeometry {
+        let (min_u, max_u) = if self.is_east { (0.5, 1.) } else { (0., 0.5) };
+        let (min_v, max_v) = if self.is_north { (0.5, 1.) } else { (0., 0.5) };
+        let offset_u = if self.is_east { 1. } else { 0. };
+        let offset_v = if self.is_north { 1. } else { 0. };
+
+        let uvs = self
+            .uvs
+            .take()
+            .unwrap_or_default()
+            .chunks(2)
+            .flat_map(|uv| {
+                [
+                    (uv[0].clamp(min_u, max_u) * 2. - offset_u) as f32,
+                    (uv[1].clamp(min_v, max_v) * 2. - offset_v) as f32,
+                ]
+            })
+            .collect();
+
+        ChildSpaceGeometry {
+            uvs,
+            heights: self.heights.take().unwrap_or_default(),
+            indices: self.indices.take().unwrap_or_default(),
+            normals: self.normals.take(),
+            watermask: self.watermask.take(),
         }
     }
 
@@ -150,11 +245,13 @@ const WATERMASK_SIZE: usize = 256;
 /// Crop a parent quantized-mesh watermask to one child quadrant.
 ///
 /// A uniform mask (1 byte) is inherited as-is. A 256x256 grid is cropped to
-/// the child's 128x128 quadrant and upscaled back to 256x256 with nearest
-/// neighbor, so the child mask keeps the same layout a directly decoded mask
-/// has. Row 0 is the NORTH edge (masks are uploaded with `flipY` and sampled
-/// at tile UVs where v=0 is the south edge), so a north child reads the first
-/// 128 rows. Returns `None` for unexpected sizes.
+/// the child's 128x128 quadrant and upscaled back to 256x256 bilinearly at the
+/// child's texel centers, so the child mask keeps the same layout a directly
+/// decoded mask has. Bilinear doubling is Chaikin subdivision, so over
+/// repeated levels the 0.5 contour (the shader's threshold) converges to a
+/// smooth curve. Row 0 is the NORTH edge (masks are uploaded with
+/// `flipY` and sampled at tile UVs where v=0 is the south edge), so a north
+/// child reads the first 128 rows. Returns `None` for unexpected sizes.
 pub fn upsample_watermask(parent: &[u8], is_east: bool, is_north: bool) -> Option<Vec<u8>> {
     match parent.len() {
         1 => Some(vec![parent[0]]),
@@ -162,12 +259,27 @@ pub fn upsample_watermask(parent: &[u8], is_east: bool, is_north: bool) -> Optio
             const HALF: usize = WATERMASK_SIZE / 2;
             let src_row0 = if is_north { 0 } else { HALF };
             let src_col0 = if is_east { HALF } else { 0 };
+            // A child texel center sits a quarter parent texel from the
+            // nearest parent center: weight 3/4 there and 1/4 on the neighbor
+            // toward it, clamped at the parent's edges.
+            let taps = |child: usize, origin: usize| {
+                let near = origin + child / 2;
+                let far = if child.is_multiple_of(2) {
+                    near.saturating_sub(1)
+                } else {
+                    (near + 1).min(WATERMASK_SIZE - 1)
+                };
+                (near, far)
+            };
             let mut out = vec![0u8; WATERMASK_SIZE * WATERMASK_SIZE];
             for y in 0..WATERMASK_SIZE {
-                let src_row = (src_row0 + y / 2) * WATERMASK_SIZE;
-                let dst_row = y * WATERMASK_SIZE;
+                let (row_near, row_far) = taps(y, src_row0);
                 for x in 0..WATERMASK_SIZE {
-                    out[dst_row + x] = parent[src_row + src_col0 + x / 2];
+                    let (col_near, col_far) = taps(x, src_col0);
+                    let at = |row: usize, col: usize| f32::from(parent[row * WATERMASK_SIZE + col]);
+                    let near = 0.75 * at(row_near, col_near) + 0.25 * at(row_near, col_far);
+                    let far = 0.75 * at(row_far, col_near) + 0.25 * at(row_far, col_far);
+                    out[y * WATERMASK_SIZE + x] = (0.75 * near + 0.25 * far).round() as u8;
                 }
             }
             Some(out)
@@ -190,10 +302,13 @@ fn clip(
 
     let mut clipped_coord_map = ClippedCoordMap::new();
 
-    let mut new_uvs = vec![];
-    let mut new_heights = vec![];
-    let mut new_normals: Option<Vec<f32>> = normals.map(|_| Vec::new());
-    let mut new_indices = vec![];
+    // A quadrant keeps roughly a quarter of the triangles; over-reserve a
+    // little so the edge splits don't trigger a regrow.
+    let est_vertices = uvs.len() / 2 / 3 + 16;
+    let mut new_uvs = Vec::with_capacity(est_vertices * 2);
+    let mut new_heights = Vec::with_capacity(est_vertices);
+    let mut new_normals: Option<Vec<f32>> = normals.map(|_| Vec::with_capacity(est_vertices * 3));
+    let mut new_indices = Vec::with_capacity(indices.len() / 3 + 16);
 
     let mut max_height = 0.0;
     let mut min_height = 99999.0;
@@ -386,7 +501,8 @@ fn construct_polygon(
     clipped_coord_map: &mut ClippedCoordMap,
     (max_height, min_height): (&mut FloatType, &mut FloatType),
 ) {
-    let mut new_polygon_indices = vec![];
+    let mut new_polygon_indices = [0u32; 4];
+    let mut new_polygon_len = 0usize;
     let mut new_normals = new_normals;
     for i in clipped_indices {
         let new_index = new_uvs.len() / 2;
@@ -427,10 +543,12 @@ fn construct_polygon(
         *max_height = max_height.max(h);
         *min_height = min_height.min(h);
 
-        new_polygon_indices.push(new_index as u32);
+        new_polygon_indices[new_polygon_len] = new_index as u32;
+        new_polygon_len += 1;
     }
+    let new_polygon_indices = &new_polygon_indices[..new_polygon_len];
 
-    if new_polygon_indices.iter().unique().count() < 3 {
+    if count_unique(new_polygon_indices) < 3 {
         return;
     }
 
@@ -441,7 +559,7 @@ fn construct_polygon(
             new_polygon_indices[1],
             new_polygon_indices[2],
         ]) {
-            new_indices.append(&mut v.to_vec());
+            new_indices.extend_from_slice(&v);
         };
     } else {
         // Two triangles.
@@ -450,7 +568,7 @@ fn construct_polygon(
             new_polygon_indices[1],
             new_polygon_indices[2],
         ]) {
-            new_indices.append(&mut v.to_vec());
+            new_indices.extend_from_slice(&v);
         };
 
         if let Some(v) = construct_indices([
@@ -458,13 +576,24 @@ fn construct_polygon(
             new_polygon_indices[2],
             new_polygon_indices[3],
         ]) {
-            new_indices.append(&mut v.to_vec());
+            new_indices.extend_from_slice(&v);
         };
     }
 }
 
+/// Number of distinct values among at most four indices, without allocating.
+fn count_unique(idxs: &[u32]) -> usize {
+    let mut n = 0;
+    for (i, a) in idxs.iter().enumerate() {
+        if !idxs[..i].contains(a) {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn construct_indices(idxs: [u32; 3]) -> Option<[u32; 3]> {
-    if idxs.iter().unique().count() < 3 {
+    if count_unique(&idxs) < 3 {
         None
     } else {
         Some(idxs)
@@ -472,7 +601,7 @@ fn construct_indices(idxs: [u32; 3]) -> Option<[u32; 3]> {
 }
 
 // This is used to avoid duplicating a coordinate.
-struct ClippedCoordMap(FxHashMap<String, usize>);
+struct ClippedCoordMap(FxHashMap<(u16, u16, u64), usize>);
 
 impl ClippedCoordMap {
     const SCALE_U16: FloatType = 32767.;
@@ -481,20 +610,19 @@ impl ClippedCoordMap {
         Self(FxHashMap::default())
     }
     fn get(&mut self, u: FloatType, v: FloatType, h: FloatType) -> Option<&usize> {
-        self.0.get(&self.make_key(u, v, h))
+        self.0.get(&Self::make_key(u, v, h))
     }
     fn insert(&mut self, u: FloatType, v: FloatType, h: FloatType, idx: usize) {
-        self.0.insert(self.make_key(u, v, h), idx);
+        self.0.insert(Self::make_key(u, v, h), idx);
     }
-    fn make_key(&self, u: FloatType, v: FloatType, h: FloatType) -> String {
-        format!(
-            "{}_{}_{}",
-            self.quantize_float(u),
-            self.quantize_float(v),
-            h.to_bits()
+    fn make_key(u: FloatType, v: FloatType, h: FloatType) -> (u16, u16, u64) {
+        (
+            Self::quantize_float(u),
+            Self::quantize_float(v),
+            h.to_bits(),
         )
     }
-    fn quantize_float(&self, v: FloatType) -> u16 {
+    fn quantize_float(v: FloatType) -> u16 {
         (v * Self::SCALE_U16) as u16
     }
 }
@@ -676,6 +804,131 @@ mod test {
         }
     }
 
+    /// 3×3 grid mesh (8 triangles) with heights that vary across the grid.
+    fn grid_mesh() -> (Vec<f32>, Vec<f32>, Vec<u32>) {
+        let mut uvs = Vec::new();
+        let mut heights = Vec::new();
+        for j in 0..3 {
+            for i in 0..3 {
+                uvs.push(i as f32 * 0.5);
+                uvs.push(j as f32 * 0.5);
+                heights.push((i * 10 + j * 100) as f32);
+            }
+        }
+        let mut indices = Vec::new();
+        for j in 0..2u32 {
+            for i in 0..2u32 {
+                let a = j * 3 + i;
+                let b = a + 1;
+                let c = a + 3;
+                let d = c + 1;
+                indices.extend_from_slice(&[a, b, d, a, d, c]);
+            }
+        }
+        (uvs, heights, indices)
+    }
+
+    #[test]
+    fn path_of_one_region_matches_single_level_upsample() {
+        let (uvs, heights, indices) = grid_mesh();
+        let geometry = || UpsamplableTerrainGeometry {
+            uvs: &uvs,
+            heights: &heights,
+            indices: &indices,
+            normals: None,
+            watermask: None,
+        };
+
+        let single = UpsampledTerrainGeometry::new(geometry(), &TileRegion::SouthEast);
+        let path =
+            UpsampledTerrainGeometry::new_from_path(geometry(), &[TileRegion::SouthEast]).unwrap();
+
+        assert_eq!(single.uvs, path.uvs);
+        assert_eq!(single.heights, path.heights);
+        assert_eq!(single.indices, path.indices);
+        assert_eq!(single.max_height, path.max_height);
+        assert_eq!(single.min_height, path.min_height);
+    }
+
+    #[test]
+    fn empty_path_yields_nothing() {
+        let (uvs, heights, indices) = grid_mesh();
+        let geometry = UpsamplableTerrainGeometry {
+            uvs: &uvs,
+            heights: &heights,
+            indices: &indices,
+            normals: None,
+            watermask: None,
+        };
+        assert!(UpsampledTerrainGeometry::new_from_path(geometry, &[]).is_none());
+    }
+
+    #[test]
+    fn two_level_path_matches_level_by_level_upsample() {
+        let (uvs, heights, indices) = grid_mesh();
+        let geometry = || UpsamplableTerrainGeometry {
+            uvs: &uvs,
+            heights: &heights,
+            indices: &indices,
+            normals: None,
+            watermask: None,
+        };
+
+        // Level by level: clip to the NE child, remap into the child's UV space
+        // through `construct_geometry`, then clip that child to its SW quadrant.
+        let mut child = UpsampledTerrainGeometry::new(geometry(), &TileRegion::NorthEast);
+        let extent = Extent::from_points(&[
+            LngLat {
+                lng: Rad::new(0.0_f64),
+                lat: Rad::new(0.0_f64),
+            },
+            LngLat {
+                lng: Rad::new(0.001_f64),
+                lat: Rad::new(0.001_f64),
+            },
+        ]);
+        let (child_geom, child_heights) =
+            child.construct_geometry(WGS84_64, &extent, &Vec3::ZERO, false);
+        let stepwise = UpsampledTerrainGeometry::new(
+            UpsamplableTerrainGeometry {
+                uvs: &child_geom.uvs,
+                heights: &child_heights,
+                indices: &child_geom.indices,
+                normals: None,
+                watermask: None,
+            },
+            &TileRegion::SouthWest,
+        );
+
+        let direct = UpsampledTerrainGeometry::new_from_path(
+            geometry(),
+            &[TileRegion::NorthEast, TileRegion::SouthWest],
+        )
+        .unwrap();
+
+        assert_eq!(stepwise.indices, direct.indices);
+        assert_eq!(stepwise.heights, direct.heights);
+        let stepwise_uvs = stepwise.uvs.as_ref().unwrap();
+        let direct_uvs = direct.uvs.as_ref().unwrap();
+        assert_eq!(stepwise_uvs.len(), direct_uvs.len());
+        for (a, b) in stepwise_uvs.iter().zip(direct_uvs.iter()) {
+            assert!((a - b).abs() < EPSILON5, "{a} != {b}");
+        }
+        // The grandchild covers the SW quadrant of the NE child, i.e. the
+        // [0.5, 0.75]² patch of the ancestor: heights `i * 10 + j * 100` sampled
+        // at uv `(i * 0.5, j * 0.5)` interpolate to 110..=165 there.
+        assert!(
+            direct.min_height >= 110. - EPSILON5,
+            "{}",
+            direct.min_height
+        );
+        assert!(
+            direct.max_height <= 165. + EPSILON5,
+            "{}",
+            direct.max_height
+        );
+    }
+
     #[test]
     fn it_should_construct_upsampled_coords() {
         let mesh = UpsampledTerrainGeometry::new(
@@ -771,29 +1024,47 @@ mod test {
         ] {
             let child = super::upsample_watermask(&parent, is_east, is_north).unwrap();
             assert_eq!(child.len(), SIZE * SIZE);
-            assert!(
-                child.iter().all(|&v| v == expected),
-                "quadrant (east={}, north={}) should be uniformly {}",
-                is_east,
-                is_north,
-                expected
-            );
+            // Away from the parent's quadrant boundary the child is uniform;
+            // the texels along it blend with the neighboring quadrant.
+            let inner_row = if is_north { SIZE - 1 } else { 0 };
+            let inner_col = if is_east { 0 } else { SIZE - 1 };
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    if y == inner_row || x == inner_col {
+                        continue;
+                    }
+                    assert_eq!(
+                        child[y * SIZE + x],
+                        expected,
+                        "quadrant (east={is_east}, north={is_north}) at ({x}, {y})"
+                    );
+                }
+            }
+            assert_ne!(child[inner_row * SIZE + SIZE / 2], expected);
         }
     }
 
     #[test]
-    fn it_should_upscale_cropped_watermask_with_nearest_neighbor() {
+    fn it_should_upscale_cropped_watermask_bilinearly() {
         const SIZE: usize = 256;
-        // Single water texel at the parent's northwest corner (row 0, col 0).
+        // Single water texel in the parent's northwest quadrant (row 10, col 20).
         let mut parent = vec![0u8; SIZE * SIZE];
-        parent[0] = 255;
+        parent[10 * SIZE + 20] = 255;
 
         let child = super::upsample_watermask(&parent, false, true).unwrap();
 
-        // The NW child doubles that texel into a 2x2 block at its own NW corner.
+        // The texel covers child rows/cols 2·i and 2·i + 1 at weight 3/4 each
+        // way, and spreads 1/4 into the next child texel on either side.
+        let weight = |child: usize, parent: usize| -> f32 {
+            match child as isize - 2 * parent as isize {
+                0 | 1 => 0.75,
+                -1 | 2 => 0.25,
+                _ => 0.0,
+            }
+        };
         for y in 0..SIZE {
             for x in 0..SIZE {
-                let expected = if x < 2 && y < 2 { 255 } else { 0 };
+                let expected = (255.0 * weight(y, 10) * weight(x, 20)).round() as u8;
                 assert_eq!(child[y * SIZE + x], expected, "at ({}, {})", x, y);
             }
         }

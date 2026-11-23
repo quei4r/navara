@@ -39,7 +39,7 @@ For full details on all properties, events, and control options, see [ThreeViewC
 
 **Read-only** (getter)
 
-The Globe instance that manages terrain, imagery layers, and globe-specific settings. Controls various properties related to globe display, including transparency, wireframe display, and elevation heatmap color maps.
+The Globe instance that manages terrain, imagery layers, and globe-specific settings. Controls various properties related to globe display, including transparency and wireframe display.
 
 **Example:**
 
@@ -50,9 +50,6 @@ view.globe.opacity = 0.8;
 
 // Enable wireframe mode
 view.globe.wireframe = true;
-
-// Set color map for elevation heatmap
-view.globe.elevationColormap = customColorMap;
 ```
 
 :::tip[Related Documentation]
@@ -151,19 +148,19 @@ For a worked deferred lighting effect that consumes the albedo output together w
 
 **Read-only** (getter)
 
-The buffers currently allocated, as `{ selectiveEffect, emissive, shadow, globeNormal }` booleans. This is **derived**, not configured: the view allocates the union of the `static requiredBuffers` declared by the active effect Descriptors, and releases a buffer when the last effect needing it is removed.
+The buffers currently allocated, as `{ normal, selectiveEffect, emissive, shadow, globeNormal }` booleans. This is **derived**, not configured: the view allocates the union of what the active effect Descriptors declare, through `static requiredBuffers` or a `getRequiredBuffers()` override, and releases a buffer when the last effect needing it is removed or an effect stops declaring it.
 
-The first three are G-buffer attachments. `globeNormal` is a separate screen-space copy of the terrain normal, so it takes no attachment slot (see [Custom Descriptor: Buffer / Texture Access](../../../three/core/custom-desc/#buffer--texture-access)).
+The first four are G-buffer attachments. `globeNormal` is a separate screen-space copy of the terrain normal, so it takes no attachment slot (see [Custom Descriptor: Buffer / Texture Access](../../../three/core/custom-desc/#buffer--texture-access)).
 
 **Example:**
 
 ```tsx
 console.log(view.buffers);
-// { selectiveEffect: false, emissive: false, shadow: false, globeNormal: false }
+// { normal: false, selectiveEffect: false, emissive: false, shadow: false, globeNormal: false }
 ```
 
 :::tip[Related Documentation]
-For declaring `requiredBuffers` and reading the buffers from a custom effect, see [Custom Descriptor: Buffer / Texture Access](../../../three/core/custom-desc/#buffer--texture-access).
+For declaring `requiredBuffers` or `getRequiredBuffers()` and reading the buffers from a custom effect, see [Custom Descriptor: Buffer / Texture Access](../../../three/core/custom-desc/#buffer--texture-access).
 :::
 
 ### animation

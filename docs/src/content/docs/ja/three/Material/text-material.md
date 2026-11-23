@@ -9,6 +9,47 @@ sidebar:
 
 ## Properties
 
+### anchor
+
+**Type:** `"center" | "left" | "right" | "top" | "bottom" | "top-left" | "top-right" | "bottom-left" | "bottom-right" | undefined`
+
+**Description:** テキストブロックのどの部分をラベルの位置に置くかを指定します。MapLibre の `text-anchor` と同じ動作です。テキストブロックの幅は最も長い行の幅、高さは 1 行につき行の高さ 1 つ分です。そのため `"top"` ではテキストが位置の下に、`"bottom"` では位置の上に表示されます。アンカーは [`rotation`](#rotation) の回転の中心にもなります。
+
+[`FeatureEvaluator`](../../api/feature-evaluator/) から地物ごとに指定することもできます。
+
+**Default:** `"center"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    anchor: "top"
+  }
+}
+```
+
+### backfaceCulling
+
+**Type:** `boolean | undefined`
+
+**Description:** 裏側から見たときにラベルを非表示にするかどうかを指定します。`false` の場合はラベルの両面を描画し、`true` の場合は表側のみを描画します。
+
+裏側がカメラから見えるのは、地表に寝かせたラベル（[`textFacing`](#textfacing) を参照）だけです。地球の外側を表側としているため、この設定を有効にすると、大きなラベルのうち地平線の向こう側に回り込んだ部分が非表示になります。`"upright"` のラベルは常に画面と同じ平面で視点の方を向いているため、影響はありません。
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat",
+    backfaceCulling: true
+  }
+}
+```
+
 ### backgroundColor
 
 **Type:** `Color | undefined`
@@ -63,24 +104,6 @@ import { Color } from "@navaramap/three";
 {
   text: {
     borderWidth: 2
-  }
-}
-```
-
-### center
-
-**Type:** [`Vec2`](../../api/types/#vec2) | undefined
-
-**Description:** 中心からのシフト量を指定します。範囲は 0 から 1 の間です。
-
-**Default:** `undefined`
-
-**Example:**
-
-```typescript
-{
-  text: {
-    center: { x: 0.5, y: 0.0 }
   }
 }
 ```
@@ -141,6 +164,24 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### declutterPadding
+
+**Type:** `number[] | undefined`
+
+**Description:** ラベルの衝突判定ボックスの周囲に加える余白で、[`sizeInMeters`](#sizeinmeters) にかかわらず画面上のピクセル単位です。CSS の padding と同じく 1 〜 4 個の値で指定します（`[全辺]`、`[上下, 左右]`、`[上, 左右, 下]`、`[上, 右, 下, 左]`）。[`declutter`](#declutter) が有効な場合にのみ意味を持ちます。MapLibre の `text-padding` に相当します。
+
+**Default:** `[2]`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    declutterPadding: [4, 8]
+  }
+}
+```
+
 ### declutterPriority
 
 **Type:** `number | undefined`
@@ -156,6 +197,24 @@ import { Color } from "@navaramap/three";
   text: {
     declutter: true,
     declutterPriority: 1
+  }
+}
+```
+
+### declutterRank
+
+**Type:** `number | undefined`
+
+**Description:** デクラッターの大まかな配置順で、[`declutterPriority`](#declutterpriority) より先に比較されます。ランクの高いマテリアルのラベルは、優先度にかかわらず、ランクの低いラベルやスプライトより先に配置されます。そのため、地物ごとの `declutterPriority` は同じランクのラベルやスプライトの順序だけを入れ替えます。[`declutter`](#declutter) が有効な場合にのみ意味を持ちます。
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    declutterRank: 1
   }
 }
 ```
@@ -281,7 +340,7 @@ view.addFontFamily({
 
 **Type:** `("point" | "line" | "polygon")[] | undefined`
 
-**Description:** このマテリアルが消費するソースジオメトリのカテゴリーです。`"line"` を含めるとラインの頂点ごとに、`"polygon"` を含めるとポリゴンリングの頂点ごとに 1 つのラベルを描画します（リングを閉じる重複頂点はスキップされます）。配列を指定するとデフォルトは置き換えられるため、ポイントジオメトリも描画し続けたい場合は `"point"` を含めてください。このオプションはジオメトリ構築時に適用されます。レイヤー作成時に指定してください。`layer.update()` で変更しても読み込み済みのタイルには反映されず、変更後に読み込まれたタイルにのみ適用されます（すべてに反映するにはレイヤーを作り直してください）。
+**Description:** このマテリアルが消費するソースジオメトリのカテゴリーです。`"line"` を含めると、デフォルトではラインごとに 1 つのラベルを、その最初の頂点に描画します。MapLibre がライン上の `symbol-placement: "point"` のシンボルを配置するのと同じです。ラインに沿ってラベルを配置するには [`placement`](#placement) を指定してください。`"polygon"` を含めるとポリゴンごとに 1 つのラベルを、ポリゴン内部で辺から最も遠い地点に描画します（MultiPolygon は各パーツに 1 つずつ）。[`placement`](#placement) でリングに沿って配置することもできます。配列を指定するとデフォルトは置き換えられるため、ポイントジオメトリも描画し続けたい場合は `"point"` を含めてください。このオプションはジオメトリ構築時に適用されます。レイヤー作成時に指定してください。`layer.update()` で変更しても読み込み済みのタイルには反映されず、変更後に読み込まれたタイルにのみ適用されます（すべてに反映するにはレイヤーを作り直してください）。
 
 **Default:** `["point"]`
 
@@ -313,6 +372,44 @@ view.addFontFamily({
 }
 ```
 
+### ignorePlacement
+
+**Type:** `boolean | undefined`
+
+**Description:** このラベルのボックスを衝突判定から外し、後から配置されるラベルやスプライトが重なれるようにします。このラベル自体は、[`overlap`](#overlap) で許可しない限り、先に配置されたものと衝突すると非表示になります。[`declutter`](#declutter) が有効な場合にのみ意味を持ちます。MapLibre の `text-ignore-placement` に相当します。
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    ignorePlacement: true
+  }
+}
+```
+
+### keepUpright
+
+**Type:** `boolean | undefined`
+
+**Description:** ライン沿いに配置したラベルが上下逆さまに読める向きになる場合に反転し、ラインがどちら向きに描かれていても名前が読めるようにします。[`placement`](#placement) が `"line"` または `"line-center"` のときのみ使用され、まっすぐ描かれるラベル（[`rotateWithCamera`](#rotatewithcamera) を参照）は反転しません。ラベルの読み方向はカメラに依存するため、カメラの移動に合わせて判定し直されます。`layer.update()` で変更した値は、表示中のラベルにも反映されます。
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    keepUpright: false // 常にラインが描かれた向きに読む
+  }
+}
+```
+
 ### lang
 
 **Type:** `string | undefined`
@@ -331,13 +428,31 @@ view.addFontFamily({
 }
 ```
 
+### letterSpacing
+
+**Type:** `number | undefined`
+
+**Description:** 文字間に追加する間隔を em 単位（`size` の倍数）で指定します。間隔は文字と文字の間にのみ追加され、最後の文字の後には追加されないため、揃え位置やアンカーには影響しません。また、[`maxWidth`](#maxwidth) による折り返し幅の計算にも含まれます。負の値を指定すると字間が詰まります。結合文字（アクセント記号など）は基底文字から離れません。アラビア文字を含むラベルでは、連結された字形が崩れるため間隔は無視されます。フィーチャー評価の `letterSpacing` キーで、フィーチャーごとに指定することもできます。
+
+**Default:** `0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    letterSpacing: 0.2 // 文字間に 0.2 em を追加
+  }
+}
+```
+
 ### lineHeight
 
 **Type:** `number | undefined`
 
-**Description:** 複数行テキストの行の高さを、フォント本来の行の高さ（アセンダー − ディセンダー + ラインギャップ）に対する倍率で指定します。
+**Description:** 複数行テキストのベースライン間の距離を em（`size` の倍数）で指定します。MapLibre の `text-line-height` と同じ単位です。未指定の場合はフォント本来の行の高さ（アセンダー − ディセンダー + ラインギャップ）で行を並べるため、行間はフォントごとに異なります。
 
-**Default:** `1.0`
+**Default:** `undefined`（フォント本来の行の高さ）
 
 **Example:**
 
@@ -345,6 +460,48 @@ view.addFontFamily({
 {
   text: {
     lineHeight: 1.2
+  }
+}
+```
+
+### lineOffset
+
+**Type:** `number | undefined`
+
+**Description:** ライン沿いに配置したラベルを、ラインから横方向にずらします。正の値はラインの進行方向の左側に移動し、ラベルが左から右に読める向きのときはラインの上側になります。単位は [`size`](#size) と同じで、[`sizeInMeters`](#sizeinmeters) が `true` のときはメートル、それ以外はピクセルです。道路の上ではなく道路の脇に名前を置きたい場合に使用します。[`placement`](#placement) が `"line"` または `"line-center"` のときのみ使用され、まっすぐ描かれるラベル（[`rotateWithCamera`](#rotatewithcamera) を参照）には適用されません。`layer.update()` で変更した値は、表示中のラベルにも反映されます。
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    size: 14,
+    sizeInMeters: false,
+    lineOffset: 10 // ラインから 10 ピクセル横に配置
+  }
+}
+```
+
+### maxAngle
+
+**Type:** `number | undefined`
+
+**Description:** ライン沿いに配置したラベルの下でラインが曲がってよい角度の上限（度）です。これを超えるラベルは読みにくいため非表示になります。角度はフォントサイズの約 1.5 倍の短い区間ごとに合計し、その区間をラベルに沿ってずらしながら判定します。そのため、近接した小さな角が重なると非表示になることがある一方、長く緩やかなカーブは全体でどれだけ曲がっていても表示されます。[`placement`](#placement) が `"line"` または `"line-center"` のときのみ使用されます。まっすぐ描かれるラベル（[`rotateWithCamera`](#rotatewithcamera) を参照）は曲がらないため、この判定の対象外です。ラベルが収まるかどうかはカメラの移動に合わせて判定し直され、`layer.update()` で変更した値は表示中のラベルにも反映されます。
+
+**Default:** `45.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    maxAngle: 90 // よりきついカーブにもラベルを配置
   }
 }
 ```
@@ -363,6 +520,27 @@ view.addFontFamily({
 {
   text: {
     maxWidth: 10 // 10 em を超える行を折り返す
+  }
+}
+```
+
+### offset
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** テキストをアンカー位置からずらす量を em 単位（[`size`](#size) の倍数）で指定します。MapLibre の `text-offset` と同じ動作です。`x` が正の値で右に、`y` が正の値で下に移動します。オフセットはラベル自身の平面内にあるため、[`rotation`](#rotation) とともに回転します。
+
+[`FeatureEvaluator`](../../api/feature-evaluator/) から地物ごとに指定することもできます。
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    anchor: "top",
+    offset: { x: 0, y: 0.5 } // 位置の 0.5 em 下
   }
 }
 ```
@@ -399,6 +577,25 @@ view.addFontFamily({
 {
   text: {
     opacity: 0.5
+  }
+}
+```
+
+### outlineBlur
+
+**Type:** `number | undefined`
+
+**Description:** アウトラインの外側の縁をぼかす幅を、その縁を中心に [`outlineWidth`](#outlinewidth) と同じ単位で指定します。アウトラインとぼかしはグリフから最大 17.5/64 em（`highQuality` では 8/64 em）からアンチエイリアス用の半スクリーンピクセルを引いた距離までしか届かず、それを超えるぼかしは収まるように狭められます。フィーチャー評価関数でフィーチャーごとに指定できます。
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    outlineWidth: 4,
+    outlineBlur: 4
   }
 }
 ```
@@ -445,7 +642,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** アウトラインの太さを CSS ピクセル単位で指定します。
+**Description:** アウトラインの太さを 1/64 em 単位、つまり高さ 64 ピクセルで描いたテキスト上のピクセル数で指定します。そのため `size` によらずグリフとの比率が保たれます。16 ピクセルのテキストに 2 ピクセルのアウトラインを付けるには `2 / 16 × 64 = 8` を指定します。アウトラインはグリフから最大 17.5/64 em（`highQuality` では 8/64 em）からアンチエイリアス用の半スクリーンピクセルを引いた距離まで届きます。そのためこの上限に近いと小さなテキストではアウトラインが相対的に細くなり、10 ピクセルのテキストでは 16/64 em のアウトラインが 2.5 ピクセルではなく約 2.2 ピクセルの幅で描かれます。フィーチャー評価関数でフィーチャーごとに指定できます。
 
 **Default:** `0.0`
 
@@ -454,7 +651,124 @@ import { Color } from "@navaramap/three";
 ```typescript
 {
   text: {
-    outlineWidth: 2
+    outlineWidth: 8
+  }
+}
+```
+
+### overlap
+
+**Type:** `"never" | "always" | "cooperative" | undefined`
+
+**Description:** 先に配置されたラベルやスプライトの上にこのラベルを重ねて描画できるかを指定します（[`declutterRank`](#declutterrank)、次に [`declutterPriority`](#declutterpriority) が大きいものから配置されます）。`"never"` はいずれかと衝突すると非表示にします。`"always"` は非表示にしません。そのボックスは、[`ignorePlacement`](#ignoreplacement) を設定しない限り、後から配置される `"never"` のものを遠ざけます。`"cooperative"` は `"never"` のものと衝突した場合にのみ非表示にします。[`declutter`](#declutter) が有効な場合にのみ意味を持ちます。MapLibre の `text-overlap` に相当します。
+
+**Default:** `"never"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    overlap: "always"
+  }
+}
+```
+
+### placement
+
+**Type:** `"point" | "line" | "line-center" | undefined`
+
+**Description:** ラインおよびポリゴンジオメトリ上でのラベルの配置方法を指定します。[`geometryTypes`](#geometrytypes) に `"line"` または `"polygon"` が含まれる場合のみ有効です。ポイントジオメトリは常にその地点にラベルが配置されます。
+
+- `"point"`：ラインごとにその最初の頂点に 1 つのラベルを配置し、ポリゴンにはポリゴン内部で辺から最も遠い地点に 1 つのラベルを配置します。ベクタータイルソースでは、最初の頂点がタイルの外にある（タイルで切られた）ラインには、そのタイルではラベルを配置しません。
+- `"line"`：[`spacing`](#spacing) ごとにラインに沿ってラベルを繰り返し配置します。デフォルトでは、地図上の道路名のように、単語ごとにラインのカーブに沿って曲がります。各単語はその下のラインの向きに合わせて回転し、単語内の文字はまっすぐ並んだままです。文字ごとに回転させるには [`spreadGlyphs`](#spreadglyphs) を指定します。ポリゴンの境界リング（穴を含む）にも同じように沿って配置します。
+- `"line-center"`：各ラインまたはポリゴンリングの長さの中間点に 1 つのラベルを配置し、同じように沿って曲げます。
+
+ライン沿いのラベルは、読みにくくなる場合は描画されずに非表示になります。
+
+- アンカーの左右に残っているラインよりもラベルが長い場合
+- ラベルが [`maxAngle`](#maxangle) を超えて曲がる場合
+
+これらの判定はカメラの移動に合わせて再実行されます。
+
+ライン沿いのラベルでは [`keepUpright`](#keepupright)、[`lineOffset`](#lineoffset)、[`spreadGlyphs`](#spreadglyphs) も使用できます。[`rotateWithCamera`](#rotatewithcamera)、[`spreadGlyphs`](#spreadglyphs)、[`textFacing`](#textfacing) をいずれも指定しない場合、ラベルは地表に寝かせてラインに沿って配置されます。これらの組み合わせで配置が決まります。
+
+| `rotateWithCamera` | `spreadGlyphs` | `textFacing` | 表示 |
+| --- | --- | --- | --- |
+| `false`（デフォルト） | `false`（デフォルト） | `"flat"`（デフォルト） | 単語がラインに沿って地表に寝かせて配置され、各単語はまっすぐのままです |
+| `false` | `true` | `"flat"` | 各文字が地表に寝かせて配置され、その下のラインの向きに合わせて回転します（MapLibre のデフォルトの道路名。`text-rotation-alignment` と `text-pitch-alignment` がともに `"map"`） |
+| `false` | どちらでも | `"upright"` | 文字（`spreadGlyphs` を指定しない場合は単語）は、アンカー位置での大きさのまま画面と同じ平面に表示されます。画面上に見えるラインに沿って間隔が決まり、それぞれ画面上でのラインの向きに合わせて回転します（`text-rotation-alignment: "map"` と `text-pitch-alignment: "viewport"`） |
+| `true` | `true` | どちらでも | 各文字はライン上に配置され、ポイントラベルと同じようにカメラに追従して回転します。間隔は画面上で決まります（`text-rotation-alignment: "viewport-glyph"`） |
+| `true` | `false` | どちらでも | ラベルは曲がらず、各アンカー位置にポイントラベルとまったく同じように、回転や背景も含めてまっすぐ描かれます（`text-rotation-alignment: "viewport"`） |
+
+まっすぐ描かれるラベルも [`spacing`](#spacing) ごとに繰り返し配置されますが、[`keepUpright`](#keepupright) による反転、[`maxAngle`](#maxangle) による判定、[`lineOffset`](#lineoffset) は適用されません。
+
+このオプションはジオメトリ構築時に適用されます。レイヤー作成時に指定してください。`layer.update()` では読み込み済みのラベルは再構築されないため、変更するにはレイヤーを削除して追加し直してください。
+
+**Default:** `"point"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line", // ラインに沿って繰り返し、曲がりに合わせて配置
+    textFacing: "flat"
+  }
+}
+```
+
+### rotateWithCamera
+
+**Type:** `boolean | undefined`
+
+**Description:** ラベルをカメラに合わせて回転させるか、地図に合わせて回転させるかを指定します。MapLibre の `text-rotation-alignment` に相当します（`true` が `"viewport"`、`false` が `"map"`）。
+
+`true` の場合、ラベルは画面上で常に左から右に読める向きになります。[`textFacing`](#textfacing) が `"upright"` のときは画面に正対するビルボードになります。`"flat"` のときは地表の法線を軸に回転し、テキストが常に左から右に読める向きになります。
+
+`false` の場合、ラベルは地図に合わせた向きになります。`"upright"` では画面と同じ平面に元の大きさのまま表示されますが、カメラの方位に合わせて回転し、x 軸が常に東を向きます。テキストは東西方向に沿って読む向きになり、北を上にした地図のラベルと同じく、カメラが南を向くと上下逆さまになります。`"flat"` では北を上にして地表に描かれ、地図とともに回転します。
+
+[`placement`](#placement) が `"line"` または `"line-center"` のとき、`false` ではラベルがラインに沿います。`true` では、[`spreadGlyphs`](#spreadglyphs) を指定しない限り、各アンカー位置にポイントラベルと同じようにまっすぐ描かれます。それぞれの配置は [`placement`](#placement) を参照してください。
+
+[`FeatureEvaluator`](../../api/feature-evaluator/) から地物ごとに指定することもできます。
+
+**Default:** `placement: "point"` では `true`、ライン沿いでは `false`（MapLibre の `"auto"`）
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat",
+    rotateWithCamera: false // 北を上にして地表に描く
+  }
+}
+```
+
+### rotation
+
+**Type:** `number | undefined`
+
+**Description:** ラベルを自身の平面内で、アンカー位置を中心に回転させる角度を度数で指定します。正面から見て時計回りです。回転は [`textFacing`](#textfacing) と [`rotateWithCamera`](#rotatewithcamera) で決まる向きに対して追加で適用されます。ビルボードでは画面上で回転し、地表のラベルでは方位角のように回転します。
+
+[`placement`](#placement) が `"line"` または `"line-center"` のときは、各文字がライン上の位置を保ったまま自身の中心を軸に回転します。MapLibre のライン沿いラベルでの `text-rotate` と同じ動作です。まっすぐ描かれるラベル（[`spreadGlyphs`](#spreadglyphs) を指定せず `rotateWithCamera: true` の場合）は、ポイントラベルと同じくアンカー位置を中心に全体が回転します。
+
+回転の中心がテキストのどこになるかは [`anchor`](#anchor) で決まります。たとえば `"center"` ならテキストの中央、`"bottom"` ならテキストブロックの下端が中心になります。
+
+[`FeatureEvaluator`](../../api/feature-evaluator/) から地物ごとに指定できるため、レイヤー内のラベルごとに異なる向きにできます。
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat",
+    rotateWithCamera: false,
+    rotation: 45, // 地表上で時計回りに 45 度回転
+    anchor: "center" // テキストの中央を軸に回転
   }
 }
 ```
@@ -531,6 +845,85 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### spacing
+
+**Type:** `number | undefined`
+
+**Description:** [`placement`](#placement) が `"line"` のときに繰り返し配置するラベルの間隔を、画面上のピクセルで指定します。単位は `geojson` ソースでも `vector-tile` ソースでも同じです。
+
+ライン上に表示するラベルは、カメラの移動に合わせて決め直されます。カメラを引くとラベルは間引かれ、近づくと間にラベルが追加されます。ラベルがラインに沿って移動することはなく、表示されるか消えるかのどちらかです。画面上の間隔は `spacing` の 1〜2 倍に保たれます。これは傾けた視点でも同様で、画面の手前側と奥側でそれぞれの密度になります。
+
+ラインの中間点のラベルは常に残り、画面上で `spacing` より短いラインにはそのラベルだけが配置されます。GeoJSON ソースで地表にごく近づいた場合（ストリートレベル）や、ベクタータイルが自身のズームレベルよりかなり深く表示されている場合（オーバーズーム）は、ラベルがそれ以上追加されなくなり、`spacing` より広い間隔になります。
+
+さらに、MapLibre の `symbol-spacing` と同じ次の規則が適用されます。
+
+- `spacing` の 4 分の 3 より長いラベルは、繰り返しの間隔が「ラベルの長さ + `spacing` の 4 分の 1」に広がります。長い名前は非表示にならず、間隔を空けて配置されます。
+- 同じタイル内で、同じテキストの先行ラベルから `spacing` の半分未満の距離にあるラベルは非表示になります。複数のラインに分かれた道路や、同じ名前の上下線に同じ場所で 2 度ラベルが付くことはありません。
+- ベクタータイルソースでは、各タイルは自身の範囲内にだけラベルを配置します。ラベルの間隔はタイルごとに決まるため、`spacing` をどれだけ大きくしても、繰り返しの間隔はおよそ 1 タイル分（画面上で 512〜1024 ピクセル）までになります。
+
+このオプションはジオメトリ構築時に適用されます。`layer.update()` では読み込み済みのラベルは再構築されないため、変更するにはレイヤーを削除して追加し直してください。
+
+**Default:** `250.0`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    spacing: 400
+  }
+}
+```
+
+### spreadGlyphs
+
+**Type:** `boolean | undefined`
+
+**Description:** ライン沿いに配置したラベルを、単語ごとではなく文字ごとに配置します。各文字の向きは [`rotateWithCamera`](#rotatewithcamera) によって決まります。
+
+- `false`（ライン沿いでのデフォルト）：各文字がその下のラインの向きに合わせて回転します。MapLibre の `symbol-placement: "line"` と同じ配置です。単語はまっすぐのままではなくカーブに沿って曲がり、急なカーブでは単語内の文字の間隔が開きます。
+- `true`：各文字は、同じ [`textFacing`](#textfacing) のポイントラベルと同じようにカメラに追従して回転します。ラインがどの向きでもテキストは読める向きに保たれます（MapLibre の `text-rotation-alignment: "viewport-glyph"`）。また、各文字は同じ大きさに保たれ、画面上に見えるラインに沿って間隔が決まります。そのため、カメラから遠ざかる向きのラインでも文字の間隔は均等に保たれます。`spreadGlyphs` を指定しない場合、`rotateWithCamera: true` ではラベルはまっすぐ描かれます。
+
+[`placement`](#placement) が `"line"` または `"line-center"` のときのみ使用されます。`layer.update()` で変更した値は、表示中のラベルにも反映されます。
+
+[`FeatureEvaluator`](../../api/feature-evaluator/) から地物ごとに指定することもできます。たとえば、レイヤーのほかのラベルは文字ごとに配置しつつ、筆記体のように文字がつながる文字体系やフォントのラベルだけを単語ごとに保てます。
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    geometryTypes: ["line"],
+    placement: "line",
+    textFacing: "flat",
+    rotateWithCamera: false, // MapLibre の道路名のようにラインに沿わせる
+    spreadGlyphs: true
+  }
+}
+```
+
+### standalone
+
+**Type:** `boolean | undefined`
+
+**Description:** 同じアンカーにあるレイヤーのビルボードが非表示のときに、このラベルを表示できるかを指定します。両方が `standalone` でない限り、レイヤーの同じ地物・同じアンカーのラベルとビルボードはペアとして一緒に判定され、互いに重なりの競合をしません。`false` の場合、ビルボードが配置できないとラベルも非表示になるため、両方を `false` にすると両方が表示されるか、どちらも表示されないかのどちらかになります。両方を `true` にすると独立して配置され、重なる場合は互いに競合します。[`declutter`](#declutter) が有効な場合にのみ意味を持ちます。MapLibre の `icon-optional` に相当します（`icon-optional: true` がラベルの `standalone: true` に対応します）。
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    standalone: false
+  }
+}
+```
+
 ### text
 
 **Type:** `string | undefined`
@@ -551,9 +944,9 @@ import { Color } from "@navaramap/three";
 
 ### textAlign
 
-**Type:** `string | undefined`
+**Type:** `"left" | "center" | "right" | "auto" | undefined`
 
-**Description:** 複数行テキストブロック内での行の水平方向の配置を指定します。`"left"`、`"center"`、`"right"` のいずれかを指定します。テキストが複数行になる場合（[`maxWidth`](#maxwidth) または明示的な `\n` 文字による）にのみ効果があります。
+**Description:** 複数行テキストブロック内での行の水平方向の配置を指定します。`"left"`、`"center"`、`"right"`、`"auto"` のいずれかを指定します。`"auto"` は [`anchor`](#anchor) の水平方向の側に行を揃えます。MapLibre の `text-justify: auto` と同じ動作です。[`FeatureEvaluator`](../../api/feature-evaluator/) から地物ごとに指定することもできます。テキストが複数行になる場合（[`maxWidth`](#maxwidth) または明示的な `\n` 文字による）にのみ効果があります。
 
 **Default:** `"center"`
 
@@ -563,6 +956,74 @@ import { Color } from "@navaramap/three";
 {
   text: {
     textAlign: "left"
+  }
+}
+```
+
+### textFacing
+
+**Type:** `"upright" | "flat" | undefined`
+
+**Description:** ラベルを画面と同じ平面に表示するか、地球表面に寝かせて表示するかを指定します。MapLibre の `text-pitch-alignment` に相当します（`"upright"` が `"viewport"`、`"flat"` が `"map"`）。`"upright"` のラベルは、カメラのピッチにかかわらず短縮されません。`"flat"` はラベルをアンカー位置の周辺で地球表面に沿わせて配置します。地球の曲率に沿うため、長いテキストでも両端が地表から浮き上がりません。寝かせたラベルは地表に描かれているように見え、カメラのピッチに応じて短縮されます。
+
+ポイントラベルでは、[`rotateWithCamera`](#rotatewithcamera) との組み合わせで、次の 4 通りの表示になります。
+
+| `textFacing` | `rotateWithCamera` | 表示 |
+| --- | --- | --- |
+| `"upright"` | `true` | 画面に正対するビルボード（デフォルト） |
+| `"upright"` | `false` | 画面と同じ平面に表示され、カメラの方位に合わせて回転し、テキストは東西方向に沿って読む向きになります（カメラが南を向くと上下逆さま） |
+| `"flat"` | `true` | 地表に描かれ、常に左から右に読める向きに回転します |
+| `"flat"` | `false` | 地表に描かれ、北を上にして地図とともに回転します |
+
+ライン沿いのラベルについては [`placement`](#placement) を参照してください。
+
+[`FeatureEvaluator`](../../api/feature-evaluator/) から `facing` として地物ごとに指定することもできます。
+
+**Default:** `"upright"`、`rotateWithCamera` が `false` の場合は `"flat"`（MapLibre の `"auto"`）
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textFacing: "flat"
+  }
+}
+```
+
+### translate
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** 描画されたラベルを画面上のピクセル数だけ移動します。MapLibre の `text-translate` と同じ動作です。`x` が正の値で右に、`y` が正の値で下に移動し、向きは [`translateAnchor`](#translateanchor) で決まります。移動はラベルを投影した後に適用されるため、距離にかかわらず同じピクセル数だけ移動し、[`rotation`](#rotation) とともには回転しません。デクラッタリングではラベルが描画される位置の領域が確保されます。
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    translate: { x: 0, y: -10 } // 10 px 上
+  }
+}
+```
+
+### translateAnchor
+
+**Type:** `"map" | "viewport" | undefined`
+
+**Description:** [`translate`](#translate) の向きの基準を指定します。`"map"` ではカメラの方位とともに回転し、`x` が正の値で東、`y` が正の値で南を向きます。`"viewport"` では画面の軸に従います。MapLibre の `"map"` とは異なり、カメラを傾けても移動量は短縮されません。
+
+**Default:** `"map"`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    translate: { x: 10, y: 0 },
+    translateAnchor: "viewport" // 方位にかかわらず画面上で 10 px 右
   }
 }
 ```
@@ -586,3 +1047,27 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### variableAnchors
+
+**Type:** `{ anchor: Anchor, offset?: Vec2 }[] | undefined`
+
+**Description:** ラベルが取りうる配置を指定します。[`declutter`](#declutter) が先頭から順に試し、空いている配置を使います。MapLibre の `text-variable-anchor-offset` と同じ動作です。各要素は [`anchor`](#anchor) と em 単位の [`offset`](#offset) の組です。使用中の配置を最初に試すため、ラベルは現在の位置がふさがったときだけ移動します。どの配置にも空きがなければラベルは非表示になりますが、[`overlap`](#overlap) が `"never"` 以外なら使用中の配置で描画されます。空でない場合は `anchor` と `offset` の代わりに使われます（ライン沿いに配置したラベルを除く）。`declutter` を使わない場合は先頭の要素が使われます。[`textAlign`](#textalign) が `"auto"` の場合、行は選ばれたアンカーの側に揃えられます。
+
+[`FeatureEvaluator`](../../api/feature-evaluator/) から地物ごとに指定することもできます。
+
+**Default:** `[]`
+
+**Example:**
+
+```typescript
+{
+  text: {
+    textAlign: "auto",
+    variableAnchors: [
+      { anchor: "left", offset: { x: 0.5, y: 0 } }, // 位置の右
+      { anchor: "right", offset: { x: -0.5, y: 0 } }, // 位置の左
+      { anchor: "top", offset: { x: 0, y: 0.5 } } // 位置の下
+    ]
+  }
+}
+```

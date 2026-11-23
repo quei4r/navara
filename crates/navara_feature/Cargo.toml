@@ -23,6 +23,7 @@ navara_memory.workspace = true
 navara_layer.workspace = true
 navara_mvt.workspace = true
 navara_worker.workspace = true
+navara_worker_component.workspace = true
 navara_component.workspace = true
 navara_camera.workspace = true
 navara_occluder.workspace = true

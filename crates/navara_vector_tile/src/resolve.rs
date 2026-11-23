@@ -55,7 +55,7 @@ pub struct ResolvedVectorTile {
 
 /// One WebMercator texturized-vector tile to drape on a terrain tile, flattened across
 /// layers for the wasm boundary (one entry per overlapping WM vector tile per layer).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedVectorTileState {
     pub layer_id: String,
     pub tile_handle: TileHandle,

@@ -40,6 +40,7 @@ export class SkyMeshDesc extends MeshDesc<
     const skyOptions: SkyMeshOptions = this.config.sky ?? {};
 
     const skyMesh = new SkyMesh(skyOptions);
+    skyMesh.raw.material.ellipsoid = this.view.atmosphere.ellipsoid;
     this._skyMesh = skyMesh;
 
     // Set up atmosphere integration. The sky shader samples the irradiance
@@ -65,6 +66,8 @@ export class SkyMeshDesc extends MeshDesc<
       if (updates.sky.envMap !== undefined) {
         this.config.sky.envMap = updates.sky.envMap;
         this.onPassKeyChange();
+        this._skyMesh.sun = this.config.sky.sun ?? !updates.sky.envMap;
+        this._skyMesh.moon = this.config.sky.moon ?? !updates.sky.envMap;
       }
 
       // Update individual properties

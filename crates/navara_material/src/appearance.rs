@@ -1,11 +1,9 @@
 use bevy_ecs::{component::Component, entity::Entity};
 use navara_core::{CRS, ElevationDecoder, calc_transform};
-use navara_geometry::TileUvTransform;
+use navara_geometry::{ExtrusionBase, TileUvTransform};
 use navara_math::{Transform, Vec2, Vec3};
 
-/// Configuration for elevation heatmap rendering.
-/// Shared across all elevation heatmap layers in a tile.
-/// Note: color_map_lut is now stored in Globe.elevation_colormap
+/// Configuration for elevation heatmap rendering (one per elevation heatmap layer).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElevationHeatmapConfig {
     pub max_height: f64,
@@ -13,6 +11,28 @@ pub struct ElevationHeatmapConfig {
 
     pub logarithmic: bool,
     pub log_boundary: f64,
+
+    /// Texture filter mode: "linear" for bilinear interpolation, "nearest" for nearest neighbor
+    pub filter: String,
+
+    /// Hashes of the layer's `colorMap` / `colorStops`. The arrays themselves
+    /// live on the web side (ColorMapAtlas); Rust only tracks that they
+    /// changed, so a colorMap-only update still fails the per-tile material
+    /// comparison in `update_mesh_material` and re-composites exactly the
+    /// tiles that draw this layer.
+    pub color_map_hash: Option<u64>,
+    pub color_stops_hash: Option<u64>,
+}
+
+/// Complete data for one elevation heatmap layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElevationHeatmapLayerData {
+    /// Layer ID used for colorMap atlas row lookup
+    pub layer_id: String,
+    /// Elevation heatmap configuration (min/max height, logarithmic scaling, filter mode, etc.)
+    pub config: ElevationHeatmapConfig,
+    /// DEM decoder resolved from this layer's source
+    pub decoder: ElevationDecoder,
 }
 
 /// Configuration for hillshade rendering.
@@ -31,7 +51,9 @@ pub struct HillshadeConfig {
 /// appearances consume [`SourceGeometryType::Point`], polyline consumes
 /// [`SourceGeometryType::Line`]). Opting extra entries into a material's
 /// `geometry_types` derives additional representations: polygon boundary
-/// rings render as polylines, and line/polygon vertices render as points.
+/// rings render as polylines, line vertices render as points, and polygons
+/// render as one label per polygon (text, billboards) or one marker per ring
+/// vertex (points) — see [`Placement`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceGeometryType {
     Point,
@@ -56,6 +78,292 @@ impl SourceGeometryType {
             Self::Point => "point",
             Self::Line => "line",
             Self::Polygon => "polygon",
+        }
+    }
+}
+
+/// Shape of the ends of a polyline and of its dashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineCap {
+    /// The line and each dash end squarely at their end points.
+    #[default]
+    Butt,
+    /// The line and each dash end in a half circle one half line width in
+    /// radius, centered on the end point. A zero-length dash becomes a dot.
+    Round,
+    /// The line ends half a line width past its end points, squarely; the
+    /// dashes end like [`LineCap::Butt`].
+    Square,
+}
+
+impl LineCap {
+    /// Parse the JS-facing name (`"butt" | "round" | "square"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "butt" => Some(Self::Butt),
+            "round" => Some(Self::Round),
+            "square" => Some(Self::Square),
+            _ => None,
+        }
+    }
+
+    /// JS-facing name of this cap.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Butt => "butt",
+            Self::Round => "round",
+            Self::Square => "square",
+        }
+    }
+}
+
+/// `waveStrength` of a water surface that does not set one.
+pub const DEFAULT_WAVE_STRENGTH: f32 = 5.0;
+
+/// Extent of a water body, which bounds how far the wind blows over it and so
+/// how large its waves grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaterScale {
+    /// Open sea: the waves grow as large as the wind allows.
+    #[default]
+    Ocean,
+    /// A bay or a large lake, about 20 km across.
+    Large,
+    /// A lake or a wide river, about 2 km across.
+    Medium,
+    /// A river or a pond, about 200 m across.
+    Small,
+}
+
+impl WaterScale {
+    /// Parse the JS-facing name (`"ocean" | "large" | "medium" | "small"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ocean" => Some(Self::Ocean),
+            "large" => Some(Self::Large),
+            "medium" => Some(Self::Medium),
+            "small" => Some(Self::Small),
+            _ => None,
+        }
+    }
+
+    /// JS-facing name of this scale.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ocean => "ocean",
+            Self::Large => "large",
+            Self::Medium => "medium",
+            Self::Small => "small",
+        }
+    }
+}
+
+/// Plane a label or sprite quad lies in.
+///
+/// Orthogonal to the material's `rotate_with_camera`, which picks what the
+/// quad turns with inside that plane (MapLibre's `*-rotation-alignment`).
+/// Left unset on a material, it resolves to [`Facing::Flat`] when
+/// `rotate_with_camera` resolves to `false` and [`Facing::Upright`]
+/// otherwise, as MapLibre resolves `auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Facing {
+    /// The quad lies in the screen plane, never foreshortened however the
+    /// camera is pitched (MapLibre's `viewport`). With `rotate_with_camera`
+    /// it reads left-to-right on screen; without, it turns with the camera
+    /// heading so its x-axis keeps pointing east.
+    #[default]
+    Upright,
+    /// The quad lies on the globe surface around the label's anchor,
+    /// following its curvature, so the label reads as painted onto the globe
+    /// and foreshortens with camera pitch.
+    Flat,
+}
+
+impl Facing {
+    /// Parse the JS-facing name (`"upright" | "flat"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "upright" => Some(Self::Upright),
+            "flat" => Some(Self::Flat),
+            _ => None,
+        }
+    }
+
+    /// JS-facing name of this facing mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upright => "upright",
+            Self::Flat => "flat",
+        }
+    }
+}
+
+/// How a label or sprite is positioned relative to the geometry it was derived
+/// from.
+///
+/// Only meaningful once the appearance opts into line or polygon geometry
+/// through `geometry_types`; point geometry always places at the point itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// Text and billboards get one anchor per line string, at its first
+    /// vertex, and one per polygon, at its pole of inaccessibility, as
+    /// MapLibre places a point-placed symbol. Points get one marker per line
+    /// vertex and per polygon-ring vertex, as a MapLibre circle layer draws
+    /// them.
+    #[default]
+    Point,
+    /// Anchors repeated along the line, or each polygon ring, at `spacing`
+    /// intervals.
+    Line,
+    /// A single anchor at the arc-length midpoint of the line, or of each
+    /// polygon ring.
+    LineCenter,
+}
+
+impl Placement {
+    /// Parse the JS-facing name (`"point" | "line" | "line-center"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "point" => Some(Self::Point),
+            "line" => Some(Self::Line),
+            "line-center" => Some(Self::LineCenter),
+            _ => None,
+        }
+    }
+
+    /// JS-facing name of this placement mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Point => "point",
+            Self::Line => "line",
+            Self::LineCenter => "line-center",
+        }
+    }
+}
+
+/// Whether a decluttered label or sprite may be drawn over symbols placed
+/// before it (MapLibre's `*-overlap`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overlap {
+    /// Hidden when it collides with any symbol placed before it.
+    #[default]
+    Never,
+    /// Shown whatever it collides with.
+    Always,
+    /// Hidden only when it collides with a symbol placed with [`Overlap::Never`].
+    Cooperative,
+}
+
+impl Overlap {
+    /// Parse the JS-facing name (`"never" | "always" | "cooperative"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "never" => Some(Self::Never),
+            "always" => Some(Self::Always),
+            "cooperative" => Some(Self::Cooperative),
+            _ => None,
+        }
+    }
+
+    /// JS-facing name of this overlap mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Always => "always",
+            Self::Cooperative => "cooperative",
+        }
+    }
+}
+
+/// Part of a label or sprite placed at its anchor point (MapLibre's
+/// `text-anchor` / `icon-anchor`).
+///
+/// For a sprite it names a point on the quad's edge or its middle. For text
+/// it names a point on the block's box: as wide as its widest line, and
+/// spanning one line height per line, centered on the font's midline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Anchor {
+    #[default]
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Anchor {
+    /// Parse the JS-facing name (`"center" | "left" | … | "bottom-right"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "center" => Some(Self::Center),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "top" => Some(Self::Top),
+            "bottom" => Some(Self::Bottom),
+            "top-left" => Some(Self::TopLeft),
+            "top-right" => Some(Self::TopRight),
+            "bottom-left" => Some(Self::BottomLeft),
+            "bottom-right" => Some(Self::BottomRight),
+            _ => None,
+        }
+    }
+
+    /// JS-facing name of this anchor.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::TopLeft => "top-left",
+            Self::TopRight => "top-right",
+            Self::BottomLeft => "bottom-left",
+            Self::BottomRight => "bottom-right",
+        }
+    }
+}
+
+/// One placement a label may take: the part of the block placed at the anchor
+/// point and the shift after it (MapLibre's `text-variable-anchor-offset`
+/// entry).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VariableAnchor {
+    pub anchor: Anchor,
+    /// Shift from the anchor point, x right and y down, in ems.
+    pub offset: Vec2,
+}
+
+/// Frame a label's or sprite's `translate` is measured in (MapLibre's
+/// `*-translate-anchor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranslateAnchor {
+    /// Turns with the map: +x points east and +y south on screen.
+    #[default]
+    Map,
+    /// Fixed to the screen: +x right and +y down.
+    Viewport,
+}
+
+impl TranslateAnchor {
+    /// Parse the JS-facing name (`"map" | "viewport"`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "map" => Some(Self::Map),
+            "viewport" => Some(Self::Viewport),
+            _ => None,
+        }
+    }
+
+    /// JS-facing name of this frame.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::Viewport => "viewport",
         }
     }
 }
@@ -117,11 +425,45 @@ pub struct PointMaterial {
     pub show: bool,
     pub size: f32,
     pub color: u32,
-    pub center: Vec2,
+    /// Plane the point's quad lies in. See [`Facing`]; `None` resolves from
+    /// `rotate_with_camera`.
+    pub point_facing: Option<Facing>,
+    /// Whether the quad turns to follow the camera. See
+    /// [`TextMaterial::rotate_with_camera`] — the semantics are identical.
+    pub rotate_with_camera: Option<bool>,
+    /// Rotation of the point within its own plane, about its anchor point,
+    /// in degrees, clockwise seen from the front. Default `0.0`.
+    pub rotation: f32,
+    /// How anchors are derived from line and polygon geometry. See
+    /// [`TextMaterial::placement`]. Default [`Placement::Point`].
+    pub placement: Placement,
+    /// Distance between repeated anchors along a line, in screen pixels. See
+    /// [`TextMaterial::spacing`]. Default `250.0`.
+    pub spacing: f32,
+    /// Add the line's tangent bearing at the anchor to `rotation`, so the
+    /// sprite turns with the line it sits on. Only used by
+    /// [`Placement::Line`]/[`Placement::LineCenter`]. Default `true`.
+    pub rotate_to_line: bool,
+    /// Part of the quad placed at the anchor point. Default [`Anchor::Center`].
+    pub anchor: Anchor,
+    /// Shift from the anchor point, x right and y down, in the unit of `size`
+    /// (meters when `size_in_meters`, pixels otherwise). Lies in the quad's
+    /// own plane, so it turns with `rotation`. Default `(0, 0)`.
+    pub offset: Vec2,
+    /// Screen-pixel shift of the drawn quad, x right and y down, applied after
+    /// projection so it stays the same number of pixels at any distance
+    /// (MapLibre's `icon-translate`). Default `(0, 0)`.
+    pub translate: Vec2,
+    /// Frame `translate` is measured in. Default [`TranslateAnchor::Map`].
+    pub translate_anchor: TranslateAnchor,
     pub height: f32,
     pub size_in_meters: bool,
     pub clamp_to_ground: bool,
     pub depth_test: bool,
+    /// Cull faces seen from behind. Off by default. Only a flat quad has a
+    /// back the camera can see: the parts of a large one wrapped over the
+    /// limb face away past the horizon, and culling trims them there.
+    pub backface_culling: bool,
     pub offset_depth: bool,
     // Allow transparency and anti-aliasing.
     pub transparent: bool,
@@ -130,12 +472,27 @@ pub struct PointMaterial {
     /// on screen, lower-priority ones are hidden. Enabled by default; set to
     /// `false` to draw every label unconditionally.
     pub declutter: bool,
+    /// Coarse placement order for decluttering, compared before
+    /// `declutter_priority`: every label with a higher rank is placed before
+    /// any label with a lower one. Only meaningful when `declutter` is enabled.
+    pub declutter_rank: f32,
     /// Placement priority for decluttering; higher wins. Only meaningful when
     /// `declutter` is enabled.
     pub declutter_priority: f32,
+    /// Extra space around the collision box, in screen pixels, as
+    /// `[top, right, bottom, left]`. Only meaningful when `declutter` is
+    /// enabled. Default `2.0` on every side.
+    pub declutter_padding: [f32; 4],
+    /// Whether the label may be drawn over symbols placed before it. Only
+    /// meaningful when `declutter` is enabled. Default [`Overlap::Never`].
+    pub overlap: Overlap,
+    /// Leave this label's box out of the collision grid, so symbols placed
+    /// after it may overlap it. Only meaningful when `declutter` is enabled.
+    /// Default `false`.
+    pub ignore_placement: bool,
     /// Source geometry types this appearance consumes. Defaults to the native
     /// geometry only; opting in `Line`/`Polygon` also emits a point per
-    /// line-string / polygon-ring vertex.
+    /// line-string / polygon-ring vertex, or along them with `placement`.
     pub geometry_types: Vec<SourceGeometryType>,
     // post effect
     pub effect_ids: Option<Vec<String>>,
@@ -149,16 +506,30 @@ impl Default for PointMaterial {
             show: true,
             size: 0.1,
             color: 0xffffff,
-            center: Vec2::new(0.0, 0.),
+            point_facing: None,
+            rotate_with_camera: None,
+            rotation: 0.0,
+            placement: Placement::Point,
+            spacing: 250.0,
+            rotate_to_line: true,
+            anchor: Anchor::Center,
+            offset: Vec2::ZERO,
+            translate: Vec2::ZERO,
+            translate_anchor: TranslateAnchor::Map,
             clamp_to_ground: true,
             height: 1.,
             size_in_meters: true,
             depth_test: true,
+            backface_culling: false,
             offset_depth: true,
             transparent: true,
             opacity: 1.0,
             declutter: true,
+            declutter_rank: 0.0,
             declutter_priority: 0.0,
+            declutter_padding: [2.0; 4],
+            overlap: Overlap::Never,
+            ignore_placement: false,
             geometry_types: vec![SourceGeometryType::Point],
             // post effect
             effect_ids: None,
@@ -182,12 +553,51 @@ pub struct BillboardMaterial {
     pub show: bool,
     pub size: f32,
     pub color: u32,
-    pub center: Vec2,
+    /// Plane the sprite's quad lies in. See [`Facing`]; `None` resolves from
+    /// `rotate_with_camera`.
+    pub billboard_facing: Option<Facing>,
+    /// Whether the quad turns to follow the camera. See
+    /// [`TextMaterial::rotate_with_camera`] — the semantics are identical.
+    pub rotate_with_camera: Option<bool>,
+    /// Rotation of the sprite within its own plane, about its anchor point,
+    /// in degrees, clockwise seen from the front. Default `0.0`.
+    pub rotation: f32,
+    /// How anchors are derived from line and polygon geometry. See
+    /// [`TextMaterial::placement`]. Default [`Placement::Point`].
+    pub placement: Placement,
+    /// Distance between repeated anchors along a line, in screen pixels. See
+    /// [`TextMaterial::spacing`]. Default `250.0`.
+    pub spacing: f32,
+    /// Add the line's tangent bearing at the anchor to `rotation`, so the
+    /// sprite turns with the line it sits on. Only used by
+    /// [`Placement::Line`]/[`Placement::LineCenter`]. Default `true`.
+    pub rotate_to_line: bool,
+    /// Part of the quad placed at the anchor point. Default [`Anchor::Center`].
+    pub anchor: Anchor,
+    /// Shift from the anchor point, x right and y down, in the unit of `size`
+    /// (meters when `size_in_meters`, pixels otherwise). Lies in the quad's
+    /// own plane, so it turns with `rotation`. Default `(0, 0)`.
+    pub offset: Vec2,
+    /// Screen-pixel shift of the drawn quad, x right and y down, applied after
+    /// projection so it stays the same number of pixels at any distance
+    /// (MapLibre's `icon-translate`). Default `(0, 0)`.
+    pub translate: Vec2,
+    /// Frame `translate` is measured in. Default [`TranslateAnchor::Map`].
+    pub translate_anchor: TranslateAnchor,
     pub height: f32,
     pub url: String,
     pub size_in_meters: bool,
+    /// `size` scales the image's own pixel height instead of being the quad's
+    /// height (MapLibre's `icon-size`): `1.0` draws the image at its natural
+    /// size, in pixels, or a meter per image pixel with `size_in_meters`.
+    /// `offset` stays in the unit of `size_in_meters`. Default `false`.
+    pub size_relative_to_image: bool,
     pub clamp_to_ground: bool,
     pub depth_test: bool,
+    /// Cull faces seen from behind. Off by default. Only a flat quad has a
+    /// back the camera can see: the parts of a large one wrapped over the
+    /// limb face away past the horizon, and culling trims them there.
+    pub backface_culling: bool,
     pub offset_depth: bool,
     // Allow transparency and anti-aliasing.
     pub transparent: bool,
@@ -197,12 +607,33 @@ pub struct BillboardMaterial {
     /// on screen, lower-priority ones are hidden. Enabled by default; set to
     /// `false` to draw every label unconditionally.
     pub declutter: bool,
+    /// Coarse placement order for decluttering, compared before
+    /// `declutter_priority`: every label with a higher rank is placed before
+    /// any label with a lower one. Only meaningful when `declutter` is enabled.
+    pub declutter_rank: f32,
     /// Placement priority for decluttering; higher wins. Only meaningful when
     /// `declutter` is enabled.
     pub declutter_priority: f32,
+    /// Extra space around the collision box, in screen pixels, as
+    /// `[top, right, bottom, left]`. Only meaningful when `declutter` is
+    /// enabled. Default `2.0` on every side.
+    pub declutter_padding: [f32; 4],
+    /// Whether the label may be drawn over symbols placed before it. Only
+    /// meaningful when `declutter` is enabled. Default [`Overlap::Never`].
+    pub overlap: Overlap,
+    /// Leave this label's box out of the collision grid, so symbols placed
+    /// after it may overlap it. Only meaningful when `declutter` is enabled.
+    /// Default `false`.
+    pub ignore_placement: bool,
+    /// Whether the billboard may show while the layer's label at the same
+    /// anchor is hidden. With `false` on both, a billboard and the label of
+    /// the same feature and anchor are placed together. Only meaningful when
+    /// `declutter` is enabled. Default `true`.
+    pub standalone: bool,
     /// Source geometry types this appearance consumes. Defaults to the native
-    /// geometry only; opting in `Line`/`Polygon` also emits a billboard per
-    /// line-string / polygon-ring vertex.
+    /// geometry only; opting in `Line` also emits a billboard per line string,
+    /// at its first vertex, and `Polygon` one per polygon — or along either
+    /// with `placement`.
     pub geometry_types: Vec<SourceGeometryType>,
     // post effect
     pub effect_ids: Option<Vec<String>>,
@@ -216,18 +647,34 @@ impl Default for BillboardMaterial {
             show: true,
             size: 0.1,
             color: 0xffffff,
-            center: Vec2::new(0.0, 0.),
+            billboard_facing: None,
+            rotate_with_camera: None,
+            rotation: 0.0,
+            placement: Placement::Point,
+            spacing: 250.0,
+            rotate_to_line: true,
+            anchor: Anchor::Center,
+            offset: Vec2::ZERO,
+            translate: Vec2::ZERO,
+            translate_anchor: TranslateAnchor::Map,
             clamp_to_ground: true,
             height: 1.,
             url: "".to_string(),
             size_in_meters: true,
+            size_relative_to_image: false,
             depth_test: true,
+            backface_culling: false,
             offset_depth: true,
             transparent: false,
             opacity: 1.0,
             alpha_test: 0.1,
             declutter: true,
+            declutter_rank: 0.0,
             declutter_priority: 0.0,
+            declutter_padding: [2.0; 4],
+            overlap: Overlap::Never,
+            ignore_placement: false,
+            standalone: true,
             geometry_types: vec![SourceGeometryType::Point],
             // post effect
             effect_ids: None,
@@ -251,11 +698,93 @@ pub struct TextMaterial {
     pub show: bool,
     pub size: f32,
     pub color: u32,
-    pub center: Vec2,
+    /// Part of the text block placed at the anchor point. Default
+    /// [`Anchor::Center`].
+    pub anchor: Anchor,
+    /// Shift from the anchor point, x right and y down, in ems (multiples of
+    /// `size`). Lies in the label's own plane, so it turns with `rotation`.
+    /// Default `(0, 0)`.
+    pub offset: Vec2,
+    /// Placements the declutter pass tries in order, keeping the first whose
+    /// box is free; the one in use is tried first, so a label only moves when
+    /// it must. Overrides `anchor` and `offset` when not empty, except along a
+    /// line. Without declutter the first is used. Default empty.
+    pub variable_anchors: Vec<VariableAnchor>,
+    /// Screen-pixel shift of the drawn label, x right and y down, applied after
+    /// projection so it stays the same number of pixels at any distance
+    /// (MapLibre's `text-translate`). Default `(0, 0)`.
+    pub translate: Vec2,
+    /// Frame `translate` is measured in. Default [`TranslateAnchor::Map`].
+    pub translate_anchor: TranslateAnchor,
+    /// Plane the label's quad lies in. See [`Facing`]; `None` resolves from
+    /// `rotate_with_camera`.
+    pub text_facing: Option<Facing>,
+    /// Rotation of the label within its own plane, about its anchor point, in
+    /// degrees, clockwise seen from the front. Applied on top of whatever
+    /// orientation `text_facing` and `rotate_with_camera` resolve to, so it
+    /// spins a billboard on screen and turns a surface label like a compass
+    /// bearing. `anchor` decides where inside the text the pivot sits. Along
+    /// a line each glyph spins about its own point on the line instead,
+    /// except for a straight label, which turns as a whole. Default `0.0`.
+    pub rotation: f32,
+    /// Whether the quad turns with the camera or with the map (MapLibre's
+    /// `*-rotation-alignment`: `viewport` or `map`).
+    ///
+    /// `true` keeps the label reading left-to-right: with [`Facing::Upright`]
+    /// that is the screen-aligned billboard, and with [`Facing::Flat`] the
+    /// quad yaws around the surface normal.
+    ///
+    /// `false` aligns it with the map: [`Facing::Upright`] stays on screen
+    /// but turns with the camera heading, [`Facing::Flat`] is a north-up
+    /// label painted on the surface. Along a line, the label follows the line.
+    ///
+    /// `None` resolves to `true` for [`Placement::Point`] and `false` for the
+    /// along-line placements, as MapLibre resolves `auto`.
+    pub rotate_with_camera: Option<bool>,
+    /// How anchors are derived from line and polygon geometry. See
+    /// [`Placement`]. Requires `geometry_types` to include `Line` or
+    /// `Polygon`; ignored otherwise. Default [`Placement::Point`].
+    pub placement: Placement,
+    /// Distance between repeated anchors along a line, in screen pixels, for
+    /// every source. The line gets nested levels of anchors and the renderer
+    /// shows, per anchor, the level whose spacing on screen is the smallest at
+    /// least this — see `navara_parser::line_placement`. A symbol longer than
+    /// three quarters of it asks for its own length plus a quarter of it
+    /// instead, and text also drops a repeat of the same name within half of
+    /// it, both as MapLibre resolves `symbol-spacing`. Default `250.0`,
+    /// matching MapLibre's default.
+    pub spacing: f32,
+    /// Largest turn, in degrees, the line may make under the label within a
+    /// window of about one and a half ems before the label is dropped as
+    /// unreadable. Measured over that sliding window rather than per glyph or
+    /// over the whole label: a few small corners close together add up and
+    /// are rejected, while a long gentle curve is accepted however far it
+    /// turns in total. Default `45.0`.
+    pub max_angle: f32,
+    /// Flip a label that would otherwise read right-to-left, so street names
+    /// stay legible whichever way the underlying line runs. Default `true`.
+    pub keep_upright: bool,
+    /// Place each glyph of an along-line label on its own instead of each
+    /// word. With `rotate_with_camera` off each glyph turns with the line
+    /// under it (MapLibre's `symbol-placement: "line"`); on, each glyph turns
+    /// to the camera like a point label and is spaced on the screen (MapLibre's
+    /// `viewport-glyph`). Off with `rotate_with_camera` on, the label is not
+    /// bent at all but drawn straight at its anchor (MapLibre's `viewport`).
+    /// Can be overridden per feature. Default `false`.
+    pub spread_glyphs: bool,
+    /// Offset perpendicular to the line, in the same units as the font size:
+    /// pixels, or metres when `size_in_meters` is set. Positive is to the left
+    /// of the direction of travel. Lets a name sit above the road rather than
+    /// on it. Default `0.0`.
+    pub line_offset: f32,
     pub height: f32,
     pub size_in_meters: bool,
     pub clamp_to_ground: bool,
     pub depth_test: bool,
+    /// Cull faces seen from behind. Off by default. Only a flat quad has a
+    /// back the camera can see: the parts of a large one wrapped over the
+    /// limb face away past the horizon, and culling trims them there.
+    pub backface_culling: bool,
     pub offset_depth: bool,
     pub text: String,
     pub font: String,
@@ -265,11 +794,17 @@ pub struct TextMaterial {
     // pub corner_radius: f32, // 0 ~ 0.5, the ratio of the corner radius to the height
     // pub padding: Vec2,
     // outline
-    // pub outline_blur: f32,    // outlineBlur Defalut:0
-    pub outline_color: u32, // outlineColor Defalut:black
+    /// Width over which the outline's outer edge fades out, centered on that
+    /// edge, in the unit of `outline_width`. Default `0.0`.
+    pub outline_blur: f32,
+    /// Default black.
+    pub outline_color: u32,
     // pub outline_offset: Vec2, // outlineOffset Default: (0,0)
-    pub outline_opacity: f32, // outlineOpacity Default:1
-    pub outline_width: f32,   // outlineWidth Default:0
+    /// From 0 to 1. Default `1.0`.
+    pub outline_opacity: f32,
+    /// Outline thickness in 1/64 em: pixels of text drawn 64 pixels tall.
+    /// Default `0.0`.
+    pub outline_width: f32,
     pub lang: String,
     /// Enable high-quality glyph rendering. When `true`, text uses an MTSDF
     /// atlas via `fdsm` — preserves sharp corners at large sizes but per-glyph
@@ -288,23 +823,51 @@ pub struct TextMaterial {
     /// characters in `text` always break lines. Em units keep the wrap width
     /// stable whether `size_in_meters` is on or off.
     pub max_width: f32,
-    /// Line height as a multiplier of the font's natural line height
-    /// (ascender − descender + line gap). Default `1.0`.
-    pub line_height: f32,
+    /// Distance between the baselines of a multi-line label, in ems
+    /// (multiples of `size`). `None` (the default) uses the font's natural
+    /// line height (ascender − descender + line gap).
+    pub line_height: Option<f32>,
     /// Horizontal alignment of lines within a multi-line block:
-    /// `"left"`, `"center"` (default), or `"right"`.
+    /// `"left"`, `"center"` (default), `"right"`, or `"auto"`, which aligns
+    /// towards the horizontal side of `anchor`.
     pub text_align: String,
+    /// Extra space between characters, in ems (multiples of `size`). Applied
+    /// between shaping clusters, never after the last one, so alignment is
+    /// unaffected; ignored for Arabic-script text, where tracking would break
+    /// cursive joining. Negative values tighten. Default `0.0`.
+    pub letter_spacing: f32,
 
     /// Participate in screen-space decluttering: when labels/sprites overlap
     /// on screen, lower-priority ones are hidden. Enabled by default; set to
     /// `false` to draw every label unconditionally.
     pub declutter: bool,
+    /// Coarse placement order for decluttering, compared before
+    /// `declutter_priority`: every label with a higher rank is placed before
+    /// any label with a lower one. Only meaningful when `declutter` is enabled.
+    pub declutter_rank: f32,
     /// Placement priority for decluttering; higher wins. Only meaningful when
     /// `declutter` is enabled.
     pub declutter_priority: f32,
+    /// Extra space around the collision box, in screen pixels, as
+    /// `[top, right, bottom, left]`. Only meaningful when `declutter` is
+    /// enabled. Default `2.0` on every side.
+    pub declutter_padding: [f32; 4],
+    /// Whether the label may be drawn over symbols placed before it. Only
+    /// meaningful when `declutter` is enabled. Default [`Overlap::Never`].
+    pub overlap: Overlap,
+    /// Leave this label's box out of the collision grid, so symbols placed
+    /// after it may overlap it. Only meaningful when `declutter` is enabled.
+    /// Default `false`.
+    pub ignore_placement: bool,
+    /// Whether the label may show while the layer's billboard at the same
+    /// anchor is hidden. With `false` on both, a label and the billboard of
+    /// the same feature and anchor are placed together. Only meaningful when
+    /// `declutter` is enabled. Default `true`.
+    pub standalone: bool,
     /// Source geometry types this appearance consumes. Defaults to the native
-    /// geometry only; opting in `Line`/`Polygon` also emits a label per
-    /// line-string / polygon-ring vertex.
+    /// geometry only; opting in `Line` also emits a label per line string, at
+    /// its first vertex, and `Polygon` one per polygon — or along either with
+    /// `placement`.
     pub geometry_types: Vec<SourceGeometryType>,
     // post effect
     pub effect_ids: Option<Vec<String>>,
@@ -318,11 +881,25 @@ impl Default for TextMaterial {
             show: true,
             size: 10.0,
             color: 0xffffff,
-            center: Vec2::new(0.5, 0.),
+            anchor: Anchor::Center,
+            offset: Vec2::ZERO,
+            variable_anchors: Vec::new(),
+            translate: Vec2::ZERO,
+            translate_anchor: TranslateAnchor::Map,
+            text_facing: None,
+            rotate_with_camera: None,
+            rotation: 0.0,
+            placement: Placement::Point,
+            spacing: 250.0,
+            max_angle: 45.0,
+            keep_upright: true,
+            spread_glyphs: false,
+            line_offset: 0.0,
             clamp_to_ground: true,
             height: 1.,
             size_in_meters: true,
             depth_test: true,
+            backface_culling: false,
             offset_depth: true,
             text: "".to_string(),
             font: "".to_string(),
@@ -331,7 +908,7 @@ impl Default for TextMaterial {
             border_width: 0.05,
             // corner_radius: 0.1,
             // padding: Vec2::new(5.0, 2.0),
-            // outline_blur: 0.0,
+            outline_blur: 0.0,
             outline_color: 0x000000,
             // outline_offset: Vec2::new(0.0, 0.0),
             outline_opacity: 1.0,
@@ -343,11 +920,17 @@ impl Default for TextMaterial {
             transparent: true,
 
             max_width: 0.0,
-            line_height: 1.0,
+            line_height: None,
             text_align: "center".to_string(),
+            letter_spacing: 0.0,
 
             declutter: true,
+            declutter_rank: 0.0,
             declutter_priority: 0.0,
+            declutter_padding: [2.0; 4],
+            overlap: Overlap::Never,
+            ignore_placement: false,
+            standalone: true,
             geometry_types: vec![SourceGeometryType::Point],
             // post effect
             effect_ids: None,
@@ -375,8 +958,19 @@ pub struct PolylineMaterial {
     pub color: u32,
     pub width: f32,
     pub max_width: f32,
+    /// Alternating dash and gap lengths in line widths, repeated along the
+    /// line. `None` draws a solid line.
+    pub dash_array: Option<Vec<f32>>,
+    /// Shape of the ends of the line and of its dashes.
+    pub cap: LineCap,
     pub clamp_to_ground: bool,
     pub tiled: bool,
+    /// Edges of the tiled path follow the geodesic, and consecutive vertices
+    /// more than 180° apart in longitude take the short way. When `false`,
+    /// edges are straight lines in Web Mercator and longitudes are used as
+    /// given, as in MapLibre. Resolved per layer by the GeoJSON tiler; the
+    /// non-tiled path ignores it.
+    pub geodesic: bool,
     pub height: f32,
     /// Source geometry types this appearance consumes. Defaults to the native
     /// geometry only; opting in `Polygon` also renders polygon boundary rings
@@ -406,8 +1000,11 @@ impl Default for PolylineMaterial {
             color: 0xffffff,
             width: 1.,
             max_width: 10000.,
+            dash_array: None,
+            cap: LineCap::Butt,
             clamp_to_ground: true,
             tiled: false,
+            geodesic: true,
             height: 1.,
             geometry_types: vec![SourceGeometryType::Line],
             internal: None,
@@ -447,6 +1044,12 @@ pub struct PolygonMaterial {
     pub color: u32,
     pub clamp_to_ground: bool,
     pub tiled: bool,
+    /// Edges of the tiled path follow the geodesic, and consecutive vertices
+    /// more than 180° apart in longitude take the short way. When `false`,
+    /// edges are straight lines in Web Mercator and longitudes are used as
+    /// given, as in MapLibre. Resolved per layer by the GeoJSON tiler; the
+    /// non-tiled path ignores it.
+    pub geodesic: bool,
     pub height: f32,
     pub extruded_height: Option<f32>,
     pub wireframe: bool,
@@ -454,6 +1057,8 @@ pub struct PolygonMaterial {
     pub roughness: f32,
     pub internal: Option<PolygonInternalMaterial>,
     pub per_position_height: bool,
+    /// What the bottom follows when `per_position_height` is set.
+    pub extrusion_base: ExtrusionBase,
     pub opacity: f32,
     pub transparent: bool,
 
@@ -464,13 +1069,23 @@ pub struct PolygonMaterial {
     pub outline_width: f32,
 
     pub water: bool,
-    pub water_scale_normal: f32,
-    pub water_speed: f32,
+    /// Scales the water's wave slopes; 0 is a flat mirror.
+    pub wave_exaggeration: f32,
+    /// Extent of the water body, which sets its wave size.
+    pub water_scale: WaterScale,
+    /// Sets the waves' size, slope and speed.
+    pub wave_strength: f32,
+    /// Where the waves travel, in degrees clockwise from north.
+    pub wave_direction: f32,
+    /// Speed in m/s of the current carrying the water's waves
+    /// along `wave_direction`.
+    pub flow_speed: f32,
     pub shininess: f32,
     pub specular_strength: f32,
-    pub apply_water_normal: bool,
     pub specular: bool,
     pub ior: f32,
+    pub shade_sides_as_surface: bool,
+    pub depth_pre_pass: bool,
     // post effect
     pub effect_ids: Option<Vec<String>>,
     pub emissive_intensity: Option<f32>,
@@ -487,6 +1102,7 @@ impl Default for PolygonMaterial {
             color: 0xffffff,
             clamp_to_ground: true,
             tiled: false,
+            geodesic: true,
             height: 1.,
             extruded_height: None,
             wireframe: false,
@@ -494,6 +1110,7 @@ impl Default for PolygonMaterial {
             roughness: 0.0,
             internal: None,
             per_position_height: false,
+            extrusion_base: ExtrusionBase::Position,
             opacity: 1.0,
             transparent: false,
 
@@ -504,13 +1121,17 @@ impl Default for PolygonMaterial {
             outline_width: 1.,
 
             water: false,
-            water_scale_normal: 0.1,
-            water_speed: 0.0003,
+            wave_exaggeration: 1.0,
+            water_scale: WaterScale::Ocean,
+            wave_strength: DEFAULT_WAVE_STRENGTH,
+            wave_direction: 0.0,
+            flow_speed: 0.0,
             shininess: 100.0,
             specular_strength: 2.0,
-            apply_water_normal: false,
             specular: false,
             ior: 1.33333,
+            shade_sides_as_surface: false,
+            depth_pre_pass: false,
 
             // post effect
             effect_ids: None,
@@ -521,10 +1142,15 @@ impl Default for PolygonMaterial {
 }
 
 impl PolygonMaterial {
+    /// Takes `from`, but keeps the fields the built geometry was shaped with,
+    /// since an update does not rebuild it.
     pub fn update(&mut self, from: &PolygonMaterial) {
         let internal = self.internal.clone();
+        let (per_position_height, extrusion_base) = (self.per_position_height, self.extrusion_base);
         *self = from.clone();
         self.internal = internal;
+        self.per_position_height = per_position_height;
+        self.extrusion_base = extrusion_base;
     }
 }
 
@@ -552,11 +1178,19 @@ pub struct ModelMaterial {
     pub roughness: f32,
     pub reflectivity: f32,
     pub water: bool,
-    pub water_scale_normal: f32,
-    pub water_speed: f32,
+    /// Scales the water's wave slopes; 0 is a flat mirror.
+    pub wave_exaggeration: f32,
+    /// Extent of the water body, which sets its wave size.
+    pub water_scale: WaterScale,
+    /// Sets the waves' size, slope and speed.
+    pub wave_strength: f32,
+    /// Where the waves travel, in degrees clockwise from north.
+    pub wave_direction: f32,
+    /// Speed in m/s of the current carrying the water's waves
+    /// along `wave_direction`.
+    pub flow_speed: f32,
     pub shininess: f32,
     pub specular_strength: f32,
-    pub apply_water_normal: bool,
     pub specular: bool,
     pub ior: f32,
     // animation
@@ -601,11 +1235,13 @@ impl Default for ModelMaterial {
             roughness: 1.0,
             reflectivity: 0.0,
             water: false,
-            water_scale_normal: 0.01,
-            water_speed: 0.0003,
+            wave_exaggeration: 1.0,
+            water_scale: WaterScale::Ocean,
+            wave_strength: DEFAULT_WAVE_STRENGTH,
+            wave_direction: 0.0,
+            flow_speed: 0.0,
             shininess: 100.0,
             specular_strength: 2.0,
-            apply_water_normal: false,
             specular: false,
             ior: 1.33333,
             // animation
@@ -655,8 +1291,67 @@ impl ModelMaterial {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelInternalMaterial {
     pub point_cloud: bool,
-    pub draco_compressed: bool,
+    /// Draco unique attribute ids of the point cloud bin; `Some` when the bin
+    /// is Draco-compressed.
+    pub draco_attributes: Option<Vec<DracoAttributeId>>,
     pub point_cloud_geodetic_normal: Vec3,
+    /// Where the points sit in the bin; `Some` for PNTS.
+    pub point_cloud_layout: Option<PointCloudLayout>,
+}
+
+/// Where the points of a PNTS tile sit in its bin, which is the whole tile.
+///
+/// ref: https://github.com/CesiumGS/3d-tiles/blob/main/specification/TileFormats/PointCloud/README.adoc#semantics
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointCloudLayout {
+    /// `POINTS_LENGTH`.
+    pub point_count: u32,
+    pub positions_format: PointPositionsFormat,
+    /// Byte range of the positions; empty for [`PointPositionsFormat::Draco`].
+    pub positions_byte_offset: u32,
+    pub positions_byte_length: u32,
+    /// Subtracted from every `Float32` position: the first point when the
+    /// tile has absolute positions, zero otherwise.
+    pub positions_origin: Vec3,
+    /// `QUANTIZED_VOLUME_SCALE` of `Uint16` positions.
+    pub quantized_volume_scale: Vec3,
+    /// Byte range of the `3DTILES_draco_point_compression` blob; empty
+    /// without it.
+    pub draco_byte_offset: u32,
+    pub draco_byte_length: u32,
+    pub colors_format: PointColorsFormat,
+    pub colors_byte_offset: u32,
+    /// `CONSTANT_RGBA` as `0xRRGGBBAA` for [`PointColorsFormat::Constant`].
+    pub constant_color: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointPositionsFormat {
+    /// `POSITION`.
+    Float32,
+    /// `POSITION_QUANTIZED`, normalized to the quantized volume.
+    Uint16,
+    /// In the `3DTILES_draco_point_compression` blob.
+    Draco,
+}
+
+/// Per-point colors outside the Draco blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointColorsFormat {
+    /// No colors, or Draco decodes them.
+    None,
+    Rgba8,
+    Rgb8,
+    Rgb565,
+    Constant,
+}
+
+/// Maps a 3D Tiles feature table semantic (`POSITION`, `RGB`, ...) to its
+/// Draco unique attribute id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DracoAttributeId {
+    pub semantic: String,
+    pub unique_id: u32,
 }
 
 /// Render-only appearance for a `raster` layer's imagery. All fetch/tiling
@@ -683,6 +1378,9 @@ impl Default for RasterMaterial {
 /// This is used to handle each tile's style in uniforms.
 #[derive(Debug, Clone, PartialEq, Component, Default)]
 pub struct RasterTileInternalMaterial {
+    /// Whether the tile mesh is drawn, from the terrain layer's `show`. The
+    /// tile and its terrain data stay loaded either way.
+    pub show_mesh: bool,
     pub shows: Vec<bool>,
     pub colors: Vec<u32>,
     pub opacities: Vec<f32>,
@@ -691,14 +1389,23 @@ pub struct RasterTileInternalMaterial {
     pub receive_shadow: Option<bool>,
     pub lit: Option<bool>,
     pub show_bounding_box: Option<bool>,
+    /// Body color of the terrain watermask's water; `None` keeps the imagery
+    /// or globe color.
+    pub water_mask_color: Option<u32>,
+    /// Scales the wave slopes on the watermask's water; 0 is a flat mirror.
+    pub wave_exaggeration: f32,
+    /// Sets the waves' size, slope and speed on the terrain watermask's water.
+    pub wave_strength: f32,
+    /// Where the waves on the terrain watermask's water travel, in degrees
+    /// clockwise from north.
+    pub wave_direction: f32,
+    /// Speed in m/s of the current carrying the waves on the watermask's water
+    /// along `wave_direction`.
+    pub flow_speed: f32,
 
-    // Elevation Heatmap fields
-    pub is_elevation_heatmaps: Vec<bool>, // Per-layer flags: which texture slots are elevation heatmaps
-    pub elevation_heatmap_config: Option<ElevationHeatmapConfig>, // Shared config for all heatmap layers
-    /// DEM decoder for the heatmap's source, resolved live from the referenced
-    /// `Source` at material-build time (not stored on the layer config). `None`
-    /// when there is no heatmap or the source isn't a raster-dem.
-    pub heatmap_elevation_decoder: Option<ElevationDecoder>,
+    /// Per-layer elevation heatmap data. `Some` when the layer is an elevation heatmap
+    /// with a raster-dem source that has a decoder; `None` for layers without an elevation heatmap.
+    pub elevation_heatmap_layers: Vec<Option<ElevationHeatmapLayerData>>,
 
     // Hillshade fields
     pub is_hillshades: Vec<bool>, // Per-layer flags: which texture slots are hillshades
@@ -743,6 +1450,24 @@ pub struct TerrainMaterial {
     /// Multiplier for the automatically calculated skirt height.
     /// A value of 1.0 uses the default calculated height.
     pub skirt_exaggeration: f32,
+    /// Vertical exaggeration of the terrain surface around
+    /// `exaggeration_relative_height`. A negative value is treated as 0.
+    pub exaggeration: f64,
+    /// Height (meters) that stays fixed while the terrain is exaggerated.
+    pub exaggeration_relative_height: f64,
+    /// Body color of the watermask's water; `None` keeps the imagery or globe
+    /// color.
+    pub water_mask_color: Option<u32>,
+    /// Scales the wave slopes on the watermask's water; 0 is a flat mirror.
+    pub wave_exaggeration: f32,
+    /// Sets the waves' size, slope and speed on the watermask's water.
+    pub wave_strength: f32,
+    /// Where the waves on the watermask's water travel, in degrees clockwise
+    /// from north.
+    pub wave_direction: f32,
+    /// Speed in m/s of the current carrying the waves on the watermask's water
+    /// along `wave_direction`.
+    pub flow_speed: f32,
 }
 
 impl Default for TerrainMaterial {
@@ -755,6 +1480,13 @@ impl Default for TerrainMaterial {
             show_bounding_box: false,
             skirt: true,
             skirt_exaggeration: 1.0,
+            exaggeration: 1.0,
+            exaggeration_relative_height: 0.0,
+            water_mask_color: None,
+            wave_exaggeration: 1.0,
+            wave_strength: DEFAULT_WAVE_STRENGTH,
+            wave_direction: 0.0,
+            flow_speed: 0.0,
         }
     }
 }
@@ -762,6 +1494,19 @@ impl Default for TerrainMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn water_scale_round_trips_its_js_name() {
+        for scale in [
+            WaterScale::Ocean,
+            WaterScale::Large,
+            WaterScale::Medium,
+            WaterScale::Small,
+        ] {
+            assert_eq!(WaterScale::parse(scale.as_str()), Some(scale));
+        }
+        assert_eq!(WaterScale::parse("sea"), None);
+    }
 
     #[test]
     fn clone_model_or_default_returns_the_model_material() {

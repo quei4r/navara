@@ -22,16 +22,20 @@ function isCancellation(err: unknown): boolean {
 }
 
 /**
- * Own the workerPoolPromises lifecycle around one pool task: register the
- * promise (so a removal event can cancel it), classify the outcome, and
- * always unregister.
+ * Await one pool task under a job's abort signal: an abort cancels the pool
+ * promise (dropping it from the queue or discarding its result), and the
+ * outcome is classified so callers never see a cancellation as a failure.
  */
 export async function settleWorkerTask<T>(
-  ctx: Pick<EventContext, "workerPoolPromises">,
-  id: string,
+  signal: AbortSignal,
   promise: WorkerPoolPromise<T>,
 ): Promise<WorkerTaskSettlement<T>> {
-  ctx.workerPoolPromises.set(id, promise);
+  const cancel = () => promise.cancel();
+  if (signal.aborted) {
+    cancel();
+  } else {
+    signal.addEventListener("abort", cancel, { once: true });
+  }
   try {
     return { status: "completed", value: await promise };
   } catch (error) {
@@ -39,19 +43,15 @@ export async function settleWorkerTask<T>(
       ? { status: "cancelled" }
       : { status: "failed", error };
   } finally {
-    // Only delete our own entry: a new task could in principle reuse the id
-    // between a cancel and this continuation.
-    if (ctx.workerPoolPromises.get(id) === promise) {
-      ctx.workerPoolPromises.delete(id);
-    }
+    signal.removeEventListener("abort", cancel);
   }
 }
 
 /** Helpers handed to a delegated-task body by {@link runDelegatedWorkerTask}. */
 export type DelegatedTaskHandle = {
   /**
-   * Register + await one pool task via {@link settleWorkerTask} and classify
-   * the outcome: the settled value on completion, `undefined` otherwise. A
+   * Await one pool task via {@link settleWorkerTask} and classify the
+   * outcome: the settled value on completion, `undefined` otherwise. A
    * failure is logged (as `Failed to <label> in worker:`) and `onFailed` runs
    * before returning, so a task kind can substitute its own failure
    * completion (e.g. the MVT parse completes with an empty result).
@@ -78,13 +78,12 @@ export type DelegatedTaskHandle = {
  * buffer registration failure, or an unexpected throw — releases the
  * delegator through `triggerWorkerTaskFailed`; otherwise it would stay
  * Requested forever and permanently occupy one of the engine's pending
- * dispatch slots for its task kind. For a task the engine already cancelled
- * the release is a no-op on the Rust side, so cancellations need no special
- * casing here.
+ * dispatch slots. For a task the engine already removed the release is a
+ * no-op on the Rust side, so cancellations need no special casing here.
  */
 export async function runDelegatedWorkerTask<P extends { free(): void }>(
-  ctx: Pick<EventContext, "workerPoolPromises" | "workerTaskHandler">,
-  id: string,
+  ctx: Pick<EventContext, "workerTaskHandler">,
+  abort: AbortController,
   bits: bigint,
   label: string,
   params: P,
@@ -94,7 +93,7 @@ export async function runDelegatedWorkerTask<P extends { free(): void }>(
   let delegatorSettled = false;
   const task: DelegatedTaskHandle = {
     async settle(promise, onFailed) {
-      const settled = await settleWorkerTask(ctx, id, promise);
+      const settled = await settleWorkerTask(abort.signal, promise);
       if (settled.status === "completed") {
         return settled.value;
       }
@@ -108,6 +107,8 @@ export async function runDelegatedWorkerTask<P extends { free(): void }>(
       // Flag before building so a throw inside `build` (after `with*` already
       // consumed `delegator_id`) cannot lead to a double free below.
       delegatorSettled = true;
+      // Delivered even after an abort: the result's buffer handles move to
+      // the engine, which frees them when the delegator is already gone.
       ctx.workerTaskHandler.triggerWorkerTaskCompleted(
         bits,
         build(delegator_id),
@@ -121,7 +122,8 @@ export async function runDelegatedWorkerTask<P extends { free(): void }>(
   } finally {
     params.free();
     if (!delegatorSettled) {
-      // Consumes `delegator_id`.
+      // Consumes `delegator_id`. A no-op on the engine side for a task it
+      // already removed (the abort signal fired).
       ctx.workerTaskHandler.triggerWorkerTaskFailed(delegator_id);
     }
   }

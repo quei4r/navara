@@ -16,10 +16,28 @@ export type {
   WorkerPoolStats,
 } from "./recyclingPool";
 
+/** One holder's claim on the shared worker pool; see `acquireWorkerPool`. */
+export type WorkerPoolLease = {
+  /** The pool's concurrency manager, which may be another holder's. */
+  manager: ConcurrencyManager;
+  /** Whether this claim created the pool, so its holder warms it up. */
+  created: boolean;
+  /** Drops this claim; the last release terminates the pool. Idempotent. */
+  release: () => void;
+};
+
+const NOT_ACQUIRED =
+  "The worker pool is not acquired: call acquireWorkerPool() first, and do not use the pool after its last holder released it.";
+
 const {
-  initializeWorkerPool,
-  terminateWorkerPool,
+  acquireWorkerPool,
+  workerPoolHolders,
+  sharedWorkerPoolSize,
   warmUpWorkerPool,
+  canWorkerPoolAcceptTasks,
+  workerPoolLoad,
+  reserveWorkerCore,
+  workerPoolReservedSlots,
   worker,
   workerPoolStats,
   workerPoolHeapStats,
@@ -30,43 +48,107 @@ const {
     | {
         pool: RecyclingWorkerPool;
         manager: ConcurrencyManager;
+        maxWorkerHeapBytes: number | undefined;
       }
     | undefined;
+  /** Cores held by threads outside the pool; outlives the pool itself, so a
+   * reservation taken before initialization (or across a re-init) holds. */
+  let coreReservations = 0;
+  let holders = 0;
 
   return {
-    initializeWorkerPool: (
+    /**
+     * Claims the page-wide worker pool, creating it on the first claim. Every
+     * view shares the one pool so their tasks contend for the same cores;
+     * `url`, `manager` and `options` of later claims are ignored while the
+     * pool lives (a differing pool size or heap budget logs a warning).
+     */
+    acquireWorkerPool: (
       url: string,
       manager: ConcurrencyManager,
       options?: RecyclingWorkerPoolOptions,
-    ) => {
-      if (worker) {
-        throw new Error("Worker pool has already been initialized.");
+    ): WorkerPoolLease => {
+      const created = !worker;
+      if (!worker) {
+        worker = {
+          // Recycles worker threads to bound WASM linear memory growth; see
+          // recyclingPool.ts for the policy.
+          pool: new RecyclingWorkerPool(url, manager.total, options),
+          manager,
+          maxWorkerHeapBytes: options?.maxWorkerHeapBytes,
+        };
+        worker.pool.setReservedSlots(coreReservations);
+      } else if (
+        manager.total !== worker.manager.total ||
+        options?.maxWorkerHeapBytes !== worker.maxWorkerHeapBytes
+      ) {
+        console.warn(
+          `The shared worker pool keeps its size (${worker.manager.total}) and worker heap budget (${worker.maxWorkerHeapBytes ?? "default"}); this claim asked for ${manager.total} and ${options?.maxWorkerHeapBytes ?? "default"}.`,
+        );
       }
+      holders++;
 
-      worker = {
-        // Recycles worker threads to bound WASM linear memory growth; see
-        // recyclingPool.ts for the policy.
-        pool: new RecyclingWorkerPool(url, manager.total, options),
-        manager,
+      let released = false;
+      return {
+        manager: worker.manager,
+        created,
+        release: () => {
+          if (released) return;
+          released = true;
+          holders--;
+          if (holders === 0 && worker) {
+            worker.pool.terminate();
+            worker = undefined;
+          }
+        },
       };
     },
-    terminateWorkerPool: () => {
-      if (worker) {
-        worker.pool.terminate();
-        worker = undefined;
-      }
-    },
+    /** Live claims on the pool; see `acquireWorkerPool`. */
+    workerPoolHolders: () => holders,
+    /** Worker count of the live pool; undefined while none exists. */
+    sharedWorkerPoolSize: (): number | undefined => worker?.manager.total,
     /**
      * Pre-initializes WASM on the workers so that upcoming tasks don't pay
      * the initialization latency. Warms a single worker and resolves once
      * it is ready; the rest warm in the background.
      */
     warmUpWorkerPool: () => {
-      invariant(worker, "initializeWorkerPool() must be invoked first.");
+      invariant(worker, NOT_ACQUIRED);
       return worker.pool.warmUp();
     },
+    /**
+     * Whether at least one worker is under its WASM heap budget. While false
+     * the engine's worker-task intake must pause so the draining workers
+     * reach a task boundary and recycle.
+     */
+    canWorkerPoolAcceptTasks: () => worker?.pool.canAcceptTasks() ?? true,
+    /**
+     * Tasks the pool's workers have running or queued, including tasks
+     * cancelled while running; see RecyclingWorkerPool.load.
+     */
+    workerPoolLoad: () => worker?.pool.load() ?? 0,
+    /**
+     * Hold one core for a thread outside the pool (a font worker, a splat
+     * decoder) while it works: one pool slot stops taking tasks and its
+     * worker idles once its queued tasks finish. Returns the release
+     * function; calling it again is a no-op. At least one slot always keeps
+     * taking tasks.
+     */
+    reserveWorkerCore: (): (() => void) => {
+      coreReservations++;
+      worker?.pool.setReservedSlots(coreReservations);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        coreReservations--;
+        worker?.pool.setReservedSlots(coreReservations);
+      };
+    },
+    /** Pool slots kept free for threads outside the pool right now. */
+    workerPoolReservedSlots: () => worker?.pool.reservedSlots() ?? 0,
     worker: () => {
-      invariant(worker, "initializeWorkerPool() must be invoked first.");
+      invariant(worker, NOT_ACQUIRED);
       return {
         pool: worker.pool,
         manager: worker.manager,
@@ -81,19 +163,17 @@ const {
 })();
 
 export {
-  initializeWorkerPool,
-  terminateWorkerPool,
+  acquireWorkerPool,
+  workerPoolHolders,
+  sharedWorkerPoolSize,
   warmUpWorkerPool,
+  canWorkerPoolAcceptTasks,
+  workerPoolLoad,
+  reserveWorkerCore,
+  workerPoolReservedSlots,
   workerPoolStats,
   workerPoolHeapStats,
   probeWorkerPoolHeap,
-};
-
-export const canWorkerProcessImmediately = () => {
-  const { pool, manager } = worker();
-  // Also pauses intake while every worker is over its WASM heap budget
-  // (draining); a recycled worker restores capacity moments later.
-  return manager.canIncrement() && pool.canAcceptTasks();
 };
 
 export type { ExecOptions } from "workerpool/types/types";
@@ -136,7 +216,9 @@ export function queueTask<
         // `finally` doesn't work, so use `then()` and `catch()` to ensure that `manager.decrement()` is invoked.
         .then((p) => {
           manager.decrement();
-          return p;
+          // workerpool types the result as the task's raw return type, but it
+          // resolves with the awaited value.
+          return p as MethodReturnType<Task, Name>;
         })
         .catch((e) => {
           manager.decrement();

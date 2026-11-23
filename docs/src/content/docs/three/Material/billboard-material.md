@@ -27,20 +27,43 @@ sidebar:
 }
 ```
 
-### center
+### anchor
 
-**Type:** [`Vec2`](../../api/types/#vec2)
+**Type:** `"center" | "left" | "right" | "top" | "bottom" | "top-left" | "top-right" | "bottom-left" | "bottom-right" | undefined`
 
-**Description:** Specifies the shift amount from the center. The range is between 0 and 1.
+**Description:** Sets which part of the billboard sits on its position, as MapLibre's `icon-anchor` does. For example, `"bottom"` stands the billboard on its position like a map pin. The anchor is also the point [`rotation`](#rotation) turns the billboard around.
 
-**Default:** Required
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `"center"`
 
 **Example:**
 
 ```typescript
 {
   billboard: {
-    center: { x: 0.5, y: 0.5 }
+    anchor: "bottom"
+  }
+}
+```
+
+### backfaceCulling
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the billboard is hidden when seen from behind. When `false`, both sides of the billboard are drawn. When `true`, only its front is drawn.
+
+Only a flat billboard (see [`billboardFacing`](#billboardfacing)) has a back the camera can see. Its front faces away from the globe, so turning this on hides the parts of a large billboard that wrap over the horizon. It has no effect on an upright billboard, which always lies in the screen plane facing the viewer.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    billboardFacing: "flat",
+    backfaceCulling: true
   }
 }
 ```
@@ -101,6 +124,24 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### declutterPadding
+
+**Type:** `number[] | undefined`
+
+**Description:** Extra space around the sprite's collision box, in screen pixels whatever [`sizeInMeters`](#sizeinmeters) is. One to four values, expanded like CSS padding: `[all]`, `[vertical, horizontal]`, `[top, horizontal, bottom]` or `[top, right, bottom, left]`. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `icon-padding`.
+
+**Default:** `[2]`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    declutterPadding: [4, 8]
+  }
+}
+```
+
 ### declutterPriority
 
 **Type:** `number | undefined`
@@ -116,6 +157,24 @@ import { Color } from "@navaramap/three";
   billboard: {
     declutter: true,
     declutterPriority: 1
+  }
+}
+```
+
+### declutterRank
+
+**Type:** `number | undefined`
+
+**Description:** Coarse placement order for decluttering, compared before [`declutterPriority`](#declutterpriority): every sprite of a material with a higher rank is placed before any label or sprite with a lower one, whatever their priorities. A per-feature `declutterPriority` therefore only reorders labels and sprites of the same rank. Only meaningful when [`declutter`](#declutter) is enabled.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    declutterRank: 1
   }
 }
 ```
@@ -198,7 +257,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `("point" | "line" | "polygon")[] | undefined`
 
-**Description:** Source geometry categories this material consumes. Adding `"line"` emits one billboard per line-string vertex, and adding `"polygon"` emits one billboard per polygon-ring vertex (the closing duplicate vertex is skipped). Setting the array replaces the default, so include `"point"` when point geometry should keep rendering. This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` applies a new value only to tiles loaded afterwards, so already-loaded tiles keep their previous geometry until the layer is re-created.
+**Description:** Source geometry categories this material consumes. Adding `"line"` emits one billboard per line string by default, at its first vertex, as MapLibre places a `symbol-placement: "point"` icon on a line. Set [`placement`](#placement) to repeat billboards along the line instead. Adding `"polygon"` emits one billboard per polygon, placed inside it at the point farthest from its edges (each part of a MultiPolygon gets its own), or along its rings with [`placement`](#placement). Setting the array replaces the default, so include `"point"` when point geometry should keep rendering. This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` applies a new value only to tiles loaded afterwards, so already-loaded tiles keep their previous geometry until the layer is re-created.
 
 **Default:** `["point"]`
 
@@ -226,6 +285,44 @@ import { Color } from "@navaramap/three";
 {
   billboard: {
     height: 100 // 100 meters
+  }
+}
+```
+
+### ignorePlacement
+
+**Type:** `boolean | undefined`
+
+**Description:** Keeps this sprite's box out of the collision check, so labels and sprites placed after it can overlap it. The sprite itself still hides when it collides with one placed before it, unless [`overlap`](#overlap) allows it. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `icon-ignore-placement`.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    ignorePlacement: true
+  }
+}
+```
+
+### offset
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** Moves the billboard away from its anchor point, in the unit of [`size`](#size): pixels when [`sizeInMeters`](#sizeinmeters) is `false`, meters otherwise. A positive `x` moves it right and a positive `y` moves it down, as MapLibre's `icon-offset` does. The offset lies in the billboard's own plane, so it turns with [`rotation`](#rotation).
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    offset: { x: 0, y: -8 } // 8 units up
   }
 }
 ```
@@ -267,6 +364,56 @@ import { Color } from "@navaramap/three";
 }
 ```
 
+### overlap
+
+**Type:** `"never" | "always" | "cooperative" | undefined`
+
+**Description:** Whether the sprite may be drawn over labels and sprites placed before it (higher [`declutterRank`](#declutterrank), then higher [`declutterPriority`](#declutterpriority), places first). `"never"` hides it on any collision. `"always"` never hides it, and its box still keeps later `"never"` ones away unless [`ignorePlacement`](#ignoreplacement) is set. `"cooperative"` hides it only when it collides with a `"never"` one. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `icon-overlap`.
+
+**Default:** `"never"`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    overlap: "always"
+  }
+}
+```
+
+### placement
+
+**Type:** `"point" | "line" | "line-center" | undefined`
+
+**Description:** How billboards are placed on line and polygon geometry. Only takes effect when [`geometryTypes`](#geometrytypes) includes `"line"` or `"polygon"`. Point geometry is always placed at the point itself.
+
+- `"point"`: one billboard per line string, at its first vertex, and one billboard per polygon, inside it at the point farthest from its edges. On a vector-tile source, a line whose first vertex lies outside the tile (where the tile cut it) gets no billboard in that tile.
+- `"line"`: billboards repeat along the line every [`spacing`](#spacing), evenly spaced regardless of where the line's vertices are. Polygon boundary rings, holes included, are followed the same way.
+- `"line-center"`: a single billboard at the halfway point along each line string or polygon ring.
+
+With `"line"` and `"line-center"`, each billboard is a single image at its anchor, turned to the direction of the line where it sits (see [`rotateToLine`](#rotatetoline)). Unless [`billboardFacing`](#billboardfacing) or [`rotateWithCamera`](#rotatewithcamera) is set, it lies flat on the surface and is aligned with the map, so an arrow image points along the line.
+
+This option applies when the layer's geometry is built: set it at layer creation. `layer.update()` does not rebuild billboards that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `"point"`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    url: "/icons/arrow.png",
+    geometryTypes: ["line"],
+    placement: "line",
+    spacing: 120, // Screen pixels
+    billboardFacing: "flat",
+    rotateWithCamera: false, // Arrows lie on the surface and point along the line
+    clampToGround: true
+  }
+}
+```
+
 ### sizeInMeters
 
 **Type:** `boolean | undefined`
@@ -281,6 +428,126 @@ import { Color } from "@navaramap/three";
 {
   billboard: {
     sizeInMeters: true
+  }
+}
+```
+
+### sizeRelativeToImage
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether [`size`](#size) scales the image's own pixel height instead of setting the billboard's height, as MapLibre's `icon-size` does. With `true`, a `size` of `1` draws the image at its natural size: in pixels when [`sizeInMeters`](#sizeinmeters) is `false`, or one meter per image pixel otherwise. The width follows the image's aspect ratio either way. [`offset`](#offset) is not scaled by the image and stays in pixels or meters.
+
+**Default:** `false`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    url: "https://example.com/pin.png", // a 32 x 40 px image
+    sizeInMeters: false,
+    sizeRelativeToImage: true,
+    size: 1.5 // drawn 48 x 60 px
+  }
+}
+```
+
+### billboardFacing
+
+**Type:** `"upright" | "flat" | undefined`
+
+**Description:** Whether the billboard lies in the screen plane or on the globe surface, as MapLibre's `icon-pitch-alignment` (`"upright"` is `"viewport"`, `"flat"` is `"map"`). An upright billboard is never foreshortened, however the camera is pitched. `"flat"` lays it on the globe surface around its anchor, following the globe's curvature, so it reads as painted onto the surface and foreshortens with camera pitch.
+
+Combine with [`rotateWithCamera`](#rotatewithcamera) for four behaviours:
+
+| `billboardFacing` | `rotateWithCamera` | Result |
+| --- | --- | --- |
+| `"upright"` | `true` | Screen-aligned billboard (the default for `placement: "point"`) |
+| `"upright"` | `false` | In the screen plane, turned with the camera heading so the image's x-axis points east |
+| `"flat"` | `true` | Painted on the surface, turned to keep facing the viewer |
+| `"flat"` | `false` | Painted on the surface, north-up, turning with the map (the default along a line) |
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/) as `facing`.
+
+**Default:** `"upright"`, or `"flat"` when `rotateWithCamera` is `false` (MapLibre's `"auto"`)
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    billboardFacing: "flat"
+  }
+}
+```
+
+### rotateToLine
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether a billboard placed along a line turns with the line. When `true`, the direction of the line at the billboard's anchor, as a compass bearing, is added to [`rotation`](#rotation). Only used when [`placement`](#placement) is `"line"` or `"line-center"`.
+
+The added bearing reads as a direction on the map when the billboard is aligned with the map ([`rotateWithCamera`](#rotatewithcamera) `false`). Flat on the surface, as it is by default along a line, the top of the image then points along the line, and `rotation` turns it further from there. Upright, the billboard stays in the screen plane and is turned by the camera heading plus the line's bearing. On a billboard that turns with the camera, the bearing only spins the image on screen.
+
+This option applies when the layer's geometry is built. `layer.update()` does not change it for billboards that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    geometryTypes: ["line"],
+    placement: "line",
+    billboardFacing: "flat",
+    rotateWithCamera: false,
+    rotateToLine: true,
+    rotation: 90 // Point to the right of the line's direction
+  }
+}
+```
+
+### rotateWithCamera
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the billboard turns with the camera or with the map, as MapLibre's `icon-rotation-alignment` (`true` is `"viewport"`, `false` is `"map"`). When `true`, the image stays upright on screen: a screen-aligned billboard, or with [`billboardFacing`](#billboardfacing) set to `"flat"`, a surface image turned to keep facing the viewer. When `false`, it is aligned with the map. With `"upright"`, it stays in the screen plane at full size but turns with the camera heading so that its x-axis keeps pointing east, and it shows upside down when the camera faces south. With `"flat"`, it lies on the surface north-up and turns with the map.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/).
+
+**Default:** `true` for `placement: "point"`, `false` along a line (MapLibre's `"auto"`)
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    billboardFacing: "upright",
+    rotateWithCamera: false // On screen, turned with the camera heading
+  }
+}
+```
+
+### rotation
+
+**Type:** `number | undefined`
+
+**Description:** Rotates the billboard within its own plane around its anchor point, in degrees, clockwise as seen from the front. The rotation is applied on top of the orientation that [`billboardFacing`](#billboardfacing) and [`rotateWithCamera`](#rotatewithcamera) resolve to.
+
+[`anchor`](#anchor) decides where inside the billboard the pivot sits.
+
+Can also be set per feature from a [feature evaluator](../../api/feature-evaluator/), so every billboard in a layer can point a different way.
+
+**Default:** `0.0`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    rotation: 45
   }
 }
 ```
@@ -317,6 +584,89 @@ import { Color } from "@navaramap/three";
 {
   billboard: {
     size: 10 // 10 meters
+  }
+}
+```
+
+### spacing
+
+**Type:** `number | undefined`
+
+**Description:** The distance between repeated billboards when [`placement`](#placement) is `"line"`, in screen pixels. The unit is the same on `geojson` and `vector-tile` sources.
+
+The billboards shown on a line are decided again as the camera moves. Pulling the camera back thins them out, and moving closer fills in more billboards between them. Billboards never slide along the line: they only appear or disappear. The gap on screen stays between one and two times `spacing`, also in a tilted view, where the near and far parts of the view each get their own density.
+
+A line always keeps the billboard at its halfway point, and a line shorter than `spacing` on screen gets only that one. Billboards stop filling in very close to the ground (street level) on a GeoJSON source, and when a vector tile is shown much deeper than its own zoom level (overscaled). There they sit farther apart than `spacing`.
+
+As with MapLibre's `symbol-spacing`, a billboard longer along the line than three quarters of `spacing` spreads its repeats to that length plus a quarter of `spacing`. The length is measured in the billboard's own frame: with `rotateToLine` the top of the image points along the line, so its height is what counts, and `rotation` turns it from there. On a vector tile source, each tile places billboards only inside its own bounds. Each tile spaces its own billboards, so repeats end up at most about one tile apart (512 to 1024 screen pixels) however large `spacing` is.
+
+This option applies when the layer's geometry is built. `layer.update()` does not rebuild billboards that are already loaded, so remove the layer and add it again to change it.
+
+**Default:** `250.0`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    geometryTypes: ["line"],
+    placement: "line",
+    spacing: 120
+  }
+}
+```
+
+### standalone
+
+**Type:** `boolean | undefined`
+
+**Description:** Whether the billboard may show while the layer's label at the same anchor is hidden. Unless both are `standalone`, a layer's label and billboard of the same feature and anchor are placed as a pair, tested together so they never block each other. With `false`, the billboard is hidden whenever its label loses its spot, so `false` on both means both show or neither does. With `true` on both, they are placed independently and block each other where they overlap. Only meaningful when [`declutter`](#declutter) is enabled. MapLibre's `text-optional` (inverted: `text-optional: true` means `standalone: true` on the billboard).
+
+**Default:** `true`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    standalone: false
+  }
+}
+```
+
+### translate
+
+**Type:** [`Vec2`](../../api/types/#vec2) | undefined
+
+**Description:** Moves the drawn billboard by a number of screen pixels, as MapLibre's `icon-translate` does. A positive `x` moves it right and a positive `y` moves it down, in the frame [`translateAnchor`](#translateanchor) sets. The shift is applied after the billboard is projected, so it stays the same number of pixels at any distance and does not turn with [`rotation`](#rotation). Decluttering reserves the space where the billboard is drawn.
+
+**Default:** `{ x: 0, y: 0 }`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    translate: { x: 0, y: -10 } // 10 px up
+  }
+}
+```
+
+### translateAnchor
+
+**Type:** `"map" | "viewport" | undefined`
+
+**Description:** Sets the frame [`translate`](#translate) is measured in. With `"map"`, the shift turns with the camera heading, so a positive `x` points east and a positive `y` points south. With `"viewport"`, it follows the screen axes. Unlike MapLibre's `"map"`, the shift is not foreshortened when the camera is pitched.
+
+**Default:** `"map"`
+
+**Example:**
+
+```typescript
+{
+  billboard: {
+    translate: { x: 10, y: 0 },
+    translateAnchor: "viewport" // 10 px right on screen, whatever the heading
   }
 }
 ```

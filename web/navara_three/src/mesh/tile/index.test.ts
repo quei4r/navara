@@ -1,4 +1,4 @@
-import { Mesh, BoxGeometry, MeshBasicMaterial } from "three";
+import { Box3, BoxGeometry, DataTexture, Mesh, MeshBasicMaterial } from "three";
 import { describe, expect, it, vi } from "vitest";
 
 import { TexturizedSceneByTileCoordinates } from "../../scene";
@@ -8,8 +8,11 @@ import { TileMesh } from ".";
 // The package barrel pulled in by tile.ts initializes a worker pool at module
 // load (os.cpus()), which is unavailable in the test environment. Stub it.
 vi.mock("@navaramap/worker", () => ({
-  initializeWorkerPool: vi.fn(),
-  terminateWorkerPool: vi.fn(),
+  acquireWorkerPool: vi.fn(() => ({
+    manager: { total: 1 },
+    created: true,
+    release: vi.fn(),
+  })),
 }));
 
 function createMockRenderer() {
@@ -40,12 +43,16 @@ function state(layerId: string, tileHandle: bigint) {
   };
 }
 
-function makeTile(atlasSize = 512) {
+function makeTile({
+  atlasSize = 512,
+  atlasAllocated = false,
+}: { atlasSize?: number; atlasAllocated?: boolean } = {}) {
   const texturizedScenes = new TexturizedSceneByTileCoordinates(
     createMockRenderer(),
   );
   const renderVectorScenes = vi.fn();
   const markDirty = vi.fn();
+  let allocated = atlasAllocated;
   const compositor = {
     acquire: vi.fn(),
     release: vi.fn(),
@@ -56,21 +63,22 @@ function makeTile(atlasSize = 512) {
     // desktop and mobile; this mock is parameterized so the sizing math can be
     // exercised at other side lengths too.
     size: atlasSize,
-    // Keep the MRT composite pass out of this test: it runs only when dirty,
-    // and _onBeforeRender returns right after the vector bake when it isn't.
+    // The MRT composite pass runs only when dirty, and _onBeforeRender returns
+    // right after the vector bake when it isn't.
     cache: { isDirty: vi.fn().mockReturnValue(false) },
+    // A tile without hillshade: color + attr attachments.
+    atlasGpuBytes: vi.fn(() => (allocated ? atlasSize * atlasSize * 4 * 2 : 0)),
+    runCompositePassIfDirty: vi.fn(() => {
+      allocated = true;
+      return true;
+    }),
+    releaseAtlas: vi.fn(() => {
+      allocated = false;
+      return true;
+    }),
   };
   const getVectorTileStates = vi.fn().mockReturnValue([]);
   const reportDrapeGpuBytes = vi.fn();
-
-  // The vector resolve revision the WASM side exposes: it changes only when the
-  // resolved slot set could have changed (a traverse ran / a scene became ready). The
-  // tile re-fetches its slots only when this differs from the last frame, so tests that
-  // change `getVectorTileStates` must bump it too (as a real traverse would).
-  let vectorRevision = 0;
-  const bumpRevision = () => {
-    vectorRevision += 1;
-  };
 
   const ctx = {
     texturizedSceneByTileCoordinates: texturizedScenes,
@@ -79,7 +87,6 @@ function makeTile(atlasSize = 512) {
     tileMapByHandle: new Map(),
     tileHandler: {
       getVectorTileStates,
-      vectorRevision: () => vectorRevision,
       getTile: vi.fn().mockReturnValue({ coords: { x: 0, y: 0, z: 0 } }),
       reportDrapeGpuBytes,
     },
@@ -93,24 +100,31 @@ function makeTile(atlasSize = 512) {
   } as unknown as ConstructorParameters<typeof TileMesh>[1];
 
   const tile = new TileMesh(ctx, meshAdded);
+  // Rust lists the tile in `vector_drape_changed` when it hands new sources
+  // over; the tile re-fetches its slots only then, so tests that change
+  // `getVectorTileStates` must mark it too.
+  const markSourcesChanged = () => tile.markVectorDrapeSourcesChanged();
 
   return {
     tile,
+    ctx,
+    meshAdded,
+    compositor,
     texturizedScenes,
     renderVectorScenes,
     getVectorTileStates,
     reportDrapeGpuBytes,
-    bumpRevision,
+    markSourcesChanged,
   };
 }
 
 const RT_BYTES = 512 * 512 * 4;
-const ATLAS_BYTES = 512 * 512 * 4 * 3;
+const ATLAS_BYTES = 512 * 512 * 4 * 2;
 // A smaller 256² atlas / drape RT (a quarter of the 512² GPU cost), used to
 // exercise the sizing math at a non-default side length. NOTE: the real mobile
 // atlas is 512², same as desktop — 256² here is just a smaller parametric size.
 const RT_BYTES_SMALL = 256 * 256 * 4;
-const ATLAS_BYTES_SMALL = 256 * 256 * 4 * 3;
+const ATLAS_BYTES_SMALL = 256 * 256 * 4 * 2;
 
 function renderTargetCount(tile: TileMesh): number {
   return (
@@ -155,8 +169,8 @@ describe("TileMesh vector bake dirty-gating", () => {
     expect(renderVectorScenes).toHaveBeenCalledTimes(1);
 
     // The backing scene's content changed (e.g. material/visibility) bumps the scene's
-    // revision. This is caught by the bake signature independently of the Rust resolve
-    // revision (which is unchanged here, so the slots are not re-fetched).
+    // revision. This is caught by the bake signature independently of the handed
+    // sources (unchanged here, so the slots are not re-fetched).
     texturizedScenes.markDirty(1n, "a");
     frame(tile);
     expect(renderVectorScenes).toHaveBeenCalledTimes(2);
@@ -172,7 +186,7 @@ describe("TileMesh vector bake dirty-gating", () => {
       texturizedScenes,
       renderVectorScenes,
       getVectorTileStates,
-      bumpRevision,
+      markSourcesChanged,
     } = makeTile();
 
     getVectorTileStates.mockReturnValue([state("a", 1n)]);
@@ -181,36 +195,35 @@ describe("TileMesh vector bake dirty-gating", () => {
     frame(tile);
     expect(renderVectorScenes).toHaveBeenCalledTimes(1);
 
-    // A second layer becomes resolved → slot set grows. The new resolution comes from a
-    // traverse, which bumps the revision; that's what makes the tile re-fetch its slots.
+    // A second layer is handed over → slot set grows. Rust lists the tile in
+    // `vector_drape_changed`; that's what makes the tile re-fetch its slots.
     texturizedScenes.add(2n, "b", drapedMesh(), 1);
     getVectorTileStates.mockReturnValue([state("a", 1n), state("b", 2n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
     expect(renderVectorScenes).toHaveBeenCalledTimes(2);
   });
 
-  it("does not let a non-draped layer steal a slot from a draped one", () => {
+  it("drops the handed layers past the texture slot budget", () => {
     const {
       tile,
       texturizedScenes,
       renderVectorScenes,
       getVectorTileStates,
-      bumpRevision,
+      markSourcesChanged,
     } = makeTile();
 
-    // maxTextures 4 → numTexturizedVector 2. Rust returns THREE layers with a rendered
-    // tile, but only "a" and "c" are actually draped (have a texturized scene). "b" is a
-    // non-draped MVT layer rendered in the MRT scene; it must not occupy a bake slot and
-    // push "c" past the cap.
+    // maxTextures 4 → numTexturizedVector 2. Rust hands THREE draped layers over;
+    // the first two in its order take the slots.
     texturizedScenes.add(1n, "a", drapedMesh(), 0);
+    texturizedScenes.add(2n, "b", drapedMesh(), 1);
     texturizedScenes.add(3n, "c", drapedMesh(), 2);
     getVectorTileStates.mockReturnValue([
       state("a", 1n),
       state("b", 2n),
       state("c", 3n),
     ]);
-    bumpRevision();
+    markSourcesChanged();
 
     frame(tile);
 
@@ -219,11 +232,11 @@ describe("TileMesh vector bake dirty-gating", () => {
         vectorDrape: { vectorSlots: { layerId: string }[] };
       }
     ).vectorDrape.vectorSlots;
-    expect(slots.map((s) => s.layerId).sort()).toEqual(["a", "c"]);
+    expect(slots.map((s) => s.layerId)).toEqual(["a", "b"]);
     expect(renderVectorScenes).toHaveBeenCalledTimes(1);
   });
 
-  it("skips the per-tile resolve fetch while the revision is unchanged", () => {
+  it("skips the per-tile fetch until Rust hands new sources over", () => {
     const { tile, texturizedScenes, getVectorTileStates } = makeTile();
 
     getVectorTileStates.mockReturnValue([state("a", 1n)]);
@@ -232,8 +245,8 @@ describe("TileMesh vector bake dirty-gating", () => {
     frame(tile);
     expect(getVectorTileStates).toHaveBeenCalledTimes(1);
 
-    // No revision change → the WASM-boundary resolve is not called again, even though
-    // its mock would now return a different set. This is the per-frame cost we removed.
+    // Not marked → the WASM-boundary call is not made again, even though its mock
+    // would now return a different set. This is the per-frame cost we removed.
     getVectorTileStates.mockReturnValue([state("a", 1n), state("b", 2n)]);
     frame(tile);
     frame(tile);
@@ -258,12 +271,12 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
       texturizedScenes,
       getVectorTileStates,
       reportDrapeGpuBytes,
-      bumpRevision,
-    } = makeTile();
+      markSourcesChanged,
+    } = makeTile({ atlasAllocated: true });
 
     texturizedScenes.add(1n, "a", drapedMesh(), 0);
     getVectorTileStates.mockReturnValue([state("a", 1n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
 
     expect(renderTargetCount(tile)).toBe(1);
@@ -276,7 +289,7 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
     // A second draped layer resolves → pool grows to 2, RT footprint doubles.
     texturizedScenes.add(2n, "b", drapedMesh(), 1);
     getVectorTileStates.mockReturnValue([state("a", 1n), state("b", 2n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
 
     expect(renderTargetCount(tile)).toBe(2);
@@ -292,19 +305,19 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
       texturizedScenes,
       getVectorTileStates,
       reportDrapeGpuBytes,
-      bumpRevision,
-    } = makeTile();
+      markSourcesChanged,
+    } = makeTile({ atlasAllocated: true });
 
     texturizedScenes.add(1n, "a", drapedMesh(), 0);
     texturizedScenes.add(2n, "b", drapedMesh(), 1);
     getVectorTileStates.mockReturnValue([state("a", 1n), state("b", 2n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
     expect(renderTargetCount(tile)).toBe(2);
 
     // "b" is no longer draped here → pool shrinks to 1, RT footprint halves.
     getVectorTileStates.mockReturnValue([state("a", 1n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
 
     expect(renderTargetCount(tile)).toBe(1);
@@ -320,21 +333,20 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
       texturizedScenes,
       getVectorTileStates,
       reportDrapeGpuBytes,
-      bumpRevision,
-    } = makeTile();
+      markSourcesChanged,
+    } = makeTile({ atlasAllocated: true });
 
     texturizedScenes.add(1n, "a", drapedMesh(), 0);
     getVectorTileStates.mockReturnValue([state("a", 1n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
     expect(renderTargetCount(tile)).toBe(1);
 
-    // All draped layers vanish → the render targets go, but the composite
-    // atlas is held for the tile's lifetime (acquired in the constructor), so
-    // the report must fall back to the atlas cost — not 0, which would wipe
-    // the baseline Rust seeds at mesh-attach time.
+    // All draped layers vanish → the render targets go, but the allocated
+    // composite atlas is held for the tile's lifetime, so the report falls
+    // back to the atlas cost, not 0.
     getVectorTileStates.mockReturnValue([]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
 
     expect(renderTargetCount(tile)).toBe(0);
@@ -350,12 +362,12 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
       texturizedScenes,
       getVectorTileStates,
       reportDrapeGpuBytes,
-      bumpRevision,
-    } = makeTile(256);
+      markSourcesChanged,
+    } = makeTile({ atlasSize: 256, atlasAllocated: true });
 
     texturizedScenes.add(1n, "a", drapedMesh(), 0);
     getVectorTileStates.mockReturnValue([state("a", 1n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
 
     // One draped layer → atlas + one 256² render target, a quarter of 512².
@@ -364,9 +376,9 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
       ATLAS_BYTES_SMALL + RT_BYTES_SMALL,
     );
 
-    // Last draped layer vanishes → falls back to the atlas seed, not 0.
+    // Last draped layer vanishes → falls back to the atlas cost, not 0.
     getVectorTileStates.mockReturnValue([]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
     expect(reportDrapeGpuBytes).toHaveBeenLastCalledWith(1n, ATLAS_BYTES_SMALL);
   });
@@ -377,12 +389,12 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
       texturizedScenes,
       getVectorTileStates,
       reportDrapeGpuBytes,
-      bumpRevision,
-    } = makeTile();
+      markSourcesChanged,
+    } = makeTile({ atlasAllocated: true });
 
     texturizedScenes.add(1n, "a", drapedMesh(), 0);
     getVectorTileStates.mockReturnValue([state("a", 1n)]);
-    bumpRevision();
+    markSourcesChanged();
     frame(tile);
     expect(reportDrapeGpuBytes).toHaveBeenLastCalledWith(
       1n,
@@ -395,9 +407,252 @@ describe("TileMesh drape render-target lazy allocation + accounting", () => {
     // Render targets are freed, but dispose must NOT report a zero cost: the
     // handle is position-stable and reused by the replacement mesh entity, so a
     // zero report would resolve (Without<Deleted>) to the NEW live entity and
-    // wipe the atlas cost the Rust side just seeded. The despawn of the old
-    // entity subtracts the cost from the ledger instead.
+    // wipe the atlas cost it reported. The despawn of the old entity subtracts
+    // the cost from the ledger instead.
     expect(renderTargetCount(tile)).toBe(0);
     expect(reportDrapeGpuBytes.mock.calls.length).toBe(callsBeforeDispose);
+  });
+});
+
+describe("TileMesh drape memory of an undrawn tile", () => {
+  function drapedTile() {
+    const made = makeTile({ atlasAllocated: true });
+    made.texturizedScenes.add(1n, "a", drapedMesh(), 0);
+    made.getVectorTileStates.mockReturnValue([state("a", 1n)]);
+    made.ctx.tileMapByHandle.set(1n, made.tile);
+    frame(made.tile);
+    return made;
+  }
+
+  it("keeps the render targets and the atlas of a tile the frame drew", () => {
+    const { tile, compositor } = drapedTile();
+
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    expect(renderTargetCount(tile)).toBe(1);
+    expect(compositor.releaseAtlas).not.toHaveBeenCalled();
+  });
+
+  it("frees them once a frame leaves the tile out", () => {
+    const { tile, compositor, reportDrapeGpuBytes } = drapedTile();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    expect(renderTargetCount(tile)).toBe(0);
+    expect(compositor.releaseAtlas).toHaveBeenCalledWith(1n);
+    expect(reportDrapeGpuBytes).toHaveBeenLastCalledWith(1n, 0);
+  });
+
+  it("bakes the render targets again on the next render", () => {
+    const { tile, renderVectorScenes, reportDrapeGpuBytes } = drapedTile();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    frame(tile);
+
+    expect(renderTargetCount(tile)).toBe(1);
+    expect(renderVectorScenes).toHaveBeenCalledTimes(2);
+    expect(reportDrapeGpuBytes).toHaveBeenLastCalledWith(1n, RT_BYTES);
+  });
+
+  it("keeps the handed slots, so the next render fetches none", () => {
+    const { tile, getVectorTileStates } = drapedTile();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    frame(tile);
+
+    expect(getVectorTileStates).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases once, however many frames leave the tile out", () => {
+    const { tile, compositor } = drapedTile();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    expect(compositor.releaseAtlas).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks for the atlas again while the mesh it replaces holds it", () => {
+    const { tile, compositor } = drapedTile();
+    compositor.releaseAtlas.mockReturnValueOnce(false);
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+    tile.releaseDrapeGpuMemoryUnlessDrawn();
+
+    expect(compositor.releaseAtlas).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("TileMesh composite atlas accounting", () => {
+  it("charges no atlas before the first composite pass", () => {
+    const {
+      tile,
+      texturizedScenes,
+      getVectorTileStates,
+      reportDrapeGpuBytes,
+      markSourcesChanged,
+    } = makeTile();
+
+    texturizedScenes.add(1n, "a", drapedMesh(), 0);
+    getVectorTileStates.mockReturnValue([state("a", 1n)]);
+    markSourcesChanged();
+    frame(tile);
+
+    expect(reportDrapeGpuBytes).toHaveBeenLastCalledWith(1n, RT_BYTES);
+  });
+
+  it("charges the atlas once the composite pass allocates it", () => {
+    const { tile, compositor, reportDrapeGpuBytes } = makeTile();
+    expect(reportDrapeGpuBytes).not.toHaveBeenCalled();
+
+    compositor.cache.isDirty.mockReturnValue(true);
+    frame(tile);
+
+    expect(compositor.runCompositePassIfDirty).toHaveBeenCalledOnce();
+    expect(reportDrapeGpuBytes).toHaveBeenLastCalledWith(1n, ATLAS_BYTES);
+  });
+
+  it("bakes the atlas with a normal attachment iff the main shader reads it", () => {
+    const { tile, compositor } = makeTile();
+    compositor.cache.isDirty.mockReturnValue(true);
+
+    frame(tile);
+    expect(compositor.runCompositePassIfDirty).toHaveBeenLastCalledWith(
+      1n,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      false,
+    );
+
+    tile.material.userData.defines = { USE_HILLSHADE: 1 };
+    frame(tile);
+    expect(compositor.runCompositePassIfDirty).toHaveBeenLastCalledWith(
+      1n,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      true,
+    );
+  });
+
+  it("reports an atlas the outgoing mesh bakes through the registered mesh", () => {
+    const { tile, ctx, meshAdded, compositor, reportDrapeGpuBytes } =
+      makeTile();
+    // A replacement mesh for the same handle claims it and shares the atlas.
+    new TileMesh(ctx, meshAdded);
+    expect(reportDrapeGpuBytes).not.toHaveBeenCalled();
+
+    // The outgoing mesh still renders and bakes the shared atlas.
+    compositor.cache.isDirty.mockReturnValue(true);
+    frame(tile);
+
+    expect(reportDrapeGpuBytes).toHaveBeenCalledExactlyOnceWith(
+      1n,
+      ATLAS_BYTES,
+    );
+  });
+
+  it("charges an already-allocated atlas on construction", () => {
+    const { reportDrapeGpuBytes } = makeTile({ atlasAllocated: true });
+
+    expect(reportDrapeGpuBytes).toHaveBeenCalledExactlyOnceWith(
+      1n,
+      ATLAS_BYTES,
+    );
+  });
+});
+
+describe("TileMesh handle registration", () => {
+  it("keeps the replacing mesh registered when the outgoing one is disposed", () => {
+    const { tile, ctx, meshAdded } = makeTile();
+    // A replacement mesh for the same position-stable handle is constructed
+    // before the outgoing one is disposed.
+    const incoming = new TileMesh(ctx, meshAdded);
+
+    tile.dispose(ctx.tileMapByHandle);
+    expect(ctx.tileMapByHandle.get(1n)).toBe(incoming);
+
+    incoming.dispose(ctx.tileMapByHandle);
+    expect(ctx.tileMapByHandle.has(1n)).toBe(false);
+  });
+});
+
+describe("TileMesh shadow casting", () => {
+  it("leaves the skirt out of the shadow draw only", () => {
+    const { tile } = makeTile();
+    tile["terrainIndexCount"] = 6;
+
+    tile["_onBeforeShadow"]();
+    expect(tile.geometry.drawRange).toEqual({ start: 0, count: 6 });
+
+    tile["_onAfterShadow"]();
+    expect(tile.geometry.drawRange).toEqual({ start: 0, count: Infinity });
+  });
+});
+
+describe("TileMesh geometry replacement", () => {
+  /** Replace the geometry with one that does or does not carry a watermask. */
+  function replaceWith(tile: TileMesh, watermask: boolean) {
+    const internals = tile as unknown as {
+      installGeometry: () => unknown;
+    };
+    vi.spyOn(internals, "installGeometry").mockImplementation(() => {
+      tile.userData.watermask = watermask
+        ? {
+            data: new Uint8Array(1),
+            isUniform: true,
+            texture: new DataTexture(),
+          }
+        : undefined;
+      tile.userData.hasNormalAttribute = false;
+      return new Box3();
+    });
+    tile.replaceGeometry(
+      {} as unknown as Parameters<TileMesh["replaceGeometry"]>[0],
+    );
+  }
+
+  it("recompiles and rebakes when a watermask appears", () => {
+    const { tile, ctx } = makeTile();
+    const version = tile.material.version;
+
+    replaceWith(tile, true);
+
+    expect(tile.material.version).toBeGreaterThan(version);
+    expect(ctx.tileTextureCompositor.markDirty).toHaveBeenCalledWith(
+      1n,
+      "watermask",
+    );
+  });
+
+  it("rebakes without recompiling when the watermask is replaced", () => {
+    const { tile, ctx } = makeTile();
+    replaceWith(tile, true);
+    const version = tile.material.version;
+    vi.mocked(ctx.tileTextureCompositor.markDirty).mockClear();
+
+    replaceWith(tile, true);
+
+    expect(tile.material.version).toBe(version);
+    expect(ctx.tileTextureCompositor.markDirty).toHaveBeenCalledWith(
+      1n,
+      "watermask",
+    );
+  });
+
+  it("leaves a tile without a watermask alone", () => {
+    const { tile, ctx } = makeTile();
+    const version = tile.material.version;
+
+    replaceWith(tile, false);
+
+    expect(tile.material.version).toBe(version);
+    expect(ctx.tileTextureCompositor.markDirty).not.toHaveBeenCalled();
   });
 });

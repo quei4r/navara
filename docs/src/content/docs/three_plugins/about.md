@@ -19,7 +19,11 @@ navara_three (core: ThreeView, Plugin, addPlugin)
         ├── PersonViewPlugin (keyboard-driven first/third-person view controller)
         ├── OverlayPlugin (world-to-screen HTML overlay projection)
         ├── CesiumIonPlugin (Cesium Ion quantized-mesh terrain)
-        └── TileJsonPlugin (TileJSON 3.0.0 tile source registration)
+        ├── TileJsonPlugin (TileJSON 3.0.0 tile source registration)
+        ├── StreetLightsPlugin (street lamps, roof beacons and traffic at night)
+        ├── DevtoolsPlugin (development tools: profiler, layer and camera inspectors)
+        └── MaterialSchemaPlugin (layer materials and styles as JSON for style UIs;
+                                  the schema itself is @navaramap/material-schema)
 ```
 
 `three_plugins` depends on `navara_three` for the `Plugin` base class and core APIs, and on `three_default_plugin` for the `DefaultDescriptions` type. Each plugin is independent. You can use one without the other.
@@ -33,6 +37,9 @@ import {
   moveOverlayElement,
   CesiumIonPlugin,
   TileJsonPlugin,
+  StreetLightsPlugin,
+  DevtoolsPlugin,
+  MaterialSchemaPlugin,
 } from "@navaramap/three-plugins";
 ```
 
@@ -53,6 +60,18 @@ Resolves a Cesium Ion asset endpoint at `init()` time and registers it as a quan
 ### TileJsonPlugin
 
 Fetches a TileJSON 3.0.0 document and registers it as a single raster, vector, or raster-DEM (elevation) tile source via `addSource()`, deriving the tile URL, zoom range, scheme, attribution (and, for raster-DEM, the MapLibre-compatible `tileSize` / `encoding`) from the document. See [TileJsonPlugin](../tilejsonplugin/) for details.
+
+### StreetLightsPlugin :since[0.3.2]
+
+Takes the roads and the buildings of a vector tile set, each with its source and a reader for its properties, draws the road surfaces, and streams the zoom 14 tiles in around a position to place street lamps along the roads, red beacons on the roofs the reader picks and cars that drive the road segments. The lamps and beacons take part in the selective effects given to `start()`, such as the built-in bloom. See [StreetLightsPlugin](../streetlightsplugin/) for details.
+
+### DevtoolsPlugin :since[0.3.2]
+
+Development tools on one panel: a profiler (frame time, memory, downloads, render buffers) a layer inspector (each layer's cost, visibility and a style form) and a camera inspector (position, orientation and field of view, with copy and paste). For development builds only. See [DevtoolsPlugin](../devtoolsplugin/) for details.
+
+### MaterialSchemaPlugin :since[0.3.2]
+
+Describes every layer material the engine accepts as JSON: the materials of each layer type, and each field's kind, documentation, default, accepted values and whether a change applies at once or only after the layer is added again. `describeLayer()` adds a layer's own values, for building a style UI. See [MaterialSchemaPlugin](../materialschemaplugin/) for details.
 
 ## Usage
 

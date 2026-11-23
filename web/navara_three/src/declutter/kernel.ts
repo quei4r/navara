@@ -1,3 +1,5 @@
+import type { Overlap } from "../type";
+
 /**
  * The pure numeric placement kernel used by {@link DeclutterManager}.
  *
@@ -18,7 +20,10 @@ export type DeclutterKernel = {
    *   candidate; pass a subarray of exactly `n * CANDIDATE_STRIDE`.
    * @param view Column-major view matrix (inverse of `camera.matrixWorld`), 16.
    * @param proj Column-major projection matrix, 16.
-   * @returns One `hidden` flag (`0`/`1`) per candidate, in input order.
+   * @param horizonMinHeight Height (never positive) the ellipsoid is shrunk
+   *   by for horizon culling, as the renderer's `nvrHorizonMinHeight`.
+   * @returns One `hidden` flag (`0`/`1`) per candidate, in input order; of
+   *   a variable-anchor group at most one row is shown.
    */
   place(
     candidates: Float64Array,
@@ -31,7 +36,7 @@ export type DeclutterKernel = {
     widthPx: number,
     heightPx: number,
     fovRad: number,
-    paddingPx: number,
+    horizonMinHeight: number,
     hysteresisPx: number,
   ): Uint8Array;
 };
@@ -41,6 +46,20 @@ export type DeclutterKernel = {
  * sync with `CANDIDATE_STRIDE` in `crates/navara_wasm_api/src/declutter.rs`.
  *
  * Layout: `[anchorX, anchorY, anchorZ, addHeight, minX, maxX, minY, maxY,
- * sizeInMeters, priority, isShown]`.
+ * sizeInMeters, priority, isShown, overlap, ignorePlacement, rank, paddingTop,
+ * paddingRight, paddingBottom, paddingLeft, pairGroup, featureIndex, pairRole,
+ * standalone, flatFacing, rotateWithCamera, rotation, translateX, translateY,
+ * translateMap, variants]`, with `overlap` coded by
+ * {@link OVERLAP_CODES} and `pairRole` by {@link PAIR_ROLE_CODES}.
  */
-export const CANDIDATE_STRIDE = 11;
+export const CANDIDATE_STRIDE = 29;
+
+/** Kernel codes for a candidate's pair role; `0` is unpaired. */
+export const PAIR_ROLE_CODES = { label: 1, billboard: 2 } as const;
+
+/** Kernel codes for {@link Overlap}. */
+export const OVERLAP_CODES: Record<Overlap, number> = {
+  never: 0,
+  always: 1,
+  cooperative: 2,
+};

@@ -15,6 +15,11 @@ pub struct EventStore {
     pub mesh_removed: Vec<Entity>,
     pub mesh_added: Vec<Entity>,
     pub mesh_updated: Vec<Entity>,
+    /// A live tile mesh whose geometry buffers were rewritten in place (an
+    /// upsampled terrain mesh replaced by its real DEM). Emitted instead of
+    /// `mesh_updated` so the platform swaps only the geometry and leaves the
+    /// material, textures and drape state untouched.
+    pub mesh_geometry_replaced: Vec<Entity>,
     pub data_requested: Vec<Entity>,
     pub data_requester_removed: Vec<Entity>,
     pub texture_fragment_reqested: Vec<Entity>,
@@ -25,8 +30,12 @@ pub struct EventStore {
     pub renderable_feature_changed: Vec<Entity>,
     pub renderable_feature_removed: Vec<Entity>,
     pub update_sample_terrain_height: Vec<Entity>,
+    pub update_terrain_height_range: Vec<Entity>,
     pub hillshade_backfilled: Vec<Entity>,
     pub hillshade_canceled: Vec<Entity>,
+    pub terrain_exaggeration_updated: Option<TerrainExaggerationUpdated>,
+    /// Terrain tiles (handles) whose vector drape sources were handed over anew.
+    pub vector_drape_changed: Vec<u64>,
 }
 
 impl EventStore {
@@ -38,6 +47,7 @@ impl EventStore {
         self.mesh_removed.clear();
         self.mesh_added.clear();
         self.mesh_updated.clear();
+        self.mesh_geometry_replaced.clear();
         self.data_requested.clear();
         self.data_requester_removed.clear();
         self.texture_fragment_reqested.clear();
@@ -48,7 +58,10 @@ impl EventStore {
         self.renderable_feature_changed.clear();
         self.renderable_feature_removed.clear();
         self.update_sample_terrain_height.clear();
+        self.update_terrain_height_range.clear();
         self.hillshade_backfilled.clear();
         self.hillshade_canceled.clear();
+        self.terrain_exaggeration_updated = None;
+        self.vector_drape_changed.clear();
     }
 }

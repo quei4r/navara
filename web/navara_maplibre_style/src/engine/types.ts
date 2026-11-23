@@ -10,6 +10,7 @@ import type {
   RasterSourceSpecification,
   RasterDEMSourceSpecification,
   TerrainSpecification,
+  FontFacesSpecification,
 } from "@maplibre/maplibre-gl-style-spec";
 
 /**
@@ -21,6 +22,16 @@ export type ParsedStyle = {
   sources: Record<string, StyleSource>;
   layers: StyleLayer[];
   terrain?: TerrainSpecification;
+  glyphs?: string; // URL template for font glyphs (not supported, use font-faces instead)
+  "font-faces"?: FontFacesSpecification; // Font face definitions
+  metadata?: Record<string, unknown>; // Custom metadata
+  // Camera initialization properties
+  center?: [number, number]; // [lng, lat] in degrees
+  zoom?: number; // Web Mercator zoom level
+  centerAltitude?: number; // Altitude of the target point in meters (defaults to 0)
+  bearing?: number; // Compass bearing in degrees (0 = north, 90 = east)
+  pitch?: number; // MapLibre pitch in degrees (0 = straight down, 60 = towards horizon)
+  roll?: number; // Camera roll in degrees
 };
 
 /**
@@ -56,7 +67,7 @@ export type RasterDemSource = Omit<RasterDEMSourceSpecification, "encoding"> & {
 };
 
 /**
- * Layer types supported: fill, fill-extrusion, line, circle, symbol, raster, hillshade.
+ * Layer types supported: fill, fill-extrusion, line, circle, symbol, raster, hillshade, background.
  *
  * Note: We define our own simplified layer types instead of using the official MapLibre
  * LayerSpecification types because:
@@ -72,7 +83,9 @@ export type StyleLayer =
   | CircleLayer
   | SymbolLayer
   | RasterLayer
-  | HillshadeLayer;
+  | HillshadeLayer
+  | ColorReliefLayer
+  | BackgroundLayer;
 
 export type LayerType =
   | "fill"
@@ -81,7 +94,9 @@ export type LayerType =
   | "circle"
   | "symbol"
   | "raster"
-  | "hillshade";
+  | "hillshade"
+  | "color-relief"
+  | "background";
 
 export type BaseLayer = {
   id: string;
@@ -157,6 +172,31 @@ export type HillshadePaint = {
   "hillshade-exaggeration"?: ValueExpression;
 };
 
+export type ColorReliefLayer = {
+  type: "color-relief";
+  paint?: ColorReliefPaint;
+} & BaseLayer;
+
+export type ColorReliefPaint = {
+  "color-relief-opacity"?: ValueExpression;
+  "color-relief-color"?: ValueExpression;
+  resampling?: "linear" | "nearest";
+};
+
+export type BackgroundLayer = {
+  id: string;
+  type: "background";
+  paint?: BackgroundPaint;
+  minzoom?: number;
+  maxzoom?: number;
+  layout?: Record<string, unknown>;
+};
+
+export type BackgroundPaint = {
+  "background-color"?: ValueExpression;
+  "background-opacity"?: ValueExpression;
+};
+
 export type SymbolLayer = {
   type: "symbol";
   layout?: SymbolLayout;
@@ -170,9 +210,29 @@ export type SymbolLayout = {
   "icon-anchor"?: ValueExpression;
   "text-field"?: ValueExpression;
   "text-size"?: ValueExpression;
+  "text-letter-spacing"?: ValueExpression;
   "text-offset"?: ValueExpression;
   "text-anchor"?: ValueExpression;
   "text-font"?: ValueExpression;
+  "text-rotate"?: ValueExpression;
+  "text-transform"?: ValueExpression;
+  "text-max-width"?: ValueExpression;
+  "text-line-height"?: ValueExpression;
+  "text-justify"?: ValueExpression;
+  "text-max-angle"?: ValueExpression;
+  "text-keep-upright"?: ValueExpression;
+  "text-rotation-alignment"?: ValueExpression;
+  "text-pitch-alignment"?: ValueExpression;
+  "text-allow-overlap"?: ValueExpression;
+  "text-overlap"?: ValueExpression;
+  "icon-rotate"?: ValueExpression;
+  "icon-rotation-alignment"?: ValueExpression;
+  "icon-pitch-alignment"?: ValueExpression;
+  "icon-allow-overlap"?: ValueExpression;
+  "icon-overlap"?: ValueExpression;
+  "symbol-placement"?: ValueExpression;
+  "symbol-spacing"?: ValueExpression;
+  "symbol-sort-key"?: ValueExpression;
 };
 
 export type SymbolPaint = {
@@ -180,6 +240,13 @@ export type SymbolPaint = {
   "icon-opacity"?: ValueExpression;
   "text-color"?: ValueExpression;
   "text-opacity"?: ValueExpression;
+  "text-halo-color"?: ValueExpression;
+  "text-halo-width"?: ValueExpression;
+  "text-halo-blur"?: ValueExpression;
+  "text-translate"?: ValueExpression;
+  "text-translate-anchor"?: ValueExpression;
+  "icon-translate"?: ValueExpression;
+  "icon-translate-anchor"?: ValueExpression;
 };
 
 /**
@@ -192,11 +259,16 @@ export type FilterExpression = unknown[];
 /**
  * Context for evaluating style expressions.
  *
- * TODO: Add zoom support - requires camera movement listeners and re-evaluation
- * when zoom changes, since features from different tile zoom levels coexist.
+ * Includes zoom level for zoom-based expressions (e.g., ["step", ["zoom"], ...]).
+ * Currently uses camera zoom for simplicity, though MapLibre traditionally uses
+ * per-tile zoom levels. This means all features evaluate expressions at the same
+ * zoom regardless of their source tile's zoom level.
  */
 export type EvaluationContext = {
   properties: Record<string, unknown> | undefined;
+  zoom?: number;
+  /** Terrain elevation in meters for `["elevation"]` (color-relief-color). */
+  elevation?: number;
 };
 
 /**
@@ -204,6 +276,7 @@ export type EvaluationContext = {
  */
 export type FeatureContext = {
   properties: Record<string, unknown> | undefined;
+  zoom?: number;
 };
 
 /**
@@ -258,7 +331,16 @@ export type StyleValue =
  * This matches the structure from @maplibre/maplibre-gl-style-spec.
  */
 export type PropertySpec = {
-  type: "color" | "number" | "boolean" | "string" | "array";
+  type:
+    | "color"
+    | "number"
+    | "boolean"
+    | "string"
+    | "array"
+    | "formatted"
+    | "resolvedImage"
+    | "padding"
+    | "variableAnchorOffsetCollection";
   default?: unknown;
   minimum?: number;
   maximum?: number;

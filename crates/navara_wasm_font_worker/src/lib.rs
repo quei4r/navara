@@ -30,8 +30,9 @@ pub fn composite_key(font_index: u32, glyph_id: u32) -> u64 {
 
 /// Atlas bytes returned to TypeScript. `channels`: 1 → R8 (SDF),
 /// 4 → RGBA8 (MSDF or color).
-#[wasm_bindgen(getter_with_clone)]
+#[wasm_bindgen]
 pub struct FontAtlas {
+    #[wasm_bindgen(getter_with_clone)]
     pub data: js_sys::Uint8Array,
     pub width: u32,
     pub height: u32,
@@ -64,11 +65,17 @@ pub struct WasmShapedGlyph {
     pub y_offset: i32,
     /// One of the `shaping::CHAR_CLASS_*` constants (line-break info).
     pub char_class: u8,
+    /// Same cluster as the previous glyph; letter spacing skips these.
+    pub continues_cluster: bool,
+    /// One of the `shaping::DIRECTION_*` constants (segment direction).
+    pub direction: u8,
 }
 
-#[wasm_bindgen(getter_with_clone)]
+#[wasm_bindgen]
 pub struct ShapeTextResult {
+    #[wasm_bindgen(getter_with_clone)]
     pub glyphs: Vec<WasmShapedGlyph>,
+    #[wasm_bindgen(getter_with_clone)]
     pub metrics: Vec<WasmGlyphMetrics>,
     pub units_per_em: u16,
     /// Vertical line metrics in font units, for multi-line layout.
@@ -83,6 +90,9 @@ pub struct ShapeTextResult {
     /// reused rects mean cached TS metrics for this atlas may be stale, so TS
     /// bumps the atlas generation to force a re-shape on next use.
     pub evicted: bool,
+    /// False when letter spacing must not be applied to this text (it contains
+    /// cursive Arabic).
+    pub allows_letter_spacing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +227,8 @@ impl FontCache {
                 x_offset: g.x_offset,
                 y_offset: g.y_offset,
                 char_class: g.char_class,
+                continues_cluster: g.continues_cluster,
+                direction: g.direction,
             })
             .collect();
 
@@ -258,6 +270,7 @@ impl FontCache {
             atlas_changed,
             is_color,
             evicted,
+            allows_letter_spacing: shaping::allows_letter_spacing(text),
         })
     }
 

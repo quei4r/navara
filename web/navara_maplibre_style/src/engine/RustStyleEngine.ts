@@ -5,8 +5,6 @@
  * providing better performance and type safety through the maplibre-expr crate.
  */
 
-import { validateStyleMin } from "@maplibre/maplibre-gl-style-spec";
-import type { StyleSpecification } from "@maplibre/maplibre-gl-style-spec";
 import { CompiledExpression, CompiledFilter } from "@navaramap/engine";
 
 import type { StyleEngine } from "./StyleEngine";
@@ -21,24 +19,12 @@ import type {
   FeatureContext,
   FilterExpression,
   LayerType,
-  ParsedStyle,
   PropertySpec,
   StyleValue,
   ValueExpression,
 } from "./types";
 
 export class RustStyleEngine implements StyleEngine {
-  async parseStyle(raw: unknown): Promise<ParsedStyle> {
-    const errors = validateStyleMin(raw as StyleSpecification);
-
-    if (errors && errors.length > 0) {
-      const errorMessages = errors.map((e: { message: string }) => e.message);
-      throw new Error(`Invalid MapLibre Style: ${errorMessages.join(", ")}`);
-    }
-
-    return raw as ParsedStyle;
-  }
-
   createFilter(
     expr: FilterExpression,
     _layerType: LayerType,
@@ -49,25 +35,21 @@ export class RustStyleEngine implements StyleEngine {
       return () => true;
     }
     // Compile filter in WASM
-    let compiled: CompiledFilter;
-    try {
-      compiled = new CompiledFilter(expr);
-    } catch (e) {
-      console.error("Filter compilation error:", e);
-      return () => false; // Hide features when filter can't be compiled
-    }
+    const compiled = new CompiledFilter(expr);
 
     // Return evaluation function
     return (ctx: FeatureContext) => {
       try {
-        return compiled.test(
+        const result = compiled.test(
           ctx.properties ?? {},
-          0, // TODO: Get actual zoom from camera
+          ctx.zoom ?? 0, // Use tile zoom if available, otherwise 0 for non-tiled features
           featureGeometryType, // Pass geometry type for ["geometry-type"] filters
         );
-      } catch (e) {
-        console.error("Filter evaluation error:", e);
-        return false; // Default to hiding features on error
+        return result;
+      } catch (_err) {
+        // Runtime evaluation error (e.g., invalid property value, type mismatch)
+        // Hide this feature (return false) rather than breaking the entire layer
+        return false;
       }
     };
   }
@@ -77,18 +59,28 @@ export class RustStyleEngine implements StyleEngine {
     spec: PropertySpec,
     featureGeometryType = "Point",
   ): (ctx: EvaluationContext) => T {
+    // Note: migrate() has already converted legacy functions and tokens to modern expressions
+    // in validateAndMigrateStyle(), so we don't need to handle them here.
+
     // Handle constant values directly (optimization).
     // For color strings, still compile via WASM so maplibre-expr can validate/coerce (and preserve alpha).
     if (typeof expr === "number" || typeof expr === "boolean") {
       const constantValue = expr as T;
       return () => constantValue;
     }
-    if (typeof expr === "string" && spec.type !== "color") {
-      const constantValue = expr as T;
-      return () => constantValue;
+
+    if (typeof expr === "string") {
+      if (spec.type === "color") {
+        // Color strings must be compiled for validation
+        // Fall through to compile
+      } else {
+        // Constant string (tokens already converted by migrate)
+        const constantValue = expr as T;
+        return () => constantValue;
+      }
     }
 
-    // MapLibre allows literal arrays as property values (e.g., [1, 2, 3]).
+    // MapLibre allows literal arrays as property values (e.g., [1, 2, 3], ["/fonts/..."]).
     // Only treat as constant if it's empty or doesn't start with a string operator.
     if (
       Array.isArray(expr) &&
@@ -112,7 +104,7 @@ export class RustStyleEngine implements StyleEngine {
       // If compilation fails and this looks like a literal array (paths, font names, etc.),
       // treat it as a constant value instead of throwing.
       // This handles cases like text-font: ["/fonts/custom.ttf"] or ["Font Name"] which are valid literals.
-      if (isLiteralArray(expr)) {
+      if (isLiteralArray(expr, spec)) {
         const constantValue = expr as unknown as T;
         return () => constantValue;
       }
@@ -123,30 +115,31 @@ export class RustStyleEngine implements StyleEngine {
 
     // Return evaluation function with optimized property passing
     return (ctx: EvaluationContext) => {
-      try {
-        // Filter properties to only required ones to reduce serialization overhead
-        let propsToPass: Record<string, unknown>;
-        if (requiredProps === null || requiredProps.length === 0) {
-          // Empty array means dynamic property access (e.g., ["get", ["concat", ...]])
-          // since constants are already filtered out above.
-          // Conservative approach: pass all properties to avoid breaking evaluation.
-          propsToPass = ctx.properties ?? {};
-        } else {
-          // Only pass required properties
-          propsToPass = {};
-          if (ctx.properties) {
-            for (const prop of requiredProps) {
-              if (Object.prototype.hasOwnProperty.call(ctx.properties, prop)) {
-                propsToPass[prop] = ctx.properties[prop];
-              }
+      // Filter properties to only required ones to reduce serialization overhead
+      let propsToPass: Record<string, unknown>;
+      if (requiredProps === null || requiredProps.length === 0) {
+        // Empty array means dynamic property access (e.g., ["get", ["concat", ...]])
+        // since constants are already filtered out above.
+        // Conservative approach: pass all properties to avoid breaking evaluation.
+        propsToPass = ctx.properties ?? {};
+      } else {
+        // Only pass required properties
+        propsToPass = {};
+        if (ctx.properties) {
+          for (const prop of requiredProps) {
+            if (Object.prototype.hasOwnProperty.call(ctx.properties, prop)) {
+              propsToPass[prop] = ctx.properties[prop];
             }
           }
         }
+      }
 
+      try {
         const result = compiled.evaluate(
           propsToPass,
-          0, // navara currently doesn't provide zoom info, so we pass 0 for now
+          ctx.zoom ?? 0, // Use tile zoom if available, otherwise 0 for non-tiled features
           featureGeometryType, // Pass geometry type for expressions that need it
+          ctx.elevation, // ["elevation"] (color-relief-color only)
         );
 
         if (result == null) {

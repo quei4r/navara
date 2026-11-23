@@ -1,12 +1,7 @@
-import {
-  Color,
-  DataTexture,
-  FloatType,
-  Material,
-  RGBAFormat,
-  type WebGLRenderer,
-} from "three";
+import { Color, type DataTexture, Material, type WebGLRenderer } from "three";
 import invariant from "tiny-invariant";
+
+import { createFloatDataTexture } from "../utils/floatDataTexture";
 
 import { batchBaseIndex } from "./layout";
 import {
@@ -18,6 +13,7 @@ import {
   type BatchTextureState,
 } from "./material";
 import type {
+  BatchAttributeDefaults,
   BatchScalarKey,
   BatchScalarSlotKey,
   BatchSlot,
@@ -41,10 +37,54 @@ function scalarDefault(key: BatchScalarKey): number {
     // Negative value indicates shader should fall back to minMaxHeightAndWidth.z
     case "lineWidth":
       return -1.0;
+    // The atlas row every view reserves for a solid line.
+    case "lineDash":
+      return 0.0;
     // Negative value indicates shader should fall back to the material size
     case "size":
       return -1.0;
+    case "rotation":
+      return 0.0;
+    // Upright + following the camera, matching the material defaults.
+    case "orientation":
+      return packOrientation(false, true);
+    // `anchorCode("center")`.
+    case "anchor":
+      return 4.0;
+    case "offsetX":
+    case "offsetY":
+      return 0.0;
   }
+}
+
+/**
+ * Pack the orientation booleans into one component: `spreadGlyphs` (text only)
+ * in the 4s place, `flatFacing` in the 2s place, `rotateWithCamera` in the 1s
+ * place, giving the exact float values 0-7. Same trick as
+ * {@link packShowOpacity}: per-feature booleans that would otherwise each burn
+ * a texel component.
+ */
+export function packOrientation(
+  flatFacing: boolean,
+  rotateWithCamera: boolean,
+  spreadGlyphs = false,
+): number {
+  return (
+    (spreadGlyphs ? 4 : 0) + (flatFacing ? 2 : 0) + (rotateWithCamera ? 1 : 0)
+  );
+}
+
+/** Unpack orientation (see {@link packOrientation}). */
+export function unpackOrientation(packed: number): {
+  flatFacing: boolean;
+  rotateWithCamera: boolean;
+  spreadGlyphs: boolean;
+} {
+  return {
+    flatFacing: packed % 4 >= 1.5,
+    rotateWithCamera: packed % 2 >= 0.5,
+    spreadGlyphs: packed >= 3.5,
+  };
 }
 
 /**
@@ -169,14 +209,7 @@ function ensureTextureRows(state: BatchTextureState): Float32Array {
     data.set(old.image.data as Float32Array);
     old.dispose();
   }
-  const texture = new DataTexture(
-    data,
-    state.width,
-    height,
-    RGBAFormat,
-    FloatType,
-  );
-  texture.needsUpdate = true;
+  const texture = createFloatDataTexture(data, state.width, height);
   pendingFirstUpload.add(texture);
   textureOwners.set(texture, state);
   texture.addEventListener("dispose", () => {
@@ -190,7 +223,8 @@ function ensureTextureRows(state: BatchTextureState): Float32Array {
 const WHITE = new Color(1, 1, 1);
 const BLACK = new Color(0, 0, 0);
 
-/** Fixed vec3 default: color → white (multiplier identity), emissive → black. */
+/** Fixed vec3 default: color → white (multiplier identity), emissive and
+ *  outline color → black. */
 function vec3Default(key: BatchVec3Key): Color {
   return key === "color" ? WHITE : BLACK;
 }
@@ -242,6 +276,32 @@ function ensureEmissiveSlots(
     state.layout.getScalarSlot("emissiveIntensity") ??
     allocateScalarSlot(state, "emissiveIntensity", 1);
   return { row, intensity };
+}
+
+/**
+ * Slots for a text outline: the color row and its opacity, width and blur
+ * scalars, allocated together so the fragment shader never mixes a written
+ * value with an unbackfilled one. The defaults (black, opaque, zero width and
+ * blur) draw no outline.
+ */
+function ensureOutlineSlots(state: BatchTextureState):
+  | {
+      row: number;
+      opacity: BatchSlot;
+      width: BatchSlot;
+      blur: BatchSlot;
+    }
+  | undefined {
+  const row = ensureVec3Row(state, "outlineColor");
+  if (row == null) return undefined;
+  const scalar = (key: BatchScalarSlotKey, fallback: number) =>
+    state.layout.getScalarSlot(key) ?? allocateScalarSlot(state, key, fallback);
+  return {
+    row,
+    opacity: scalar("outlineOpacity", 1),
+    width: scalar("outlineWidth", 0),
+    blur: scalar("outlineBlur", 0),
+  };
 }
 
 /**
@@ -308,6 +368,103 @@ function ensureShowOpacitySlot(
   );
 }
 
+/**
+ * Slot of the per-feature rotation, and of the packed orientation pair.
+ *
+ * Both backfill with the **material's** current value (passed in by the mesh
+ * as {@link BatchAttributeDefaults}) rather than a fixed constant, because
+ * `USE_BATCH_*` is a material-wide define: the moment one feature gets its own
+ * value every feature starts reading the slot, so features nobody has styled
+ * must already hold what the uniform was giving them. Same reasoning as
+ * {@link ensureShowOpacitySlot}.
+ */
+function ensureRotationSlot(
+  state: BatchTextureState,
+  defaults: Partial<BatchAttributeDefaults> | undefined,
+): BatchSlot | undefined {
+  if (!state.supported.has("rotation")) return undefined;
+  return (
+    state.layout.getScalarSlot("rotation") ??
+    allocateScalarSlot(
+      state,
+      "rotation",
+      defaults?.rotation ?? scalarDefault("rotation"),
+    )
+  );
+}
+
+function ensureOrientationSlot(
+  state: BatchTextureState,
+  defaults: Partial<BatchAttributeDefaults> | undefined,
+): BatchSlot | undefined {
+  if (!state.supported.has("orientation")) return undefined;
+  return (
+    state.layout.getScalarSlot("orientation") ??
+    allocateScalarSlot(
+      state,
+      "orientation",
+      packOrientation(
+        defaults?.flatFacing ?? false,
+        defaults?.rotateWithCamera ?? true,
+        defaults?.spreadGlyphs ?? false,
+      ),
+    )
+  );
+}
+
+/** Slot of the per-feature anchor, backfilled like {@link ensureRotationSlot}. */
+function ensureAnchorSlot(
+  state: BatchTextureState,
+  defaults: Partial<BatchAttributeDefaults> | undefined,
+): BatchSlot | undefined {
+  if (!state.supported.has("anchor")) return undefined;
+  return (
+    state.layout.getScalarSlot("anchor") ??
+    allocateScalarSlot(
+      state,
+      "anchor",
+      defaults?.anchor ?? scalarDefault("anchor"),
+    )
+  );
+}
+
+/**
+ * Slots of the per-feature offset. Both halves are allocated together, so the
+ * shader never reads one written component beside an unbackfilled one; they
+ * backfill like {@link ensureRotationSlot}.
+ */
+function ensureOffsetSlots(
+  state: BatchTextureState,
+  defaults: Partial<BatchAttributeDefaults> | undefined,
+): { x: BatchSlot; y: BatchSlot } | undefined {
+  if (!state.supported.has("offsetX") || !state.supported.has("offsetY")) {
+    return undefined;
+  }
+  const x =
+    state.layout.getScalarSlot("offsetX") ??
+    allocateScalarSlot(state, "offsetX", defaults?.offset?.[0] ?? 0);
+  const y =
+    state.layout.getScalarSlot("offsetY") ??
+    allocateScalarSlot(state, "offsetY", defaults?.offset?.[1] ?? 0);
+  return { x, y };
+}
+
+/**
+ * Whether an attribute's slot has already been allocated on this material.
+ *
+ * Meshes use this to decide whether a **material**-level change has to be
+ * written through to every feature. While no slot exists the shader's uniform
+ * is still governing, so there is nothing to reconcile and writing would only
+ * allocate a row the layer never needed; once a slot exists every feature
+ * reads the texture, so a stale per-feature value would survive the change.
+ */
+export function hasBatchScalarSlot(
+  material: Material,
+  key: BatchScalarSlotKey,
+): boolean {
+  return !!getBatchTextureState(material)?.layout.getScalarSlot(key);
+}
+
 export function getBatchDataTexture(
   material: Material,
 ): DataTexture | undefined {
@@ -322,7 +479,7 @@ export function getBatchDataTexture(
 export function readBatchScalar(
   material: Material,
   batchId: number,
-  key: BatchScalarKey,
+  key: BatchScalarSlotKey,
 ): number | undefined {
   const state = getBatchTextureState(material);
   const slot = state?.layout.getScalarSlot(key);
@@ -385,12 +542,17 @@ function textureData(state: BatchTextureState): {
  * Returns whether the write actually landed — callers must not stamp any
  * batch define or enhancer flag for a rejected write (wrong value type,
  * unsupported attribute, or no texture yet).
+ *
+ * `defaults` carries the material-level values of uniform-backed attributes;
+ * it is only read when this write is the one that allocates the slot (see
+ * {@link BatchAttributeDefaults}).
  */
 export function updateBatchAttribute(
   material: Material,
   batchId: number,
   attribute: BatchedAttributeName,
   value: number | number[] | boolean,
+  defaults?: Partial<BatchAttributeDefaults>,
 ): boolean {
   const state = getBatchTextureState(material);
   // Without a known batchLength the texture cannot exist yet; nothing to write.
@@ -504,9 +666,129 @@ export function updateBatchAttribute(
       markTexelDirty(texture, baseIndex);
       return true;
     }
+    case "flatFacing":
+    case "rotateWithCamera":
+    case "spreadGlyphs": {
+      if (typeof value !== "boolean") return false;
+      const slot = ensureOrientationSlot(state, defaults);
+      if (!slot) return false;
+      enableDefine(material, "USE_BATCH_ORIENTATION");
+
+      const { texture, data } = textureData(state);
+      const baseIndex = batchBaseIndex(
+        state.width,
+        state.groups,
+        batchId,
+        slot.row,
+      );
+      // Read-modify-write: the booleans share this component.
+      const next = {
+        ...unpackOrientation(data[baseIndex + slot.comp]),
+        [attribute]: value,
+      };
+      data[baseIndex + slot.comp] = packOrientation(
+        next.flatFacing,
+        next.rotateWithCamera,
+        next.spreadGlyphs,
+      );
+      markTexelDirty(texture, baseIndex);
+      return true;
+    }
+    case "rotation": {
+      if (typeof value !== "number") return false;
+      const slot = ensureRotationSlot(state, defaults);
+      if (!slot) return false;
+      enableDefine(material, "USE_BATCH_ROTATION");
+
+      const { texture, data } = textureData(state);
+      const baseIndex = batchBaseIndex(
+        state.width,
+        state.groups,
+        batchId,
+        slot.row,
+      );
+      data[baseIndex + slot.comp] = Number.isFinite(value) ? value : 0;
+      markTexelDirty(texture, baseIndex);
+      return true;
+    }
+    case "anchor": {
+      if (typeof value !== "number") return false;
+      const slot = ensureAnchorSlot(state, defaults);
+      if (!slot) return false;
+      enableDefine(material, "USE_BATCH_ANCHOR");
+
+      const { texture, data } = textureData(state);
+      const baseIndex = batchBaseIndex(
+        state.width,
+        state.groups,
+        batchId,
+        slot.row,
+      );
+      data[baseIndex + slot.comp] = Number.isFinite(value)
+        ? value
+        : scalarDefault("anchor");
+      markTexelDirty(texture, baseIndex);
+      return true;
+    }
+    case "offset": {
+      if (!(value instanceof Array)) return false;
+      const slots = ensureOffsetSlots(state, defaults);
+      if (!slots) return false;
+      enableDefine(material, "USE_BATCH_OFFSET");
+
+      const { texture, data } = textureData(state);
+      for (const [slot, v] of [
+        [slots.x, value[0]],
+        [slots.y, value[1]],
+      ] as const) {
+        const baseIndex = batchBaseIndex(
+          state.width,
+          state.groups,
+          batchId,
+          slot.row,
+        );
+        data[baseIndex + slot.comp] = Number.isFinite(v) ? v : 0;
+        markTexelDirty(texture, baseIndex);
+      }
+      return true;
+    }
+    case "outline": {
+      if (!(value instanceof Array)) return false;
+      const slots = ensureOutlineSlots(state);
+      if (!slots) return false;
+      enableDefine(material, "USE_BATCH_OUTLINE");
+
+      const { texture, data } = textureData(state);
+      const colorBase = batchBaseIndex(
+        state.width,
+        state.groups,
+        batchId,
+        slots.row,
+      );
+      for (let i = 0; i < 3; i++) {
+        data[colorBase + i] = Number.isFinite(value[i]) ? value[i] : 0;
+      }
+      markTexelDirty(texture, colorBase);
+      for (const [slot, v, fallback] of [
+        [slots.opacity, value[3], 1],
+        [slots.width, value[4], 0],
+        [slots.blur, value[5], 0],
+      ] as const) {
+        const baseIndex = batchBaseIndex(
+          state.width,
+          state.groups,
+          batchId,
+          slot.row,
+        );
+        data[baseIndex + slot.comp] = Number.isFinite(v) ? v : fallback;
+        markTexelDirty(texture, baseIndex);
+      }
+      return true;
+    }
     case "height":
     case "extrudedHeight":
     case "lineWidth":
+    case "lineDash":
     case "size": {
       if (typeof value !== "number") return false;
 

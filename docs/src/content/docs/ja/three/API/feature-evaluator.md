@@ -144,16 +144,33 @@ evaluate(
 | `extrudedHeight` | `number` | ポリゴンの押し出し高さ（メートル） |
 | `text` | `string` | ラベルテキストの内容（テキスト/ラベル地物用） |
 | `width` | `number` | ライン幅（ピクセル、ポリライン地物用） |
+| `dashArray` | `number[]` | ダッシュと隙間の長さ（線幅の倍数、ポリライン地物用）。空の配列を返すとその地物は実線になります。マテリアルの [`dashArray`](../../../three/material/polyline-material/#dasharray) を上書きします |
+| `cap` | `"butt" \| "round" \| "square"` | 各ダッシュの端の形状（ポリライン地物用）。マテリアルの [`cap`](../../../three/material/polyline-material/#cap) を上書きします |
 | `size` | `number` | ポイント/テキストサイズ（メートルまたはピクセル、ポイント/テキスト地物用） |
+| `letterSpacing` | `number` | 文字間に追加する間隔（em 単位、テキスト地物用）。マテリアルの [`letterSpacing`](../../../three/material/text-material/#letterspacing) を上書きします |
 | `opacity` | `number` | 地物の不透明度、範囲 0.0-1.0（ポリゴン/ポイント/ビルボード/モデル/テキスト用） |
-| `declutterPriority` | `number` | デクラッターの配置優先度。値が大きいほど重なりの競合に勝ちます（[`declutter`](../../../three/material/text-material/#declutter) が有効なポイント/ビルボード/テキスト用）。レイヤーの `declutterPriority` を上書きします |
+| `declutterPriority` | `number` | デクラッターの配置優先度。値が大きいほど重なりの競合に勝ちます（[`declutter`](../../../three/material/text-material/#declutter) が有効なポイント/ビルボード/テキスト用）。レイヤーの `declutterPriority` を上書きしますが、先に比較されるマテリアルの [`declutterRank`](../../../three/material/text-material/#declutterrank) は上書きしません |
 | `image` | `string \| null` | 画像の URL（ビルボード地物用）。個別の URL ごとに一度だけ読み込まれ、レイヤーのテクスチャアトラスにパックされます。`null` を返すと以前に設定した地物ごとの画像がクリアされ、ビルボードマテリアルのデフォルト `url` に戻ります（マテリアルに `url` がない場合、その地物は非表示になります） |
+| `facing` | `"upright" \| "flat"` | ポイント、ビルボード、ラベルを画面と同じ平面に表示する（`"upright"`）か、地球表面に寝かせる（`"flat"`）か（ポイント/ビルボード/テキスト用）。マテリアルの `pointFacing`/`billboardFacing`/`textFacing` から決まる値を上書きします |
+| `rotateWithCamera` | `boolean` | ポイント、ビルボード、ラベルをカメラに合わせて回転させる（`true`）か、地図に合わせて回転させる（`false`）か（ポイント/ビルボード/テキスト用）。ライン沿いでは、`false` でラベルがラインに沿い、`true` で `spreadGlyphs` を指定しない限りまっすぐ描かれます。マテリアルの `rotateWithCamera` から決まる値を上書きします |
+| `spreadGlyphs` | `boolean` | ラベルをライン沿いに文字ごとに配置するか（ライン沿いに配置したテキスト用）。マテリアルの `spreadGlyphs` を上書きします。たとえば、ほかのラベルは文字ごとに配置するレイヤーで、筆記体のように文字がつながる文字体系やフォントのラベルだけを単語ごとに保てます |
+| `rotation` | `number` | 平面内の回転角。単位は度で、正面から見て時計回りです（ポイント/ビルボード/テキスト用）。地物はアンカーを中心に回転しますが、ラインに沿うラベルでは各文字が自身の中心を軸に回転します。レイヤー内の地物ごとに異なる向きにできます。マテリアルの `rotation` を上書きします |
+| `anchor` | `"center" \| "left" \| "right" \| "top" \| "bottom" \| "top-left" \| "top-right" \| "bottom-left" \| "bottom-right"` | ポイント/ビルボード/ラベルのどの部分を位置に置くか（ポイント/ビルボード/テキスト用）。マテリアルの `anchor`（[`anchor`](../../../three/material/text-material/#anchor) を参照）を上書きします |
+| `offset` | `{ x: number, y: number }` | アンカー位置からのずれ。`x` は右、`y` は下向きで、テキストでは em 単位、ポイントとビルボードでは `size` と同じ単位です。マテリアルの `offset`（[`offset`](../../../three/material/text-material/#offset) を参照）を上書きします |
+| `variableAnchors` | `{ anchor: Anchor, offset?: { x: number, y: number } }[]` | デクラッタリングが順に試すラベルの配置（テキスト地物用、オフセットは em 単位）。マテリアルの [`variableAnchors`](../../../three/material/text-material/#variableanchors) を上書きします |
+| `textAlign` | `"left" \| "center" \| "right" \| "auto"` | 行の揃え方（テキスト地物用）。`"auto"` はラベルの `anchor` に従います。マテリアルの [`textAlign`](../../../three/material/text-material/#textalign) を上書きします |
+| `outlineColor` | `Color` | アウトラインの色（テキスト地物用）。マテリアルの [`outlineColor`](../../../three/material/text-material/#outlinecolor) を上書きします |
+| `outlineOpacity` | `number` | アウトラインの不透明度、範囲 0.0-1.0（テキスト地物用）。マテリアルの [`outlineOpacity`](../../../three/material/text-material/#outlineopacity) を上書きします |
+| `outlineWidth` | `number` | アウトラインの太さ、1/64 em 単位（テキスト地物用）。マテリアルの [`outlineWidth`](../../../three/material/text-material/#outlinewidth) を上書きします |
+| `outlineBlur` | `number` | アウトラインをぼかす幅、1/64 em 単位（テキスト地物用）。マテリアルの [`outlineBlur`](../../../three/material/text-material/#outlineblur) を上書きします |
 | `emissive` | `Color` | 発光色（バッチ化されたポリゴン/3D Tiles モデル/ポイント/ビルボード/テキスト用。batch/feature id を持たないモデルでは無視されます）。`emissiveIntensity` と組み合わせて Selective Bloom を駆動します。テキストではグリフの塗り部分のみが発光し、アウトラインと背景は発光しません |
 | `emissiveIntensity` | `number` | 発光強度の乗数（バッチ化されたポリゴン/3D Tiles モデル/ポイント/ビルボード/テキスト用） |
 
 :::note
 評価されたスタイルはレイヤーのデフォルトスタイルを上書きします。
 :::
+
+地物ごとの `facing` と `rotateWithCamera` は、MapLibre の `"auto"` のようには解決されません。それぞれ、マテリアルで決まった向きのうち自身に対応する側だけを置き換えます。そのため、ポイントラベルで `rotateWithCamera: false` だけを返すと、ラベルは `"upright"` のままカメラの方位に合わせて回転します。北を上にして地表に描くには、`facing: "flat"` も返してください。
 
 **Example:**
 
@@ -299,6 +316,9 @@ type EvaluatedValue = {
   width?: number;
   /** ポイント/テキストサイズ（メートルまたはピクセル、ポイント/テキスト地物用） */
   size?: number;
+  /** 文字間に追加する間隔（em 単位、テキスト地物用）。マテリアルの
+   * `letterSpacing` を上書きします */
+  letterSpacing?: number;
   /** 地物の不透明度、範囲 0.0-1.0（ポリゴン/ポイント/ビルボード/モデル/テキスト用） */
   opacity?: number;
   /** デクラッターの配置優先度。値が大きいほど重なりの競合に勝ちます
@@ -309,6 +329,56 @@ type EvaluatedValue = {
    * レイヤーのテクスチャアトラスにパックされます。`null` は以前に設定した
    * 地物ごとの画像をクリアし、ビルボードマテリアルのデフォルト url に戻します */
   image?: string | null;
+  /** ポイント、ビルボード、ラベルを画面と同じ平面に表示する（"upright"）か、
+   * 地球表面に寝かせる（"flat"）か（ポイント/ビルボード/テキスト用）。
+   * マテリアルの facing 設定を上書きします */
+  facing?: "upright" | "flat";
+  /** ポイント、ビルボード、ラベルをカメラに合わせて回転させる（`true`）か、
+   * 地図に合わせて回転させる（`false`）か（ポイント/ビルボード/テキスト用）。
+   * ライン沿いでは、`false` でラベルがラインに沿います */
+  rotateWithCamera?: boolean;
+  /** ラベルをライン沿いに文字ごとに配置するか
+   * （ライン沿いに配置したテキスト用） */
+  spreadGlyphs?: boolean;
+  /** 平面内の回転角。単位は度で、正面から見て時計回り
+   * （ポイント/ビルボード/テキスト用）。ラインに沿うラベルでは各文字が
+   * 自身の中心を軸に回転します */
+  rotation?: number;
+  /** ポイント/ビルボード/ラベルのどの部分を位置に置くか
+   * （ポイント/ビルボード/テキスト用）。マテリアルの `anchor` を上書きします */
+  anchor?:
+    | "center"
+    | "left"
+    | "right"
+    | "top"
+    | "bottom"
+    | "top-left"
+    | "top-right"
+    | "bottom-left"
+    | "bottom-right";
+  /** アンカー位置からのずれ。`x` は右、`y` は下向きで、テキストでは em 単位、
+   * ポイントとビルボードでは `size` と同じ単位。マテリアルの `offset` を上書きします */
+  offset?: { x: number; y: number };
+  /** デクラッタリングが順に試す配置（テキスト用、オフセットは em 単位）。
+   * マテリアルの `variableAnchors` を上書きします */
+  variableAnchors?: {
+    anchor: NonNullable<EvaluatedValue["anchor"]>;
+    offset?: { x: number; y: number };
+  }[];
+  /** 行の揃え方（テキスト用）。`"auto"` は `anchor` に従います。
+   * マテリアルの `textAlign` を上書きします */
+  textAlign?: "left" | "center" | "right" | "auto";
+  /** アウトラインの色（テキスト用）。マテリアルの `outlineColor` を上書きします */
+  outlineColor?: Color;
+  /** アウトラインの不透明度、範囲 0.0-1.0（テキスト用）。
+   * マテリアルの `outlineOpacity` を上書きします */
+  outlineOpacity?: number;
+  /** アウトラインの太さ、1/64 em 単位（テキスト用）。
+   * マテリアルの `outlineWidth` を上書きします */
+  outlineWidth?: number;
+  /** アウトラインをぼかす幅、1/64 em 単位（テキスト用）。
+   * マテリアルの `outlineBlur` を上書きします */
+  outlineBlur?: number;
   /** 発光色（バッチ化されたポリゴン/3D Tiles モデル/ポイント/ビルボード/
    * テキスト用。batch/feature id を持たないモデルでは無視されます）。
    * `emissiveIntensity` と組み合わせて Selective Bloom を駆動します。

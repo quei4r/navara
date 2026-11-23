@@ -56,6 +56,12 @@ export {
   type SplatMeshEvent,
 } from "./SplatMeshDesc";
 export {
+  Text3DMeshDesc,
+  type Text3DMeshConfig,
+  type Text3DMeshUpdate,
+  type Text3DMeshEvent,
+} from "./Text3DMeshDesc";
+export {
   TubeMeshDesc,
   type TubeMeshConfig,
   type TubeMeshUpdate,
@@ -126,6 +132,19 @@ export {
   type InstancedModelsDescription,
   type InstancedGltfModelEvent,
 } from "./InstancedGltfModelMeshDesc";
+
+export {
+  PolygonMeshDesc,
+  type PolygonMeshConfig,
+  type PolygonMeshStyle,
+  type PolygonMeshUpdate,
+} from "./PolygonMeshDesc";
+export {
+  PolylineMeshDesc,
+  type PolylineMeshConfig,
+  type PolylineMeshStyle,
+  type PolylineMeshUpdate,
+} from "./PolylineMeshDesc";
 
 // Mesh implementations
 export { SkyMesh, type SkyMeshOptions } from "./skyMesh";

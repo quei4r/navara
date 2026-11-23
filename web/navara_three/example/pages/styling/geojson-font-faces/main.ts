@@ -56,7 +56,10 @@ const run = async () => {
     size: 15,
     // Wrap width in ems (multiples of size); 0 disables wrapping
     maxWidth: 0,
-    lineHeight: 1.0,
+    // Baseline-to-baseline distance in ems
+    lineHeight: 1.2,
+    // Extra space between characters in ems; ignored for Arabic-script names
+    letterSpacing: 0,
     textAlign: "center" as "left" | "center" | "right",
   };
 
@@ -78,12 +81,13 @@ const run = async () => {
         sizeInMeters: false,
         clampToGround: true,
         depthTest: true,
-        center: { x: 0.5, y: 0.0 },
+        anchor: "bottom",
         outlineColor: new Color().setStyle("#000000"),
         outlineWidth: 5,
         outlineOpacity: 0.5,
         maxWidth: params.maxWidth,
         lineHeight: params.lineHeight,
+        letterSpacing: params.letterSpacing,
         textAlign: params.textAlign,
       },
     });
@@ -141,6 +145,12 @@ const run = async () => {
     .addBinding(params, "lineHeight", { min: 0.5, max: 3, step: 0.1 })
     .on("change", ({ value }) => {
       layer?.update({ text: { lineHeight: value } });
+    });
+
+  pane
+    .addBinding(params, "letterSpacing", { min: -0.2, max: 1, step: 0.05 })
+    .on("change", ({ value }) => {
+      layer?.update({ text: { letterSpacing: value } });
     });
 
   pane

@@ -86,7 +86,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `boolean | undefined`
 
-**Description:** Specifies whether to apply the color directly or use atmospheric scattering calculations. When `false`, the color is dynamically computed from the atmosphere texture.
+**Description:** Specifies whether to apply the color directly or use atmospheric scattering calculations. When `false`, the color is dynamically computed from the atmosphere transmittance texture, and the sun renders black while that texture is unavailable. Set `true` to use the configured `color` directly, with no atmosphere texture needed.
 
 **Default:** `false`
 
@@ -104,7 +104,7 @@ import { Color } from "@navaramap/three";
 
 **Type:** `number | undefined`
 
-**Description:** Specifies the intensity of the sunlight. Higher values result in brighter light.
+**Description:** Specifies the intensity of the sunlight. Higher values result in brighter light. Diffuse shading divides the result by π (the Lambert BRDF), so without the atmosphere system and tone mapping, intensity 1 renders a fully lit surface at about 32% of its albedo. Use `Math.PI` in that setup to render surfaces at their true albedo.
 
 **Default:** `1`
 
@@ -144,7 +144,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** Specifies the number of shadow cascades. More cascades improve shadow quality distribution but consume more GPU resources.
 
-**Default:** `4`
+**Default:** `4` (`2` when `mobileOptimization` is in effect)
 
 **Example:**
 
@@ -162,7 +162,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** Specifies the shadow map resolution (per cascade). Higher values improve shadow quality but consume more GPU memory.
 
-**Default:** `2048`
+**Default:** `2048` (`1024` when `mobileOptimization` is in effect)
 
 **Example:**
 
@@ -180,7 +180,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** The maximum distance from the camera beyond which shadows are not rendered. The unit is meters.
 
-**Default:** `50000`
+**Default:** `50000` (`10000` when `mobileOptimization` is in effect)
 
 **Example:**
 
@@ -256,7 +256,7 @@ import { Color } from "@navaramap/three";
 
 **Description:** Enables smooth transitions between shadow cascades to reduce visible seams.
 
-**Default:** `true`
+**Default:** `true` (`false` when `mobileOptimization` is in effect)
 
 **Example:**
 
@@ -318,6 +318,24 @@ import { Color } from "@navaramap/three";
 {
   sun: {
     shadowNormalBias: 0,
+  }
+}
+```
+
+### shadowRadius
+
+**Type:** `number | undefined`
+
+**Description:** Width of the shadow map filter kernel, in shadow map texels. The kernel takes a fixed nine samples, so above about `4` the samples show up individually instead of forming a soft edge. Where the [AerialPerspectiveEffectDesc](../../../three_default_descs/effect-desc/aerial-perspective-effect-desc/) re-applies these shadows, its `shadowSoftness` option widens the edge in screen space instead.
+
+**Default:** `1`
+
+**Example:**
+
+```typescript
+{
+  sun: {
+    shadowRadius: 2,
   }
 }
 ```
@@ -384,7 +402,8 @@ const sun = view.addLight<SunLightDesc>({
     shadowFade: true,
     shadowIntensity: 1.0,
     shadowBias: 0.0001,
-    shadowNormalBias: 0
+    shadowNormalBias: 0,
+    shadowRadius: 1
   }
 });
 ```

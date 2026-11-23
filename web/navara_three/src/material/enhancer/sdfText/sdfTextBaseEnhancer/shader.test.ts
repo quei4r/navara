@@ -1,4 +1,4 @@
-import { SDF_PX_SIZE, atlasRangePx } from "@navaramap/font";
+import { SDF_PX_SIZE, atlasPaddingPx, atlasRangePx } from "@navaramap/font";
 import sdfTextFragmentShader from "@shaders/glsl/sdfText.frag.glsl";
 import sdfTextVertexShader from "@shaders/glsl/sdfText.vert.glsl";
 import { describe, expect, it } from "vitest";
@@ -61,10 +61,12 @@ describe("sdfTextBaseEnhancer shader", () => {
       expect(transform({ useMsdf: false }).defines).toMatchObject({
         NVR_SDF_PX_SIZE: SDF_PX_SIZE,
         NVR_SDF_PX_RANGE: atlasRangePx(false),
+        NVR_SDF_PX_PADDING: atlasPaddingPx(false),
       });
       expect(transform({ useMsdf: true }).defines).toMatchObject({
         NVR_SDF_PX_SIZE: SDF_PX_SIZE,
         NVR_SDF_PX_RANGE: atlasRangePx(true),
+        NVR_SDF_PX_PADDING: atlasPaddingPx(true),
       });
     });
 
@@ -88,14 +90,15 @@ describe("sdfTextBaseEnhancer shader", () => {
       });
     });
 
-    it("uses UV-derived coverage and clamps supersamples to the padded glyph boundary", () => {
+    it("uses UV-derived coverage and extrapolates past the clamped glyph rect", () => {
       expect(sdfTextFragmentShader).toContain("nvr_screenPxRange()");
       expect(sdfTextFragmentShader).toContain("nvr_edgeCoverage(");
+      // Clamping to the outer texel centres would repeat their value as a
+      // plateau that outlines the quad; the field must keep falling past it.
       expect(sdfTextFragmentShader).toContain(
-        "clamp(atlasUv, vAtlasUvMin, vAtlasUvMax)",
+        "clamp(atlasUv, vAtlasUvMin + halfTexel, vAtlasUvMax - halfTexel)",
       );
-      expect(sdfTextFragmentShader).not.toContain("vAtlasUvMin + halfTexel");
-      expect(sdfTextFragmentShader).not.toContain("vAtlasUvMax - halfTexel");
+      expect(sdfTextFragmentShader).toContain("vec2(sdf, sdf) - beyond");
       expect(sdfTextVertexShader).toContain(
         "vAtlasUvMin = glyphUvRect.xy / atlasSize",
       );
@@ -113,7 +116,7 @@ describe("sdfTextBaseEnhancer shader", () => {
         "float alpha = fillAlpha + behindFill",
       );
       expect(sdfTextFragmentShader).not.toContain(
-        "mix(uOutlineColor, vColor, fillAlpha)",
+        "mix(vOutlineColor, vColor, fillAlpha)",
       );
       expect(sdfTextFragmentShader).toMatch(
         /alpha \*= opacity;\s*if \(alpha <= 0\.0\) discard;/,
@@ -141,12 +144,59 @@ describe("sdfTextBaseEnhancer shader", () => {
       expect(shader.uniforms.uLabelData).toBeDefined();
       expect(shader.uniforms.uLabelTexSize).toBeDefined();
     });
+
+    it("keeps the shader's row indices in step with the row table", () => {
+      // The GLSL side restates the row numbers as its own defines, so a row
+      // inserted on the CPU without updating the shader would silently read
+      // the wrong texel rather than fail to compile.
+      for (const [name, index] of Object.entries(LabelRow)) {
+        const define = `LABEL_ROW_${name}`;
+        expect(sdfTextVertexShader).toMatch(
+          new RegExp(`#define\\s+${define}\\s+${index}\\b`),
+        );
+      }
+    });
+  });
+
+  // Line placement compiles a different placement branch and reads a second
+  // texture, so the define, the sample count and the uniforms must arrive
+  // together or the branch reads garbage.
+  describe("line placement contract", () => {
+    it("compiles the straight-label branch by default", () => {
+      const shader = transform({});
+      expect(shader.defines.NVR_LINE_PLACEMENT).toBeUndefined();
+      expect(shader.defines.PATH_SAMPLES).toBeUndefined();
+    });
+
+    it("injects the define and the sample count together", () => {
+      const shader = transform({ linePlacement: true, pathSamples: 32 });
+      expect(shader.defines.NVR_LINE_PLACEMENT).toBe(1);
+      expect(shader.defines.PATH_SAMPLES).toBe(32);
+    });
+
+    it("binds the path texture uniforms", () => {
+      const shader = transform({ linePlacement: true, pathSamples: 32 });
+      expect(shader.uniforms.uPathData).toBeDefined();
+      expect(shader.uniforms.uPathTexSize).toBeDefined();
+      expect(shader.uniforms.uLineOffset).toBeDefined();
+      expect(shader.uniforms.uSpreadGlyphs).toBeDefined();
+    });
+
+    it("gives line-placed batches their own program cache key", () => {
+      // The two branches declare different uniforms, so sharing a compiled
+      // program would leave one of them reading an unbound sampler.
+      const straight = createSdfTextBaseEnhancer(createMockMaterial());
+      straight.mount({});
+      const curved = createSdfTextBaseEnhancer(createMockMaterial());
+      curved.mount({ linePlacement: true, pathSamples: 32 });
+
+      expect(curved.programCacheKey()).not.toBe(straight.programCacheKey());
+    });
   });
 
   it("should assign batch-wide uniforms to shader.uniforms", () => {
-    const shader = transform({ outlineOpacity: 0.25 });
-    expect(shader.uniforms.uCenter).toBeDefined();
-    expect(shader.uniforms.uOutlineOpacity?.value).toBe(0.25);
+    const shader = transform({ lineOffset: 4 });
+    expect(shader.uniforms.uLineOffset?.value).toBe(4);
     expect(shader.uniforms.nvr_uPickable).toBeDefined();
   });
 });

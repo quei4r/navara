@@ -1,0 +1,614 @@
+---
+import supportedStyles from "../content/docs/maplibre_style/supported.json";
+
+interface Props {
+  category: "layer" | "source" | "expression" | "root" | "light" | "sky" | "terrain" | "projection" | "transition" | "sprite" | "glyphs" | "font-faces" | "state" | "types";
+}
+
+const { category } = Astro.props;
+
+const MAPLIBRE_SPEC_BASE = "https://maplibre.org/maplibre-style-spec";
+
+// Category-specific URL paths
+const categoryPaths: Record<string, string> = {
+  layer: "layers",
+  source: "sources",
+  expression: "expressions",
+  root: "root",
+  light: "light",
+  sky: "sky",
+  terrain: "terrain",
+  projection: "projection",
+  transition: "transition",
+  sprite: "sprite",
+  glyphs: "glyphs",
+  "font-faces": "font-faces",
+  state: "state",
+  types: "types",
+};
+
+// Fetch MapLibre Style Spec reference with error handling
+let maplibreReference: any = {};
+try {
+  const response = await fetch(
+    "https://raw.githubusercontent.com/maplibre/maplibre-style-spec/refs/heads/main/src/reference/v8.json"
+  );
+
+  if (!response.ok) {
+    console.warn(`Failed to fetch MapLibre spec: ${response.status} ${response.statusText}`);
+  } else {
+    maplibreReference = await response.json();
+  }
+} catch (error) {
+  console.warn("Failed to fetch MapLibre spec, using fallback:", error);
+}
+
+// Slugify function matching Python-Markdown's toc extension
+function slugify(text: string): string {
+  // Remove special chars except word chars (\w), spaces (\s), and hyphens (-)
+  // This matches the regex: [^\w\s-]
+  let slug = text.replace(/[^\w\s-]/g, '');
+
+  // Strip leading/trailing whitespace and convert to lowercase
+  slug = slug.trim().toLowerCase();
+
+  // Replace whitespace with hyphens and collapse multiple hyphens
+  slug = slug.replace(/[\s]+/g, '-').replace(/-+/g, '-');
+
+  return slug;
+}
+
+// Handle duplicate IDs by appending _1, _2, etc.
+function makeUnique(id: string, usedIds: Set<string>): string {
+  let uniqueId = id;
+
+  // If ID is empty or already used, make it unique
+  while (!uniqueId || usedIds.has(uniqueId)) {
+    // Check if it matches pattern: something_N
+    const match = uniqueId.match(/^(.*)_(\d+)$/);
+    if (match) {
+      // Increment the number
+      uniqueId = `${match[1]}_${parseInt(match[2]) + 1}`;
+    } else {
+      // Append _1 (for empty strings, this becomes "_1")
+      uniqueId = `${uniqueId}_1`;
+    }
+  }
+
+  usedIds.add(uniqueId);
+  return uniqueId;
+}
+
+// Generate anchors using MapLibre's anchor generation rules
+// This avoids network requests and makes builds reproducible
+function generateAnchors(
+  category: string,
+  spec: any
+): Map<string, string> {
+  const anchorMap = new Map<string, string>();
+  const usedIds = new Set<string>();
+
+  if (category === "layer") {
+    // MapLibre docs use the insertion order of layout_* keys in v8.json
+    const layoutKeys = Object.keys(spec || {}).filter(key => key.startsWith('layout_'));
+    const layerTypes = layoutKeys.map(key => key.replace('layout_', ''));
+
+    for (const layerType of layerTypes) {
+      // Generate anchor for layer type itself
+      const layerAnchor = makeUnique(slugify(layerType), usedIds);
+      anchorMap.set(layerType, layerAnchor);
+
+      // Process paint and layout properties for this layer
+      const paintKey = `paint_${layerType}`;
+      const layoutKey = `layout_${layerType}`;
+
+      // Get all properties (paint + layout) and sort them
+      const paintProps = Object.keys(spec?.[paintKey] || {}).filter(
+        key => !key.startsWith('*')
+      );
+      const layoutProps = Object.keys(spec?.[layoutKey] || {}).filter(
+        key => !key.startsWith('*')
+      );
+
+      // Process in order: paint properties first, then layout
+      for (const propName of [...paintProps.sort(), ...layoutProps.sort()]) {
+        const propAnchor = makeUnique(slugify(propName), usedIds);
+
+        // Store layer-property composite key
+        anchorMap.set(`${layerType}-${propName}`, propAnchor);
+
+        // Only store plain property name if not already stored (first occurrence wins)
+        if (!anchorMap.has(propName)) {
+          anchorMap.set(propName, propAnchor);
+        }
+      }
+    }
+  } else if (category === "expression") {
+    // MapLibre processes expressions by group, in the order groups first appear in v8.json
+    // Within each group, expressions are processed in v8.json order
+    const expressionValues = spec?.expression_name?.values || {};
+
+    // Collect groups in the order they first appear
+    const groups: string[] = [];
+    const seenGroups = new Set<string>();
+    for (const value of Object.values(expressionValues)) {
+      const group = (value as any).group;
+      if (group && !seenGroups.has(group)) {
+        groups.push(group);
+        seenGroups.add(group);
+      }
+    }
+
+    // Process expressions group by group
+    for (const group of groups) {
+      for (const [operator, value] of Object.entries(expressionValues)) {
+        if ((value as any).group !== group) continue;
+
+        const slug = slugify(operator);
+        const anchor = makeUnique(slug, usedIds);
+        anchorMap.set(operator, anchor);
+      }
+    }
+  } else if (category === "source") {
+    // Process source types
+    const sourceTypes = (spec?.source || []).flatMap((sourceKey: string) =>
+      Object.keys(spec?.[sourceKey]?.type?.values || {})
+    );
+
+    for (const sourceType of sourceTypes.sort()) {
+      const anchor = makeUnique(slugify(sourceType), usedIds);
+      anchorMap.set(sourceType, anchor);
+    }
+  } else if (category === "root") {
+    // Process root properties in alphabetical order
+    const rootProps = Object.keys(spec?.$root || {})
+      .filter(key => !key.startsWith('*') && key !== 'required')
+      .sort();
+
+    for (const prop of rootProps) {
+      const anchor = makeUnique(slugify(prop), usedIds);
+      anchorMap.set(prop, anchor);
+    }
+  } else if (category === "light") {
+    // Process light properties
+    const lightProps = Object.keys(spec?.light || {})
+      .filter(key => !key.startsWith('*'))
+      .sort();
+
+    for (const prop of lightProps) {
+      const anchor = makeUnique(slugify(prop), usedIds);
+      anchorMap.set(prop, anchor);
+    }
+  } else if (category === "sky") {
+    // Process sky properties
+    const skyProps = Object.keys(spec?.sky || {})
+      .filter(key => !key.startsWith('*'))
+      .sort();
+
+    for (const prop of skyProps) {
+      const anchor = makeUnique(slugify(prop), usedIds);
+      anchorMap.set(prop, anchor);
+    }
+  } else if (category === "terrain") {
+    // Process terrain properties
+    const terrainProps = Object.keys(spec?.terrain || {})
+      .filter(key => !key.startsWith('*'))
+      .sort();
+
+    for (const prop of terrainProps) {
+      const anchor = makeUnique(slugify(prop), usedIds);
+      anchorMap.set(prop, anchor);
+    }
+  } else if (category === "projection") {
+    // Process projection properties
+    const projectionProps = Object.keys(spec?.projection || {})
+      .filter(key => !key.startsWith('*'))
+      .sort();
+
+    for (const prop of projectionProps) {
+      const anchor = makeUnique(slugify(prop), usedIds);
+      anchorMap.set(prop, anchor);
+    }
+  } else if (category === "transition") {
+    // Process transition properties
+    const transitionProps = Object.keys(spec?.transition || {})
+      .filter(key => !key.startsWith('*'))
+      .sort();
+
+    for (const prop of transitionProps) {
+      const anchor = makeUnique(slugify(prop), usedIds);
+      anchorMap.set(prop, anchor);
+    }
+  } else if (category === "types") {
+    // Types documented on MapLibre's Types page (manually written, not from v8.json)
+    // Anchors are lowercase versions of the type names
+    const documentedTypes = [
+      'color', 'formatted', 'resolvedImage', 'string', 'boolean',
+      'number', 'array', 'Point', 'enum', 'padding',
+      'projectionDefinition', 'numberArray', 'colorArray'
+    ];
+
+    for (const type of documentedTypes) {
+      // MapLibre uses lowercase anchors
+      const anchor = type.toLowerCase();
+      anchorMap.set(type, anchor);
+    }
+  }
+  // For sprite, glyphs, font-faces, state: these are single-property pages,
+  // no anchors needed within the page
+
+  return anchorMap;
+}
+
+const realAnchors = generateAnchors(category, maplibreReference);
+
+// Build rows based on category
+type Row = {
+  name: string;
+  url: string;
+  status: string;
+  isHeader?: boolean;
+};
+
+const categoryPath = categoryPaths[category];
+const supportedItems = (supportedStyles[category] || {}) as Record<string, any>;
+let rows: Row[] = [];
+
+switch (category) {
+  case "layer": {
+    // For layers, show layer types and their paint/layout properties
+    const layerTypes = Object.keys(maplibreReference?.layer?.type?.values || {});
+
+    for (const layerType of layerTypes) {
+      // Add layer type as header
+      const layerSupported = supportedItems[layerType];
+      const layerStatus = layerSupported
+        ? typeof layerSupported === "string"
+          ? layerSupported
+          : (layerSupported as any).status
+        : "❌";
+
+      rows.push({
+        name: layerType,
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(layerType) || layerType}`,
+        status: layerStatus,
+        isHeader: true,
+      });
+
+      // Add paint properties
+      const paintKey = `paint_${layerType}`;
+      if (maplibreReference[paintKey]) {
+        const paintProps = Object.keys(maplibreReference[paintKey]).filter(
+          key => !key.startsWith('*')
+        );
+        for (const propName of paintProps) {
+          const propSupported = layerSupported?.paint?.[propName];
+          const propStatus = propSupported
+            ? typeof propSupported === "string"
+              ? propSupported
+              : propSupported.status
+            : "❌";
+
+          // Try to find the real anchor using multiple strategies:
+          // 1. Try layer-property composite key (for shared properties like visibility)
+          // 2. Try property name directly (for properties like circle-radius)
+          // 3. Fall back to property name
+          const anchor =
+            realAnchors.get(`${layerType}-${propName}`) ||
+            realAnchors.get(propName) ||
+            propName;
+
+          rows.push({
+            name: `  ${propName}`,
+            url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${anchor}`,
+            status: propStatus,
+          });
+        }
+      }
+
+      // Add layout properties
+      const layoutKey = `layout_${layerType}`;
+      if (maplibreReference[layoutKey]) {
+        const layoutProps = Object.keys(maplibreReference[layoutKey]).filter(
+          key => !key.startsWith('*')
+        );
+        for (const propName of layoutProps) {
+          const propSupported = layerSupported?.layout?.[propName];
+          const propStatus = propSupported
+            ? typeof propSupported === "string"
+              ? propSupported
+              : propSupported.status
+            : "❌";
+
+          // Try to find the real anchor using multiple strategies:
+          // 1. Try layer-property composite key (for shared properties like visibility)
+          // 2. Try property name directly (for properties like circle-radius)
+          // 3. Fall back to property name
+          const anchor =
+            realAnchors.get(`${layerType}-${propName}`) ||
+            realAnchors.get(propName) ||
+            propName;
+
+          rows.push({
+            name: `  ${propName}`,
+            url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${anchor}`,
+            status: propStatus,
+          });
+        }
+      }
+    }
+    break;
+  }
+  case "source": {
+    // Source types as headers, each followed by its properties
+    const sourceTypes = (maplibreReference?.source || []).flatMap((sourceKey: string) =>
+      Object.keys(maplibreReference[sourceKey]?.type?.values || {})
+    );
+    const statusOf = (item: any): string =>
+      item ? (typeof item === "string" ? item : item.status) : "❌";
+
+    for (const name of sourceTypes) {
+      const supported = supportedItems[name];
+      const typeUrl = `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name}`;
+      rows.push({
+        name,
+        url: typeUrl,
+        status: statusOf(supported),
+        isHeader: true,
+      });
+
+      // The spec lists a source type's properties under `source_<type>`
+      const specKey = `source_${name.replace(/-/g, "_")}`;
+      const props = Object.keys(maplibreReference?.[specKey] || {}).filter(
+        key => !key.startsWith('*') && key !== 'type'
+      );
+      for (const propName of props) {
+        let status: string;
+        if (propName === "encoding" && supported?.encoding) {
+          // Supported encodings are listed as children of the source type
+          const unsupported = Object.entries(supported.encoding)
+            .filter(([, value]) => statusOf(value).startsWith("❌"))
+            .map(([encoding]) => encoding);
+          status = unsupported.length
+            ? `⚠️ Not supported: ${unsupported.join(", ")}`
+            : "✅";
+        } else {
+          status = statusOf(supported?.properties?.[propName]);
+        }
+        // The spec page has one section per source type; link to it
+        rows.push({ name: `  ${propName}`, url: typeUrl, status });
+      }
+    }
+    break;
+  }
+  case "expression": {
+    // Expression operators
+    const operators = Object.keys(maplibreReference?.expression_name?.values || {});
+    rows = operators.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name,
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name}`,
+        status,
+      };
+    });
+    break;
+  }
+  case "root": {
+    // Root features - extract from $root in the spec
+    const rootProps = Object.keys(maplibreReference?.$root || {}).filter(
+      key => !key.startsWith('*') && key !== 'required'
+    );
+    rows = rootProps.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name,
+        url: `${MAPLIBRE_SPEC_BASE}/root/#${realAnchors.get(name) || name}`,
+        status,
+      };
+    });
+    break;
+  }
+  case "light": {
+    // Light properties
+    const lightProps = Object.keys(maplibreReference?.light || {}).filter(
+      key => !key.startsWith('*')
+    );
+    rows = lightProps.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name,
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name}`,
+        status,
+      };
+    });
+    break;
+  }
+  case "sky": {
+    // Sky properties
+    const skyProps = Object.keys(maplibreReference?.sky || {}).filter(
+      key => !key.startsWith('*')
+    );
+    rows = skyProps.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name,
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name}`,
+        status,
+      };
+    });
+    break;
+  }
+  case "terrain": {
+    // Terrain properties
+    const terrainProps = Object.keys(maplibreReference?.terrain || {}).filter(
+      key => !key.startsWith('*')
+    );
+    rows = terrainProps.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name,
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name}`,
+        status,
+      };
+    });
+    break;
+  }
+  case "projection": {
+    // Projection properties
+    const projectionProps = Object.keys(maplibreReference?.projection || {}).filter(
+      key => !key.startsWith('*')
+    );
+    rows = projectionProps.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name,
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name}`,
+        status,
+      };
+    });
+    break;
+  }
+  case "transition": {
+    // Transition properties
+    const transitionProps = Object.keys(maplibreReference?.transition || {}).filter(
+      key => !key.startsWith('*')
+    );
+    rows = transitionProps.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name,
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name}`,
+        status,
+      };
+    });
+    break;
+  }
+  case "sprite":
+  case "glyphs":
+  case "font-faces":
+  case "state": {
+    // These are single-property pages, just show the main property
+    const status = supportedItems.status || "❌";
+    rows = [{
+      name: category === "font-faces" ? "font-faces" : category,
+      url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/`,
+      status,
+    }];
+    break;
+  }
+  case "types": {
+    // Types documented on MapLibre's Types page
+    // Map internal names (from supported.json) to display names (as shown on MapLibre docs)
+    const typeDisplayNames: Record<string, string> = {
+      'color': 'Color',
+      'formatted': 'Formatted',
+      'resolvedImage': 'ResolvedImage',
+      'string': 'String',
+      'boolean': 'Boolean',
+      'number': 'Number',
+      'array': 'Array',
+      'Point': 'Point',
+      'enum': 'Enum',
+      'padding': 'Padding',
+      'projectionDefinition': 'ProjectionDefinition',
+      'numberArray': 'numberArray',
+      'colorArray': 'colorArray'
+    };
+
+    const documentedTypes = Object.keys(typeDisplayNames);
+
+    rows = documentedTypes.map((name) => {
+      const supported = supportedItems[name];
+      const status = supported
+        ? typeof supported === "string"
+          ? supported
+          : (supported as any).status
+        : "❌";
+      return {
+        name: typeDisplayNames[name],
+        url: `${MAPLIBRE_SPEC_BASE}/${categoryPath}/#${realAnchors.get(name) || name.toLowerCase()}`,
+        status,
+      };
+    });
+    break;
+  }
+}
+---
+
+<table>
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    {rows.map((row) => (
+      <tr class={row.isHeader ? "header-row" : ""}>
+        <td>
+          <a href={row.url} target="_blank" rel="noopener noreferrer">
+            {row.name}
+          </a>
+        </td>
+        <td>{row.status}</td>
+      </tr>
+    ))}
+  </tbody>
+</table>
+
+<style>
+  /* Starlight renders tables as `display: block`, which shrinks them to content width */
+  table {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+  }
+
+  th {
+    width: 50%;
+  }
+
+  .header-row {
+    background-color: var(--sl-color-gray-6);
+  }
+
+  .header-row td:first-child {
+    font-weight: bold;
+  }
+</style>

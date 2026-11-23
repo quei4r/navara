@@ -18,7 +18,9 @@ export { LRUMap } from "./LRUMap";
 export {
   COLOR_GLYPH_PX_SIZE,
   GlyphCharClass,
+  GlyphDirection,
   SDF_PX_SIZE,
+  atlasPaddingPx,
   atlasRangePx,
 } from "./types";
 export type {

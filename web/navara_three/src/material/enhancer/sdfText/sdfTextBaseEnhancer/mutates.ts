@@ -23,13 +23,12 @@ export const createBaseMutates = (
   rtcCenter?: [number, number, number],
 ): SdfTextBaseMutates => {
   const refs: SdfTextBaseRefs = {
-    uCenter: { value: new Vector2(0.5, 0.0) },
+    uFlatFacing: { value: false },
+    uRotateWithCamera: { value: true },
+    uRotation: { value: 0 },
     uSizeInMeters: { value: true },
     uOffsetDepth: { value: true },
     uSdfThreshold: { value: 0.5 },
-    uOutlineWidth: { value: 0.0 },
-    uOutlineColor: { value: new Color(1, 0, 0) },
-    uOutlineOpacity: { value: 1.0 },
     uShowBackground: { value: false },
     uBackgroundColor: { value: new Color(1, 0, 0) },
     uBackgroundOutlineColor: { value: new Color(1, 0, 0) },
@@ -61,16 +60,25 @@ export const createBaseMutates = (
     // Non-zero so the shader's `i % width` / `i / width` never divide by zero
     // before the mesh binds its label texture.
     uLabelTexSize: { value: new Vector2(1, 1) },
+    uPathData: { value: null },
+    uPathTexSize: { value: new Vector2(1, 1) },
+    uLineOffset: { value: 0 },
+    uTranslate: { value: new Vector2(0, 0) },
+    uTranslateViewport: { value: false },
+    uSpreadGlyphs: { value: false },
   };
 
   return {
     update: (state: SdfTextBaseState) => {
-      refs.uCenter.value.set(state.center[0], state.center[1]);
+      refs.uFlatFacing.value = state.flatFacing;
+      refs.uRotateWithCamera.value = state.rotateWithCamera;
+      refs.uRotation.value = state.rotation;
       refs.uSizeInMeters.value = state.sizeInMeters;
+      refs.uLineOffset.value = state.lineOffset;
+      refs.uTranslate.value.set(state.translate[0], state.translate[1]);
+      refs.uTranslateViewport.value = state.translateViewport;
+      refs.uSpreadGlyphs.value = state.spreadGlyphs;
       refs.uOffsetDepth.value = state.offsetDepth;
-      refs.uOutlineWidth.value = state.outlineWidth;
-      refs.uOutlineColor.value.set(state.outlineColor);
-      refs.uOutlineOpacity.value = state.outlineOpacity;
       refs.uShowBackground.value = state.showBackground;
       refs.uBackgroundColor.value.set(state.backgroundColor);
       refs.uBackgroundOutlineColor.value.set(state.backgroundOutlineColor);
@@ -82,13 +90,12 @@ export const createBaseMutates = (
     },
 
     updateUniforms: (uniforms) => {
-      uniforms.uCenter = refs.uCenter;
+      uniforms.uFlatFacing = refs.uFlatFacing;
+      uniforms.uRotateWithCamera = refs.uRotateWithCamera;
+      uniforms.uRotation = refs.uRotation;
       uniforms.uSizeInMeters = refs.uSizeInMeters;
       uniforms.uOffsetDepth = refs.uOffsetDepth;
       uniforms.uSdfThreshold = refs.uSdfThreshold;
-      uniforms.uOutlineWidth = refs.uOutlineWidth;
-      uniforms.uOutlineColor = refs.uOutlineColor;
-      uniforms.uOutlineOpacity = refs.uOutlineOpacity;
       uniforms.uShowBackground = refs.uShowBackground;
       uniforms.uBackgroundColor = refs.uBackgroundColor;
       uniforms.uBackgroundOutlineColor = refs.uBackgroundOutlineColor;
@@ -111,6 +118,14 @@ export const createBaseMutates = (
       uniforms.uColorAtlasSize = refs.uColorAtlasSize;
       uniforms.uLabelData = refs.uLabelData;
       uniforms.uLabelTexSize = refs.uLabelTexSize;
+      // Bound unconditionally: `updateUniforms` has no state, and an unused
+      // uniform costs nothing when NVR_LINE_PLACEMENT is off.
+      uniforms.uPathData = refs.uPathData;
+      uniforms.uPathTexSize = refs.uPathTexSize;
+      uniforms.uLineOffset = refs.uLineOffset;
+      uniforms.uTranslate = refs.uTranslate;
+      uniforms.uTranslateViewport = refs.uTranslateViewport;
+      uniforms.uSpreadGlyphs = refs.uSpreadGlyphs;
       if (refs.batchDataTexture) {
         uniforms.batchDataTexture = refs.batchDataTexture;
       }
@@ -176,6 +191,16 @@ export const createBaseMutates = (
       refs.uLabelData.value = texture;
       // Guard against a zero size reaching the shader's modulo/divide.
       refs.uLabelTexSize.value.set(Math.max(1, width), Math.max(1, height));
+    },
+
+    setPathDataTexture: (
+      texture: DataTexture | null,
+      width: number,
+      height: number,
+    ) => {
+      refs.uPathData.value = texture;
+      // Guard against a zero size reaching the shader's modulo/divide.
+      refs.uPathTexSize.value.set(Math.max(1, width), Math.max(1, height));
     },
 
     setRtcCenter: (center: [number, number, number]) => {

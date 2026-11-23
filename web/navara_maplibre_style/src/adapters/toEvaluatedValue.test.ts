@@ -3,11 +3,25 @@ import { describe, it, expect, vi } from "vitest";
 import { JsStyleEngine } from "../engine/JsStyleEngine";
 import type { StyleLayer } from "../engine/types";
 
-import { createPaintEvaluators, toEvaluatedValue } from "./toEvaluatedValue";
+import {
+  createLayoutEvaluators,
+  createPaintEvaluators,
+  toEvaluatedValue,
+  toNavaraColor,
+} from "./toEvaluatedValue";
+
+// Type for the mock Color class with exposed r, g, b properties
+type MockColor = {
+  r: number;
+  g: number;
+  b: number;
+  setRGB(r: number, g: number, b: number): MockColor;
+  setStyle(style: string): MockColor;
+};
 
 // Mock @navaramap/three to avoid importing Three.js in tests
 vi.mock("@navaramap/three", () => ({
-  Color: class Color {
+  Color: class Color implements MockColor {
     r = 0;
     g = 0;
     b = 0;
@@ -39,6 +53,64 @@ vi.mock("@navaramap/three", () => ({
     }
   },
 }));
+
+describe("zoom-only evaluator caching", () => {
+  const countingEngine = () => {
+    const engine = new JsStyleEngine();
+    let calls = 0;
+    const createValueFn = engine.createValueFn.bind(engine);
+    engine.createValueFn = ((...args: Parameters<typeof createValueFn>) => {
+      const fn = createValueFn(...args);
+      return (ctx: Parameters<typeof fn>[0]) => {
+        calls++;
+        return fn(ctx);
+      };
+    }) as typeof engine.createValueFn;
+    return { engine, calls: () => calls };
+  };
+
+  it("evaluates a zoom-only paint expression once per zoom", () => {
+    const { engine, calls } = countingEngine();
+    const width = createPaintEvaluators(
+      {
+        id: "lines",
+        type: "line",
+        source: "test",
+        paint: {
+          "line-width": ["interpolate", ["linear"], ["zoom"], 2, 1, 6, 3],
+        },
+      } as StyleLayer,
+      engine,
+      "LineString",
+    )["line-width"];
+
+    for (let i = 0; i < 100; i++) {
+      expect(width({ properties: { id: i }, zoom: 4 })).toBe(2);
+    }
+    expect(calls()).toBe(1);
+
+    expect(width({ properties: {}, zoom: 6 })).toBe(3);
+    expect(calls()).toBe(2);
+  });
+
+  it("evaluates data-driven expressions for every feature", () => {
+    const { engine, calls } = countingEngine();
+    const size = createLayoutEvaluators(
+      {
+        id: "labels",
+        type: "symbol",
+        source: "test",
+        layout: { "text-size": ["get", "size"] },
+      } as StyleLayer,
+      engine,
+      "Point",
+    )["text-size"];
+
+    expect(size({ properties: { size: 10 }, zoom: 4 })).toBe(10);
+    expect(size({ properties: { size: 20 }, zoom: 4 })).toBe(20);
+    expect(calls()).toBe(2);
+  });
+});
 
 describe("createPaintEvaluators", () => {
   const engine = new JsStyleEngine();
@@ -150,6 +222,37 @@ describe("toEvaluatedValue", () => {
 
     expect(result.color).toBeDefined();
     expect(result.show).toBe(true);
+  });
+
+  it("leaves the material's default color to apply when fill-color is unset, and overrides it when set", () => {
+    const engine = new JsStyleEngine();
+    const evaluate = (paint?: Record<string, unknown>) => {
+      const layer = {
+        id: "test",
+        type: "fill",
+        source: "test",
+        ...(paint && { paint }),
+      } as StyleLayer;
+      const paintValues = Object.fromEntries(
+        Object.entries(createPaintEvaluators(layer, engine, "Polygon")).map(
+          ([key, fn]) => [key, fn({ properties: {}, zoom: 0 })],
+        ),
+      );
+      return toEvaluatedValue(layer, paintValues);
+    };
+
+    // `toLayerDescription` puts the spec's black on the material; an unset
+    // color must not set one per feature, or it would hide that default.
+    expect(evaluate().color).toBeUndefined();
+
+    const color = evaluate({ "fill-color": "#ff0000" }).color as unknown as {
+      r: number;
+      g: number;
+      b: number;
+    };
+    expect(color.r).toBeCloseTo(1);
+    expect(color.g).toBeCloseTo(0);
+    expect(color.b).toBeCloseTo(0);
   });
 
   it("should handle undefined color values", () => {
@@ -290,6 +393,18 @@ describe("toEvaluatedValue", () => {
     expect(result.opacity).toBeCloseTo(0.75, 2);
   });
 
+  it("converts circle-radius to a point size twice as large", () => {
+    const layer: StyleLayer = {
+      id: "test",
+      type: "circle",
+      source: "test",
+    };
+
+    const result = toEvaluatedValue(layer, { "circle-radius": 8 });
+
+    expect(result.size).toBe(16);
+  });
+
   it("should default to alpha 1.0 for CSS color strings", () => {
     const layer: StyleLayer = {
       id: "test",
@@ -407,6 +522,49 @@ describe("toEvaluatedValue", () => {
       // Only text should be processed
       expect(result.text).toBe("Label");
       expect(result.image).toBeUndefined();
+    });
+
+    it("should map icon-rotate and symbol-sort-key for billboards", () => {
+      const layer: StyleLayer = { id: "test", type: "symbol", source: "test" };
+
+      const result = toEvaluatedValue(
+        layer,
+        {},
+        { "icon-image": "marker", "icon-rotate": 45, "symbol-sort-key": 3 },
+        "billboard",
+      );
+
+      expect(result.rotation).toBe(45);
+      // Lower sort keys are placed first, so they get higher priority.
+      expect(result.declutterPriority).toBe(-3);
+    });
+
+    it("should map text-rotate, text-transform and symbol-sort-key for text", () => {
+      const layer: StyleLayer = { id: "test", type: "symbol", source: "test" };
+
+      const upper = toEvaluatedValue(
+        layer,
+        {},
+        {
+          "text-field": "Main Street",
+          "text-rotate": -30,
+          "text-transform": "uppercase",
+          "symbol-sort-key": -2,
+        },
+        "text",
+      );
+      expect(upper.text).toBe("MAIN STREET");
+      expect(upper.rotation).toBe(-30);
+      expect(upper.declutterPriority).toBe(2);
+
+      const lower = toEvaluatedValue(
+        layer,
+        {},
+        { "text-field": "Main Street", "text-transform": "lowercase" },
+        "text",
+      );
+      expect(lower.text).toBe("main street");
+      expect(lower).not.toHaveProperty("declutterPriority");
     });
 
     it("should warn and skip when geometryType is invalid (not billboard or text)", () => {
@@ -533,5 +691,318 @@ describe("toEvaluatedValue", () => {
       // extrudedHeight not set because delta = max(0, 0 - 0) = 0, which fails > 0 check
       expect(result.extrudedHeight).toBeUndefined();
     });
+  });
+});
+
+describe("toNavaraColor", () => {
+  it("should parse CSS color strings with MapLibre Color.parse", () => {
+    const result = toNavaraColor("#ff0000");
+
+    expect(result).toBeDefined();
+    expect((result?.color as unknown as MockColor).r).toBe(1);
+    expect((result?.color as unknown as MockColor).g).toBe(0);
+    expect((result?.color as unknown as MockColor).b).toBe(0);
+    expect(result?.alpha).toBe(1.0);
+  });
+
+  it("should extract alpha from rgba() strings", () => {
+    const result = toNavaraColor("rgba(255, 0, 0, 0.5)");
+
+    expect(result).toBeDefined();
+    expect(result?.alpha).toBe(0.5);
+  });
+
+  it("should extract alpha from #RRGGBBAA strings", () => {
+    const result = toNavaraColor("#ff0000cc");
+
+    expect(result).toBeDefined();
+    expect(result?.alpha).toBeCloseTo(0.8, 1);
+  });
+
+  it("should handle MapLibreColor objects", () => {
+    const maplibreColor = { r: 1, g: 0, b: 0, a: 0.7 };
+    const result = toNavaraColor(maplibreColor);
+
+    expect(result).toBeDefined();
+    expect((result?.color as unknown as MockColor).r).toBe(1);
+    expect((result?.color as unknown as MockColor).g).toBe(0);
+    expect((result?.color as unknown as MockColor).b).toBe(0);
+    expect(result?.alpha).toBe(0.7);
+  });
+
+  it("should return undefined for invalid color strings", () => {
+    const result = toNavaraColor("invalid-color");
+
+    expect(result).toBeUndefined();
+  });
+});
+
+describe("text-letter-spacing", () => {
+  const engine = new JsStyleEngine();
+  const symbol = (layout: StyleLayer["layout"]): StyleLayer =>
+    ({ id: "test", type: "symbol", source: "test", layout }) as StyleLayer;
+
+  it("defaults to the spec value 0 when omitted", () => {
+    const evaluators = createLayoutEvaluators(symbol({}), engine, "Point");
+    expect(
+      evaluators["text-letter-spacing"]({ properties: {}, zoom: 10 }),
+    ).toBe(0);
+  });
+
+  it("evaluates zoom and data-driven expressions", () => {
+    const byZoom = createLayoutEvaluators(
+      symbol({
+        "text-letter-spacing": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          10,
+          0,
+          14,
+          0.4,
+        ],
+      }),
+      engine,
+      "Point",
+    )["text-letter-spacing"];
+    expect(byZoom({ properties: {}, zoom: 12 })).toBeCloseTo(0.2);
+
+    const byData = createLayoutEvaluators(
+      symbol({ "text-letter-spacing": ["get", "tracking"] }),
+      engine,
+      "Point",
+    )["text-letter-spacing"];
+    expect(byData({ properties: { tracking: 0.3 }, zoom: 10 })).toBe(0.3);
+  });
+
+  it("maps to letterSpacing on text features", () => {
+    const result = toEvaluatedValue(
+      symbol({}),
+      {},
+      { "text-field": "Label", "text-letter-spacing": 0.25 },
+      "text",
+    );
+    expect(result.letterSpacing).toBe(0.25);
+  });
+
+  it("is not applied to icons", () => {
+    const result = toEvaluatedValue(
+      symbol({}),
+      {},
+      { "icon-image": "/icons/marker.svg", "text-letter-spacing": 0.25 },
+      "billboard",
+    );
+    expect(result.letterSpacing).toBeUndefined();
+  });
+});
+
+describe("text-halo-*", () => {
+  const symbol = (paint: Record<string, unknown>): StyleLayer =>
+    ({ id: "test", type: "symbol", source: "test", paint }) as StyleLayer;
+  /** `paint` holds constants, so it is also the layer's style paint unless
+   *  `stylePaint` gives the expressions it evaluated from. */
+  const text = (
+    paint: Record<string, unknown>,
+    size = 16,
+    stylePaint: Record<string, unknown> = paint,
+  ) =>
+    toEvaluatedValue(
+      symbol(stylePaint),
+      paint,
+      { "text-field": "Label", "text-size": size },
+      "text",
+    );
+
+  it("leaves the outline alone when the layer sets no halo", () => {
+    const result = text({});
+    expect(result.outlineWidth).toBeUndefined();
+    expect(result.outlineOpacity).toBeUndefined();
+  });
+
+  it("converts pixels of the label's text size to 1/64 em", () => {
+    const result = text(
+      { "text-halo-color": "#ff0000", "text-halo-width": 2 },
+      16,
+    );
+    expect(result.outlineColor).toMatchObject({ r: 1, g: 0, b: 0 });
+    expect(result.outlineOpacity).toBe(1);
+    expect(result.outlineWidth).toBeCloseTo(8);
+    expect(text({ "text-halo-width": 2 }, 32).outlineWidth).toBeCloseTo(4);
+  });
+
+  it("spreads the blur over MapLibre's whole fade", () => {
+    expect(
+      text({ "text-halo-width": 1, "text-halo-blur": 1 }, 16).outlineBlur,
+    ).toBeCloseTo((1 / 16) * 64 * 2.38);
+  });
+
+  it("drops the blur when the width is 0 for every feature", () => {
+    expect(text({ "text-halo-blur": 1 }).outlineBlur).toBe(0);
+    expect(
+      text({ "text-halo-width": 0, "text-halo-blur": 1 }).outlineBlur,
+    ).toBe(0);
+  });
+
+  it("keeps the blur when a data-driven width is 0", () => {
+    const paint = { "text-halo-width": 0, "text-halo-blur": 1 };
+    expect(
+      text(paint, 16, { ...paint, "text-halo-width": ["get", "halo"] })
+        .outlineBlur,
+    ).toBeCloseTo((1 / 16) * 64 * 2.38);
+  });
+
+  it("takes opacity from the color's alpha, transparent when unset", () => {
+    expect(
+      text({ "text-halo-color": "rgba(0, 0, 0, 0.5)", "text-halo-width": 1 })
+        .outlineOpacity,
+    ).toBeCloseTo(0.5);
+    expect(text({ "text-halo-width": 1 }).outlineOpacity).toBe(0);
+  });
+
+  it("is not applied to icons", () => {
+    const result = toEvaluatedValue(
+      symbol({}),
+      { "text-halo-width": 2 },
+      { "icon-image": "/icons/marker.svg" },
+      "billboard",
+    );
+    expect(result.outlineWidth).toBeUndefined();
+  });
+});
+
+describe("text-rotate and icon-rotate", () => {
+  const engine = new JsStyleEngine();
+  const symbol = (layout: StyleLayer["layout"]): StyleLayer =>
+    ({ id: "test", type: "symbol", source: "test", layout }) as StyleLayer;
+
+  it("defaults to the spec value 0 when omitted", () => {
+    const evaluators = createLayoutEvaluators(symbol({}), engine, "Point");
+    for (const key of ["text-rotate", "icon-rotate"]) {
+      expect(evaluators[key]({ properties: {}, zoom: 10 })).toBe(0);
+    }
+  });
+
+  it("evaluates data-driven rotation", () => {
+    const byData = createLayoutEvaluators(
+      symbol({ "text-rotate": ["get", "heading"] }),
+      engine,
+      "Point",
+    )["text-rotate"];
+    expect(byData({ properties: { heading: 30 }, zoom: 10 })).toBe(30);
+  });
+
+  it("maps each to its own mesh's rotation", () => {
+    const layout = {
+      "text-field": "Label",
+      "icon-image": "/icons/marker.svg",
+      "text-rotate": 15,
+      "icon-rotate": 40,
+    };
+    expect(toEvaluatedValue(symbol({}), {}, layout, "text").rotation).toBe(15);
+    expect(toEvaluatedValue(symbol({}), {}, layout, "billboard").rotation).toBe(
+      40,
+    );
+  });
+});
+
+describe("anchor, offset and justify", () => {
+  const engine = new JsStyleEngine();
+  const symbol = (layout: StyleLayer["layout"]): StyleLayer =>
+    ({ id: "test", type: "symbol", source: "test", layout }) as StyleLayer;
+
+  it("evaluates spec defaults when omitted", () => {
+    const evaluators = createLayoutEvaluators(symbol({}), engine, "Point");
+    const ctx = { properties: {}, zoom: 10 };
+    expect(evaluators["text-anchor"](ctx)).toBe("center");
+    expect(evaluators["icon-anchor"](ctx)).toBe("center");
+    expect(evaluators["text-justify"](ctx)).toBe("center");
+    expect(evaluators["text-offset"](ctx)).toEqual([0, 0]);
+    expect(evaluators["icon-offset"](ctx)).toEqual([0, 0]);
+  });
+
+  it("evaluates a data-driven anchor per feature", () => {
+    const anchor = createLayoutEvaluators(
+      symbol({ "text-anchor": ["get", "side"] }),
+      engine,
+      "Point",
+    )["text-anchor"];
+    expect(anchor({ properties: { side: "left" }, zoom: 10 })).toBe("left");
+  });
+
+  it("maps text placement in ems", () => {
+    const result = toEvaluatedValue(
+      symbol({}),
+      {},
+      {
+        "text-field": "Label",
+        "text-anchor": "top",
+        "text-offset": [0, 1.5],
+        "text-justify": "auto",
+      },
+      "text",
+    );
+    expect(result.anchor).toBe("top");
+    expect(result.offset).toEqual({ x: 0, y: 1.5 });
+    expect(result.textAlign).toBe("auto");
+  });
+
+  it("scales the icon offset by icon-size into pixels", () => {
+    const result = toEvaluatedValue(
+      symbol({}),
+      {},
+      {
+        "icon-image": "/icons/marker.svg",
+        "icon-anchor": "bottom",
+        "icon-offset": [2, -3],
+        "icon-size": 2,
+      },
+      "billboard",
+    );
+    expect(result.anchor).toBe("bottom");
+    expect(result.offset).toEqual({ x: 4, y: -6 });
+  });
+
+  it("maps variable anchors only when the style sets them", () => {
+    const layout = {
+      "text-field": "Label",
+      "text-variable-anchor": ["left", "right"],
+      "text-radial-offset": ["get", "r"],
+    };
+    const evaluators = createLayoutEvaluators(symbol(layout), engine, "Point");
+    const ctx = { properties: { r: 2 }, zoom: 10 };
+    const values = Object.fromEntries(
+      Object.entries(evaluators).map(([key, fn]) => [key, fn(ctx)]),
+    );
+    const result = toEvaluatedValue(symbol(layout), {}, values, "text");
+    expect(result.variableAnchors).toEqual([
+      { anchor: "left", offset: { x: 2, y: 0 } },
+      { anchor: "right", offset: { x: -2, y: 0 } },
+    ]);
+
+    const plain = createLayoutEvaluators(symbol({}), engine, "Point");
+    expect(plain["text-variable-anchor"]).toBeUndefined();
+    expect(plain["text-radial-offset"]).toBeUndefined();
+  });
+
+  it("moves a fixed anchor by a radial offset", () => {
+    const result = toEvaluatedValue(
+      symbol({}),
+      {},
+      { "text-field": "Label", "text-anchor": "left", "text-radial-offset": 1 },
+      "text",
+    );
+    expect(result.offset).toEqual({ x: 1, y: 0 });
+    expect(result).not.toHaveProperty("variableAnchors");
+  });
+
+  it("drops values outside the spec's enums", () => {
+    const result = toEvaluatedValue(
+      symbol({}),
+      {},
+      { "text-field": "Label", "text-anchor": "middle", "text-justify": "x" },
+      "text",
+    );
+    expect(result).not.toHaveProperty("anchor");
+    expect(result).not.toHaveProperty("textAlign");
   });
 });

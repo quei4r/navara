@@ -2,19 +2,407 @@
  * Converts MapLibre Style layer to Navara layer description.
  */
 
-import type { LayerDescription, Source } from "@navaramap/three";
+import {
+  type Color,
+  type LayerDescription,
+  type Overlap,
+  type Source,
+  type SourceGeometryType,
+  type TranslateAnchor,
+  type VectorLayer,
+} from "@navaramap/three";
 
-import type { StyleLayer } from "../engine/types";
+import { PAINT_SPECS_BY_TYPE } from "../engine/paintSpecs";
+import type { StyleEngine } from "../engine/StyleEngine";
+import { type StyleLayer, type ValueExpression } from "../engine/types";
+import {
+  expressionUsesGeometryType,
+  expressionUsesZoom,
+} from "../utils/expressionHelpers";
+
+import { parseColorReliefStops, toColorReliefRamp } from "./colorRelief";
+import { CONSTRUCTION_ZOOM, resolveSymbolOrientation } from "./symbolAlignment";
+import { toNavaraColor } from "./toEvaluatedValue";
+
+type TextDescription = NonNullable<VectorLayer["text"]>;
+type BillboardDescription = NonNullable<VectorLayer["billboard"]>;
+
+/**
+ * Symbol properties evaluated for the whole layer that `layer.update()`
+ * applies to labels already shown, so they can follow zoom. The rest of the
+ * layer-level properties (placement, spacing, geometry types) are baked into
+ * tile geometry and stay at {@link CONSTRUCTION_ZOOM}.
+ */
+const ZOOM_FOLLOWING_SYMBOL_PROPERTIES = {
+  layout: [
+    "text-rotation-alignment",
+    "text-pitch-alignment",
+    "icon-rotation-alignment",
+    "icon-pitch-alignment",
+    "text-keep-upright",
+    "text-max-angle",
+    "text-max-width",
+    "text-allow-overlap",
+    "icon-allow-overlap",
+    "text-overlap",
+    "icon-overlap",
+    "text-ignore-placement",
+    "icon-ignore-placement",
+    "text-padding",
+    "icon-padding",
+    "text-optional",
+    "icon-optional",
+    "text-line-height",
+  ],
+  paint: [
+    "text-translate",
+    "text-translate-anchor",
+    "icon-translate",
+    "icon-translate-anchor",
+  ],
+} as const;
+
+/**
+ * Whether a symbol layer sets a layer-level property with a zoom expression,
+ * so its description must be rebuilt as the zoom changes.
+ */
+export function symbolLayerFollowsZoom(styleLayer: StyleLayer): boolean {
+  if (styleLayer.type !== "symbol") return false;
+  return (["layout", "paint"] as const).some((kind) => {
+    const values = styleLayer[kind] as Record<string, unknown> | undefined;
+    return ZOOM_FOLLOWING_SYMBOL_PROPERTIES[kind].some((key) =>
+      expressionUsesZoom(values?.[key]),
+    );
+  });
+}
+
+/**
+ * Whether a hillshade layer's exaggeration depends on zoom, so its
+ * description must be rebuilt as the zoom changes.
+ */
+export function hillshadeLayerFollowsZoom(styleLayer: StyleLayer): boolean {
+  if (styleLayer.type !== "hillshade") return false;
+  return expressionUsesZoom(styleLayer.paint?.["hillshade-exaggeration"]);
+}
+
+/**
+ * Whether a color-relief layer's opacity or resampling depends on zoom, so its
+ * description must be rebuilt as the zoom changes.
+ */
+export function colorReliefLayerFollowsZoom(styleLayer: StyleLayer): boolean {
+  if (styleLayer.type !== "color-relief") return false;
+  const paint = (styleLayer.paint ?? {}) as Record<string, unknown>;
+  return (
+    expressionUsesZoom(paint["color-relief-opacity"]) ||
+    expressionUsesZoom(paint.resampling)
+  );
+}
+
+type LayerValueFn = ReturnType<StyleEngine["createValueFn"]>;
+
+/**
+ * Compiled layer-level property functions. Zoom-following layers evaluate the
+ * same property on every zoom change, and compiling an expression is the
+ * costly part. A function depends only on the layer's expression and spec,
+ * so it is kept for the lifetime of the layer object. Not keyed by engine: the
+ * plugin uses a single engine, so a layer is never evaluated by two.
+ */
+const layerValueFns = new WeakMap<StyleLayer, Map<string, LayerValueFn>>();
+
+function layerValueFn(
+  engine: StyleEngine,
+  styleLayer: StyleLayer,
+  kind: "layout" | "paint",
+  key: string,
+  expr: ValueExpression,
+  spec: Parameters<StyleEngine["createValueFn"]>[1],
+): LayerValueFn {
+  let byKey = layerValueFns.get(styleLayer);
+  if (!byKey) layerValueFns.set(styleLayer, (byKey = new Map()));
+
+  const cacheKey = `${kind}:${key}`;
+  let fn = byKey.get(cacheKey);
+  if (!fn) {
+    fn = engine.createValueFn(expr, spec);
+    byKey.set(cacheKey, fn);
+  }
+  return fn;
+}
+
+/**
+ * Evaluate a layout/paint property for the whole layer at `zoom`, falling
+ * back to the spec default when the style omits it. Returns `undefined` only
+ * for properties with no spec default that the style leaves unset.
+ */
+function evaluateLayerProperty(
+  engine: StyleEngine,
+  styleLayer: StyleLayer,
+  kind: "layout" | "paint",
+  key: string,
+  zoom = CONSTRUCTION_ZOOM,
+): unknown {
+  const spec =
+    kind === "layout"
+      ? engine.getLayoutSpec(styleLayer.type, key)
+      : engine.getPaintSpec(styleLayer.type, key);
+  if (!spec) return undefined;
+
+  const values = styleLayer[kind] as
+    Record<string, ValueExpression | undefined> | undefined;
+  const expr = values?.[key] ?? (spec.default as ValueExpression | undefined);
+  if (expr === undefined) return undefined;
+
+  try {
+    return layerValueFn(
+      engine,
+      styleLayer,
+      kind,
+      key,
+      expr,
+      spec,
+    )({
+      properties: undefined,
+      zoom,
+    });
+  } catch (err) {
+    console.warn(
+      `Failed to evaluate ${key} for layer "${styleLayer.id}":`,
+      err,
+    );
+    return spec.default;
+  }
+}
+
+function finiteOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+export type SymbolPlacement = "point" | "line" | "line-center";
+
+/**
+ * Resolve a symbol layer's `symbol-placement`. Without an engine (or for
+ * non-symbol layers) this is always `"point"`.
+ */
+export function getSymbolPlacement(
+  styleLayer: StyleLayer,
+  engine?: StyleEngine,
+): SymbolPlacement {
+  if (!engine || styleLayer.type !== "symbol") return "point";
+  const value = evaluateLayerProperty(
+    engine,
+    styleLayer,
+    "layout",
+    "symbol-placement",
+  );
+  return value === "line" || value === "line-center" ? value : "point";
+}
+
+/**
+ * Source geometry a symbol layer consumes. Along-line placement takes lines
+ * only. Point placement labels every geometry, as MapLibre does: a line once
+ * at its first vertex, a polygon at its pole of inaccessibility.
+ */
+function getSymbolGeometryTypes(
+  styleLayer: StyleLayer,
+  placement: SymbolPlacement,
+): SourceGeometryType[] | undefined {
+  if (placement !== "point") return ["line"];
+  return getAllGeometryTypesUnlessFiltered(styleLayer);
+}
+
+/**
+ * Every source geometry type, for a point-like layer (circle, point-placed
+ * symbol) that MapLibre draws on lines and polygons too. The plugin evaluates
+ * such a layer's filter as a single geometry type (`"Point"`), though, so a
+ * filter that tests it (`$type`, `["geometry-type"]`) would pass lines and
+ * polygons as points; such layers keep the native point geometry only.
+ */
+function getAllGeometryTypesUnlessFiltered(
+  styleLayer: StyleLayer,
+): SourceGeometryType[] | undefined {
+  const filter = "filter" in styleLayer ? styleLayer.filter : undefined;
+  return expressionUsesGeometryType(filter)
+    ? undefined
+    : ["point", "line", "polygon"];
+}
+
+/**
+ * Resolve `*-overlap` — falling back to `*-allow-overlap` when it is unset,
+ * as MapLibre does — and `*-ignore-placement`.
+ */
+function resolveOverlap(
+  engine: StyleEngine,
+  styleLayer: StyleLayer,
+  prefix: "text" | "icon",
+  zoom: number,
+): { overlap: Overlap; ignorePlacement: boolean } {
+  const evaluate = (key: string) =>
+    evaluateLayerProperty(
+      engine,
+      styleLayer,
+      "layout",
+      `${prefix}-${key}`,
+      zoom,
+    );
+  const overlap = evaluate("overlap");
+  return {
+    overlap:
+      typeof overlap === "string"
+        ? (overlap as Overlap)
+        : evaluate("allow-overlap") === true
+          ? "always"
+          : "never",
+    ignorePlacement: evaluate("ignore-placement") === true,
+  };
+}
+
+/**
+ * Resolve `*-padding` as the one to four CSS-ordered values the material's
+ * `declutterPadding` takes. `text-padding` is a single number, `icon-padding`
+ * either form.
+ *
+ * Evaluated at the whole zoom: a changed padding rebuilds the layer through
+ * `layer.update()`, which an interpolation would otherwise trigger on every
+ * zoom step.
+ */
+function resolvePadding(
+  engine: StyleEngine,
+  styleLayer: StyleLayer,
+  prefix: "text" | "icon",
+  zoom: number,
+): number[] {
+  const value = evaluateLayerProperty(
+    engine,
+    styleLayer,
+    "layout",
+    `${prefix}-padding`,
+    Math.floor(zoom),
+  );
+  return typeof value === "number" ? [value] : (value as number[]);
+}
+
+/**
+ * Resolve `*-translate` and `*-translate-anchor` for the layer. Both are
+ * zoom-only in the spec, so one value covers every feature; MapLibre's pixels,
+ * +y down, match the material's `translate`.
+ */
+function resolveTranslate(
+  engine: StyleEngine,
+  styleLayer: StyleLayer,
+  prefix: "text" | "icon",
+  zoom: number,
+): { translate: { x: number; y: number }; translateAnchor: TranslateAnchor } {
+  const translate = evaluateLayerProperty(
+    engine,
+    styleLayer,
+    "paint",
+    `${prefix}-translate`,
+    zoom,
+  );
+  const [x, y] = Array.isArray(translate) ? translate : [];
+  const anchor = evaluateLayerProperty(
+    engine,
+    styleLayer,
+    "paint",
+    `${prefix}-translate-anchor`,
+    zoom,
+  );
+  return {
+    translate: { x: finiteOr(x, 0), y: finiteOr(y, 0) },
+    translateAnchor: anchor === "viewport" ? "viewport" : "map",
+  };
+}
+
+/**
+ * Whether a symbol's icon or text may show while its `partner` is hidden:
+ * MapLibre places the two together unless the partner is `*-optional`, or the
+ * layer does not draw it at all.
+ */
+function placesAlone(
+  engine: StyleEngine,
+  styleLayer: StyleLayer,
+  partner: "text" | "icon",
+  partnerExists: boolean,
+  zoom: number,
+): boolean {
+  return (
+    !partnerExists ||
+    evaluateLayerProperty(
+      engine,
+      styleLayer,
+      "layout",
+      `${partner}-optional`,
+      zoom,
+    ) === true
+  );
+}
+
+/**
+ * Helper to extract sourceLayers from MapLibre's source-layer property.
+ * Returns an object with optional sourceLayers array.
+ *
+ * MapLibre uses singular "source-layer" (string) to specify which layer from a vector tile source to render.
+ * Navara uses "sourceLayers" (array) to support multiple source layers in the future.
+ */
+function getSourceLayersField(styleLayer: StyleLayer): {
+  sourceLayers?: string[];
+} {
+  if ("source-layer" in styleLayer && styleLayer["source-layer"]) {
+    return { sourceLayers: [styleLayer["source-layer"]] };
+  }
+  return {};
+}
+
+/**
+ * The paint property that colors each layer type's material. Checked against
+ * the spec, so a misspelled name fails to compile instead of silently leaving
+ * the layer white.
+ */
+const COLOR_PROPERTIES = {
+  fill: "fill-color",
+  "fill-extrusion": "fill-extrusion-color",
+  line: "line-color",
+  circle: "circle-color",
+  symbol: "text-color",
+} as const satisfies {
+  [
+    K in keyof typeof PAINT_SPECS_BY_TYPE
+  ]?: keyof (typeof PAINT_SPECS_BY_TYPE)[K];
+};
+
+/**
+ * The spec default of a layer type's color property, for the layer's
+ * material. Unset paint properties are not evaluated per feature, so without
+ * it an unset color would be the material's own default, white, instead of
+ * the spec's black. Only the RGB is taken: every such default is opaque.
+ */
+function defaultColorField(layerType: keyof typeof COLOR_PROPERTIES): {
+  color?: Color;
+} {
+  const spec = (
+    PAINT_SPECS_BY_TYPE[layerType] as Record<string, { default?: unknown }>
+  )[COLOR_PROPERTIES[layerType]];
+  const color = toNavaraColor(spec?.default);
+  return color ? { color: color.color } : {};
+}
 
 /**
  * Create layer description for fill layer.
  */
-function createFillLayer(source: Source): LayerDescription {
+function createFillLayer(
+  source: Source,
+  styleLayer: StyleLayer,
+): LayerDescription {
   return {
     type: "vector",
     source,
+    ...getSourceLayersField(styleLayer),
     polygon: {
       clampToGround: true,
+      ...defaultColorField("fill"),
+      // MapLibre draws edges straight in Web Mercator and keeps longitudes
+      // past ±180° as given.
+      geodesic: false,
     },
   };
 }
@@ -22,25 +410,46 @@ function createFillLayer(source: Source): LayerDescription {
 /**
  * Create layer description for fill-extrusion layer.
  */
-function createFillExtrusionLayer(source: Source): LayerDescription {
+function createFillExtrusionLayer(
+  source: Source,
+  styleLayer: StyleLayer,
+): LayerDescription {
+  const opacity = (styleLayer.paint as Record<string, unknown> | undefined)?.[
+    "fill-extrusion-opacity"
+  ];
   return {
     type: "vector",
     source,
+    ...getSourceLayersField(styleLayer),
     polygon: {
       clampToGround: false,
+      ...defaultColorField("fill-extrusion"),
+      ...(opacity !== undefined &&
+        opacity !== 1 && { transparent: true, depthPrePass: true }),
     },
   };
 }
 
 /**
  * Create layer description for line layer.
+ * Supports both LineString and Polygon sources (polygon boundaries).
  */
-function createLineLayer(source: Source): LayerDescription {
+function createLineLayer(
+  source: Source,
+  styleLayer: StyleLayer,
+): LayerDescription {
   return {
     type: "vector",
     source,
+    ...getSourceLayersField(styleLayer),
     polyline: {
       clampToGround: true,
+      ...defaultColorField("line"),
+      // See createFillLayer.
+      geodesic: false,
+      // Support deriving polylines from both line and polygon geometries
+      // This allows line layers to render polygon boundaries (e.g., country borders)
+      geometryTypes: ["line", "polygon"],
     },
   };
 }
@@ -48,13 +457,30 @@ function createLineLayer(source: Source): LayerDescription {
 /**
  * Create layer description for circle layer.
  */
-function createCircleLayer(source: Source): LayerDescription {
+function createCircleLayer(
+  source: Source,
+  styleLayer: StyleLayer,
+): LayerDescription {
+  const geometryTypes = getAllGeometryTypesUnlessFiltered(styleLayer);
+  const circleSpec = PAINT_SPECS_BY_TYPE.circle;
   return {
     type: "vector",
     source,
+    ...getSourceLayersField(styleLayer),
     point: {
       clampToGround: true,
-      center: { x: 0, y: -0.5 },
+      ...defaultColorField("circle"),
+      // `circle-radius` is in screen pixels, and circles are centered on
+      // their point, as in MapLibre. `size` is the full width, so twice the
+      // radius.
+      size: 2 * circleSpec["circle-radius"].default,
+      sizeInMeters: false,
+      anchor: "center",
+      // MapLibre never collides circles: overlapping ones are all drawn.
+      declutter: false,
+      // MapLibre draws a circle at every vertex of lines and polygon rings,
+      // which is the default `placement: "point"`.
+      ...(geometryTypes && { geometryTypes }),
     },
   };
 }
@@ -70,27 +496,144 @@ function createRasterLayer(source: Source): LayerDescription {
 }
 
 /**
- * Create layer description for hillshade layer.
+ * Create layer description for hillshade layer. `hillshade-exaggeration` is
+ * passed through as Navara's exaggeration, evaluated at `zoom` (see
+ * {@link hillshadeLayerFollowsZoom}). When the style leaves it unset, Navara's
+ * own default applies rather than the spec default.
  */
-function createHillshadeLayer(source: Source): LayerDescription {
+function createHillshadeLayer(
+  source: Source,
+  styleLayer: StyleLayer,
+  engine?: StyleEngine,
+  zoom = CONSTRUCTION_ZOOM,
+): LayerDescription {
+  const isSet =
+    styleLayer.type === "hillshade" &&
+    styleLayer.paint?.["hillshade-exaggeration"] !== undefined;
+  const exaggeration =
+    engine && isSet
+      ? evaluateLayerProperty(
+          engine,
+          styleLayer,
+          "paint",
+          "hillshade-exaggeration",
+          zoom,
+        )
+      : undefined;
   return {
     type: "raster",
     source,
-    hillshade: {},
+    hillshade:
+      typeof exaggeration === "number" && Number.isFinite(exaggeration)
+        ? { exaggeration }
+        : {},
   };
 }
 
 /**
- * Extract font from text-font layout property.
+ * Create layer description for color-relief layer.
+ * Converts MapLibre color-relief to Navara elevation heatmap.
  */
-function extractFont(textFont: unknown): string | undefined {
-  if (Array.isArray(textFont) && textFont.length > 0) {
-    return textFont[0] as string;
+function createColorReliefLayer(
+  source: Source,
+  styleLayer: StyleLayer,
+  engine?: StyleEngine,
+  zoom?: number,
+): LayerDescription | null {
+  if (styleLayer.type !== "color-relief") return null;
+
+  const paint = styleLayer.paint || {};
+  const colorExpression = paint["color-relief-color"];
+
+  // Get default values from paint spec
+  const colorReliefSpec = PAINT_SPECS_BY_TYPE["color-relief"];
+  const defaultOpacity = colorReliefSpec["color-relief-opacity"]
+    .default as number;
+  const defaultResampling = colorReliefSpec.resampling.default as string;
+
+  // Opacity and resampling may be zoom expressions (or legacy zoom
+  // functions): evaluate them at `zoom`. The plugin rebuilds the description
+  // as the zoom changes (see colorReliefLayerFollowsZoom).
+  const evaluate = (key: "color-relief-opacity" | "resampling") =>
+    engine
+      ? evaluateLayerProperty(engine, styleLayer, "paint", key, zoom)
+      : paint[key];
+  const opacityValue = evaluate("color-relief-opacity");
+  const opacity =
+    typeof opacityValue === "number"
+      ? Math.min(Math.max(opacityValue, 0), 1)
+      : defaultOpacity;
+  const resamplingValue = evaluate("resampling") ?? defaultResampling;
+  let resampling = defaultResampling;
+  if (resamplingValue === "linear" || resamplingValue === "nearest") {
+    resampling = resamplingValue;
+  } else {
+    console.warn(
+      `Color-relief layer "${styleLayer.id}": resampling must evaluate to "linear" or "nearest". ` +
+        `Using "${defaultResampling}".`,
+    );
   }
-  if (typeof textFont === "string") {
-    return textFont;
+
+  // Evaluate the whole color expression at each stop's elevation, as MapLibre
+  // does (see parseColorReliefStops).
+  const colorSpec = engine?.getPaintSpec("color-relief", "color-relief-color");
+  let evaluateAt: ((elevation: number) => unknown) | undefined;
+  if (engine && colorSpec && colorExpression !== undefined) {
+    try {
+      const evaluateColor = engine.createValueFn(
+        colorExpression as ValueExpression,
+        colorSpec,
+      );
+      evaluateAt = (elevation) =>
+        evaluateColor({
+          properties: undefined,
+          zoom: zoom ?? CONSTRUCTION_ZOOM,
+          elevation,
+        });
+    } catch (err) {
+      console.warn(
+        `Color-relief layer "${styleLayer.id}": failed to compile color-relief-color:`,
+        err,
+      );
+      return null;
+    }
   }
-  return undefined;
+
+  // Expected format: ["interpolate", ["linear"], ["elevation"], stop1, color1, stop2, color2, ...]
+  const stops = parseColorReliefStops(colorExpression, evaluateAt);
+  if (stops === undefined && Array.isArray(colorExpression)) {
+    console.warn(
+      `Color-relief layer "${styleLayer.id}": color-relief-color must be an interpolate expression over ["elevation"]. ` +
+        `Expected: ["interpolate", [...], ["elevation"], ...]`,
+    );
+    return null;
+  }
+  const ramp = stops && toColorReliefRamp(stops);
+  if (!ramp) {
+    console.warn(
+      `Color-relief layer "${styleLayer.id}": Failed to parse color-relief-color expression. ` +
+        `Expected format: ["interpolate", ["linear"], ["elevation"], stop1, color1, stop2, color2, ...]`,
+    );
+    return null;
+  }
+
+  const layerDesc: LayerDescription = {
+    type: "raster",
+    source,
+    elevationHeatmap: {
+      minHeight: ramp.minHeight,
+      maxHeight: ramp.maxHeight,
+      logarithmic: false,
+      filter: resampling,
+      colorMap: ramp.colorMap,
+      colorStops: ramp.colorStops,
+    },
+    raster: {
+      opacity,
+    },
+  };
+
+  return layerDesc;
 }
 
 /**
@@ -149,6 +692,10 @@ function getIconUrl(iconImage: unknown): string {
 function createSymbolLayer(
   source: Source,
   styleLayer: StyleLayer,
+  fontFamily?: string,
+  engine?: StyleEngine,
+  zoom = CONSTRUCTION_ZOOM,
+  rank = 0,
 ): LayerDescription | null {
   const layout = styleLayer.layout;
 
@@ -164,28 +711,38 @@ function createSymbolLayer(
     return null;
   }
 
-  // Extract font from text-font layout property if text is needed
-  let font: string | undefined;
-  if (hasTextField && layout?.["text-font"]) {
-    font = extractFont(layout["text-font"]);
-  }
-
-  // Warn if text is configured but no font specified
-  if (hasTextField && !font) {
+  // Warn if text is configured but no font provided
+  if (hasTextField && !fontFamily) {
     console.warn(
-      `Symbol layer "${styleLayer.id}" has text-field but no text-font specified. Text rendering will fail.`,
+      `Symbol layer "${styleLayer.id}" has text-field but no font was provided. ` +
+        `Text rendering will be skipped. ` +
+        `Provide fonts via style overrides: new MapLibreStylePlugin(style, { overrides: await fetchFontStyleOverrides('Open Sans', 'https://fonts.googleapis.com/...') })`,
     );
+    // If there's no icon either, this layer can't render anything - skip it
+    if (!hasIconImage) {
+      return null;
+    }
   }
 
   // Build layer description based on what's configured
   const layerDesc: LayerDescription = {
     type: "vector",
     source,
+    ...getSourceLayersField(styleLayer),
   };
+
+  const placement = getSymbolPlacement(styleLayer, engine);
+  const alongLine = placement !== "point";
+  const geometryTypes = getSymbolGeometryTypes(styleLayer, placement);
+  const orientation = engine
+    ? resolveSymbolOrientation(styleLayer, engine, zoom)
+    : undefined;
 
   if (hasIconImage) {
     layerDesc.billboard = {
+      // `icon-size`, evaluated per feature, scales the image's own size.
       size: 1.0,
+      sizeRelativeToImage: true,
       height: 1,
       sizeInMeters: false,
       clampToGround: true,
@@ -193,22 +750,79 @@ function createSymbolLayer(
       url: getIconUrl(layout?.["icon-image"]),
       offsetDepth: true,
       transparent: true,
-      center: hasTextField ? { x: 1.0, y: -0.5 } : { x: 0.5, y: -0.5 },
     };
+
+    if (engine && orientation) {
+      Object.assign(layerDesc.billboard, {
+        placement,
+        ...orientation.icon,
+        declutter: true,
+        declutterRank: rank,
+        declutterPadding: resolvePadding(engine, styleLayer, "icon", zoom),
+        standalone: placesAlone(
+          engine,
+          styleLayer,
+          "text",
+          hasTextField && fontFamily !== undefined,
+          zoom,
+        ),
+        ...resolveOverlap(engine, styleLayer, "icon", zoom),
+        ...resolveTranslate(engine, styleLayer, "icon", zoom),
+        ...(geometryTypes && { geometryTypes }),
+        ...(alongLine && { spacing: orientation.spacing }),
+      } satisfies Partial<BillboardDescription>);
+    }
   }
 
-  if (hasTextField) {
+  if (hasTextField && fontFamily) {
     layerDesc.text = {
       clampToGround: true,
-      font,
+      font: fontFamily, // Use the font family name registered via addFontFamily
+      ...defaultColorField("symbol"),
       text: "",
       size: 1.0,
       sizeInMeters: false,
-      center: hasIconImage ? { x: 0.0, y: 0.0 } : { x: 0.5, y: 0.0 },
       depthTest: true,
       offsetDepth: true,
-      declutter: false,
+      declutter: true, // Enable declutter to hide duplicate/overlapping labels
     };
+
+    if (engine && orientation && styleLayer.type === "symbol") {
+      Object.assign(layerDesc.text, {
+        placement,
+        ...orientation.text,
+        declutterRank: rank,
+        declutterPadding: resolvePadding(engine, styleLayer, "text", zoom),
+        standalone: placesAlone(engine, styleLayer, "icon", hasIconImage, zoom),
+        ...resolveOverlap(engine, styleLayer, "text", zoom),
+        ...resolveTranslate(engine, styleLayer, "text", zoom),
+        // MapLibre never wraps or justifies labels placed along a line.
+        maxWidth: alongLine
+          ? 0
+          : finiteOr(
+              evaluateLayerProperty(
+                engine,
+                styleLayer,
+                "layout",
+                "text-max-width",
+                zoom,
+              ),
+              10,
+            ),
+        lineHeight: finiteOr(
+          evaluateLayerProperty(
+            engine,
+            styleLayer,
+            "layout",
+            "text-line-height",
+            zoom,
+          ),
+          1.2,
+        ),
+        ...(geometryTypes && { geometryTypes }),
+        ...(alongLine && { spacing: orientation.spacing }),
+      } satisfies Partial<TextDescription>);
+    }
   }
 
   return layerDesc;
@@ -219,6 +833,14 @@ function createSymbolLayer(
  *
  * @param source - Navara source object
  * @param styleLayer - MapLibre layer specification
+ * @param fontFamily - Optional font family name for text rendering (ignores style's text-font)
+ * @param engine - Optional style engine for evaluating layer-level symbol
+ *   properties
+ * @param zoom - Zoom to evaluate the layer-level symbol properties that can
+ *   follow it at (see {@link symbolLayerFollowsZoom}); defaults to
+ *   {@link CONSTRUCTION_ZOOM}
+ * @param rank - Symbol placement rank: the layer's index in the style, as
+ *   MapLibre places symbols from the top-most layer down
  * @returns Navara layer description, or null if the layer cannot be processed
  *
  * Note: Returns null for unsupported/misconfigured layers instead of throwing,
@@ -230,22 +852,35 @@ function createSymbolLayer(
 export function toLayerDescription(
   source: Source,
   styleLayer: StyleLayer,
+  fontFamily?: string,
+  engine?: StyleEngine,
+  zoom?: number,
+  rank?: number,
 ): LayerDescription | null {
   switch (styleLayer.type) {
     case "fill":
-      return createFillLayer(source);
+      return createFillLayer(source, styleLayer);
     case "fill-extrusion":
-      return createFillExtrusionLayer(source);
+      return createFillExtrusionLayer(source, styleLayer);
     case "line":
-      return createLineLayer(source);
+      return createLineLayer(source, styleLayer);
     case "circle":
-      return createCircleLayer(source);
+      return createCircleLayer(source, styleLayer);
     case "raster":
       return createRasterLayer(source);
     case "hillshade":
-      return createHillshadeLayer(source);
+      return createHillshadeLayer(source, styleLayer, engine, zoom);
+    case "color-relief":
+      return createColorReliefLayer(source, styleLayer, engine, zoom);
     case "symbol":
-      return createSymbolLayer(source, styleLayer);
+      return createSymbolLayer(
+        source,
+        styleLayer,
+        fontFamily,
+        engine,
+        zoom,
+        rank,
+      );
     default:
       // Warn but don't throw - allows loading third-party styles with unsupported layers
       // TypeScript exhaustively narrows styleLayer to never, but we handle unknown types at runtime
