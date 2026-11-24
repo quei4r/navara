@@ -106,7 +106,7 @@ import { VectorDrapeResolver } from "./vectorDrapeResolver";
 // them into a single binding — later `.value` rebinds on the other slots then
 // never reach the GPU (the deduped winner's texture is sampled for all).
 function createWebGPUSlotPlaceholder(): DataTexture {
-  const t = new DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+  const t = new DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1); // 补一八七 中性透明
   t.needsUpdate = true;
   return t;
 }
@@ -2032,6 +2032,9 @@ ${generateTileCommonInjection(maxTextures)}
       }
 
       const slot = slots[i];
+      // 补一八八：WebGPU 节点材质直接采样已烘焙的 drape slot RT（composite atlas 仅在
+      // 经典 WebGL 路径绑定，WebGPU 早退不采样）；撤补一八七过宽的 RT 排除，恢复矢量贴地。
+      // 中性透明占位符（createWebGPUSlotPlaceholder）保留，防未激活槽采样白雪花。
       const active = shown && !isHs;
       const tex = active ? t : slot.placeholder;
       if (slot.node.value !== tex) slot.node.value = tex;
